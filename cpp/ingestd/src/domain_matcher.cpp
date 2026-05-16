@@ -11,6 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include <unicode/uidna.h>
+#include <unicode/ustring.h>
+
 extern "C" {
 // Small hand-declared libunistring ABI surface; this target links the shared library directly.
 unsigned char* u8_tolower(const unsigned char* s,
@@ -19,36 +22,13 @@ unsigned char* u8_tolower(const unsigned char* s,
                           void* nf,
                           unsigned char* resultbuf,
                           std::size_t* lengthp);
-
-// Small hand-declared ICU ABI surface for the legacy IDNA2003 API.
-using UChar = char16_t;
-using UErrorCode = std::int32_t;
-UChar* u_strFromUTF8_72(UChar* dest,
-                        std::int32_t destCapacity,
-                        std::int32_t* pDestLength,
-                        const char* src,
-                        std::int32_t srcLength,
-                        UErrorCode* pErrorCode);
-char* u_strToUTF8_72(char* dest,
-                     std::int32_t destCapacity,
-                     std::int32_t* pDestLength,
-                     const UChar* src,
-                     std::int32_t srcLength,
-                     UErrorCode* pErrorCode);
-std::int32_t uidna_IDNToASCII_72(const UChar* src,
-                                 std::int32_t srcLength,
-                                 UChar* dest,
-                                 std::int32_t destCapacity,
-                                 std::int32_t options,
-                                 void* parseError,
-                                 UErrorCode* status);
 }
 
 namespace rapid_inbox::ingestd {
 namespace {
 
-constexpr UErrorCode kUZeroError = 0;
-constexpr UErrorCode kUBufferOverflowError = 15;
+constexpr UErrorCode kUZeroError = U_ZERO_ERROR;
+constexpr UErrorCode kUBufferOverflowError = U_BUFFER_OVERFLOW_ERROR;
 constexpr std::int32_t kUidnaAllowUnassigned = 1;
 
 constexpr std::string_view kUtf8PythonWhitespace[] = {
@@ -212,12 +192,12 @@ std::vector<UChar> utf8_to_uchars(std::string_view value) {
         std::vector<UChar> output(static_cast<std::size_t>(capacity));
         std::int32_t output_length = 0;
         UErrorCode status = kUZeroError;
-        (void)u_strFromUTF8_72(output.data(),
-                               capacity,
-                               &output_length,
-                               value.data(),
-                               src_length,
-                               &status);
+        (void)u_strFromUTF8(output.data(),
+                            capacity,
+                            &output_length,
+                            value.data(),
+                            src_length,
+                            &status);
         if (status == kUZeroError && output_length <= capacity) {
             output.resize(static_cast<std::size_t>(output_length));
             return output;
@@ -242,13 +222,13 @@ std::vector<UChar> idna_to_ascii_uchars(const std::vector<UChar>& input) {
     for (;;) {
         std::vector<UChar> output(static_cast<std::size_t>(capacity));
         UErrorCode status = kUZeroError;
-        const std::int32_t output_length = uidna_IDNToASCII_72(input.data(),
-                                                              src_length,
-                                                              output.data(),
-                                                              capacity,
-                                                              kUidnaAllowUnassigned,
-                                                              nullptr,
-                                                              &status);
+        const std::int32_t output_length = uidna_IDNToASCII(input.data(),
+                                                           src_length,
+                                                           output.data(),
+                                                           capacity,
+                                                           kUidnaAllowUnassigned,
+                                                           nullptr,
+                                                           &status);
         if (status == kUZeroError && output_length <= capacity) {
             output.resize(static_cast<std::size_t>(output_length));
             return output;
@@ -269,12 +249,12 @@ std::string uchars_to_utf8(const std::vector<UChar>& input) {
         std::string output(static_cast<std::size_t>(capacity), '\0');
         std::int32_t output_length = 0;
         UErrorCode status = kUZeroError;
-        (void)u_strToUTF8_72(output.data(),
-                             capacity,
-                             &output_length,
-                             input.data(),
-                             src_length,
-                             &status);
+        (void)u_strToUTF8(output.data(),
+                          capacity,
+                          &output_length,
+                          input.data(),
+                          src_length,
+                          &status);
         if (status == kUZeroError && output_length <= capacity) {
             output.resize(static_cast<std::size_t>(output_length));
             return output;
