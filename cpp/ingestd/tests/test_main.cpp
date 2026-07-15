@@ -29,6 +29,8 @@ void test_mime_parser_decodes_encoded_subject();
 void test_mime_parser_reports_malformed_multipart();
 void test_mime_parser_allows_boundary_trailing_whitespace();
 void test_mime_parser_decodes_latin1_text_body();
+void test_mime_parser_truncates_preview_at_utf8_boundary();
+void test_mime_parser_replaces_invalid_utf8_in_preview();
 void test_mime_parser_keeps_empty_attachment();
 void test_mime_parser_decodes_gbk_encoded_subject();
 void test_mime_parser_failure_is_std_exception();
@@ -147,6 +149,8 @@ int main() {
         test_mime_parser_reports_malformed_multipart();
         test_mime_parser_allows_boundary_trailing_whitespace();
         test_mime_parser_decodes_latin1_text_body();
+        test_mime_parser_truncates_preview_at_utf8_boundary();
+        test_mime_parser_replaces_invalid_utf8_in_preview();
         test_mime_parser_keeps_empty_attachment();
         test_mime_parser_decodes_gbk_encoded_subject();
         test_mime_parser_failure_is_std_exception();

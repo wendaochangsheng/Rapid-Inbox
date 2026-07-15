@@ -3006,9 +3006,6 @@ class RapidInboxRuntime:
                     m.subject,
                     m.from_addr,
                     m.verification_code,
-                    m.text_preview,
-                    m.text_body_path,
-                    m.html_body_path,
                     m.has_attachments,
                     m.parse_status
                 FROM message_deliveries AS d
@@ -3089,9 +3086,6 @@ class RapidInboxRuntime:
                     m.subject,
                     m.from_addr,
                     m.verification_code,
-                    m.text_preview,
-                    m.text_body_path,
-                    m.html_body_path,
                     m.has_attachments,
                     m.parse_status
                 FROM message_deliveries AS d

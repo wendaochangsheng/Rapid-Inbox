@@ -477,6 +477,40 @@ async def test_admin_mailboxes_page_can_toggle_visibility_via_form(app_client, r
 
 
 @pytest.mark.asyncio
+async def test_invalid_utf8_preview_does_not_break_public_or_admin_pages(
+    app_client,
+    runtime,
+    seeded_message,
+) -> None:
+    with connect_database(runtime.settings.database_path) as connection:
+        connection.execute(
+            "UPDATE messages SET text_preview = CAST(? AS TEXT) WHERE id = ?",
+            (b"legacy-\xe4\xb8", seeded_message.message_id),
+        )
+
+    public_view = await runtime.messages.get_public_mailbox_view(
+        "foo@adb.com",
+        surface="web",
+    )
+    public_item = await runtime.messages.get_public_mailbox_item(
+        "foo@adb.com",
+        seeded_message.delivery_id,
+        surface="web",
+    )
+    public_page = await app_client.get("/mail/foo@adb.com")
+
+    assert public_page.status_code == 200
+    assert "text_preview" not in public_view["items"][0]
+    assert "text_preview" not in public_item
+
+    await _login_and_change_initial_password(app_client, runtime)
+    admin_page = await app_client.get(f"/admin/messages/{seeded_message.message_id}")
+
+    assert admin_page.status_code == 200
+    assert seeded_message.message_id in admin_page.text
+
+
+@pytest.mark.asyncio
 async def test_admin_mailboxes_filter_form_accepts_empty_values(app_client, runtime) -> None:
     domain = await runtime.create_domain("adb.com")
     await _login_and_change_initial_password(app_client, runtime)

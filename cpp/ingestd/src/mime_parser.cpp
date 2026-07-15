@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include <unicode/utf8.h>
+
 namespace rapid_inbox::ingestd {
 namespace {
 
@@ -559,6 +561,35 @@ std::string strip_html_tags(const std::string& html) {
     return decode_basic_html_entities(std::move(text));
 }
 
+constexpr std::size_t kPreviewMaxBytes = 200;
+
+std::string bounded_valid_utf8_preview(std::string_view value) {
+    std::string output;
+    output.reserve(std::min(value.size(), kPreviewMaxBytes));
+
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(value.data());
+    const auto length = static_cast<std::int32_t>(
+        std::min(value.size(), static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())));
+    std::int32_t offset = 0;
+
+    while (offset < length) {
+        UChar32 code_point;
+        U8_NEXT_OR_FFFD(bytes, offset, length, code_point);
+
+        std::uint8_t encoded[U8_MAX_LENGTH];
+        std::int32_t encoded_length = 0;
+        U8_APPEND_UNSAFE(encoded, encoded_length, code_point);
+
+        const auto next_size = static_cast<std::size_t>(encoded_length);
+        if (next_size > kPreviewMaxBytes - output.size()) {
+            break;
+        }
+        output.append(reinterpret_cast<const char*>(encoded), next_size);
+    }
+
+    return output;
+}
+
 std::optional<std::string> build_preview(const ParsedMail& mail) {
     std::string source;
     if (mail.has_text && !mail.text_body.empty()) {
@@ -597,10 +628,7 @@ std::optional<std::string> build_preview(const ParsedMail& mail) {
         polished.push_back(ch);
     }
     collapsed = std::move(polished);
-    if (collapsed.size() > 200) {
-        collapsed.resize(200);
-    }
-    return collapsed;
+    return bounded_valid_utf8_preview(collapsed);
 }
 
 void add_attachment(ParseContext& context,

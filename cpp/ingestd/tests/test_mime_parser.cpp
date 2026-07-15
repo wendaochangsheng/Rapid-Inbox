@@ -210,6 +210,47 @@ void test_mime_parser_decodes_latin1_text_body() {
                 "latin1 text body converted to utf-8");
 }
 
+void test_mime_parser_truncates_preview_at_utf8_boundary() {
+    const std::string headers =
+        "From: QA Sender <sender@example.com>\r\n"
+        "To: foo@adb.com\r\n"
+        "Subject: UTF-8 preview boundary\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "\r\n";
+
+    const auto split_code_point = parse(
+        headers + std::string(198, 'a') + std::string("\xe4\xb8\xad") + "tail\r\n");
+    test::check(split_code_point.text_preview.value_or("") == std::string(198, 'a'),
+                "preview does not split a utf-8 code point");
+    test::check(split_code_point.text_preview.value_or("").size() <= 200,
+                "utf-8 preview stays within byte limit");
+
+    const std::string exact_preview = std::string(197, 'a') + std::string("\xe4\xb8\xad");
+    const auto exact_boundary = parse(headers + exact_preview + "tail\r\n");
+    test::check(exact_boundary.text_preview.value_or("") == exact_preview,
+                "complete utf-8 code point is retained at byte limit");
+    test::check(exact_boundary.text_preview.value_or("").size() == 200,
+                "utf-8 preview can fill byte limit exactly");
+}
+
+void test_mime_parser_replaces_invalid_utf8_in_preview() {
+    std::string raw_message =
+        "From: QA Sender <sender@example.com>\r\n"
+        "To: foo@adb.com\r\n"
+        "Subject: Invalid UTF-8 preview\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "\r\n"
+        "before";
+    raw_message.push_back(static_cast<char>(0xff));
+    raw_message += "after\r\n";
+
+    const auto parsed = parse(raw_message);
+    test::check(parsed.text_preview.value_or("") == "before\xef\xbf\xbd" "after",
+                "invalid utf-8 preview bytes are replaced");
+    test::check(parsed.text_preview.value_or("").size() <= 200,
+                "sanitized preview stays within byte limit");
+}
+
 void test_mime_parser_keeps_empty_attachment() {
     const auto parsed = parse(
         "From: QA Sender <sender@example.com>\r\n"

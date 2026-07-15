@@ -159,6 +159,26 @@ async def test_admin_api_supports_message_reparse_and_settings_update(admin_clie
 
 
 @pytest.mark.asyncio
+async def test_admin_message_detail_replaces_invalid_utf8_preview(
+    admin_client,
+    runtime,
+    seeded_message,
+) -> None:
+    with connect_database(runtime.settings.database_path) as connection:
+        connection.execute(
+            "UPDATE messages SET text_preview = CAST(? AS TEXT) WHERE id = ?",
+            (b"legacy-\xe4\xb8", seeded_message.message_id),
+        )
+
+    response = await admin_client.get(
+        f"/api/v1/admin/messages/{seeded_message.message_id}"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text_preview"] == "legacy-\ufffd"
+
+
+@pytest.mark.asyncio
 async def test_live_sse_api_key_enforces_ip_restrictions(app_client, runtime) -> None:
     key = await runtime.api_keys.create_key(
         name="live-ip-restricted",

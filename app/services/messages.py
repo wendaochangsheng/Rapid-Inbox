@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 import sqlite3
 from typing import Any
@@ -24,6 +25,23 @@ SAFE_INLINE_CONTENT_TYPES = {
 }
 
 _CID_REFERENCE_RE = re.compile(r'cid:([^"\'<>\s]+)', re.IGNORECASE)
+_logger = logging.getLogger("rapid_inbox.messages")
+
+
+def _decode_legacy_text_preview(value: bytes | None, *, message_id: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        _logger.warning(
+            "invalid UTF-8 message preview recovered",
+            extra={
+                "event": "invalid_text_preview_recovered",
+                "message_id": message_id,
+            },
+        )
+        return value.decode("utf-8", errors="replace")
 
 
 class MessageService:
@@ -214,7 +232,7 @@ class MessageService:
                     has_html,
                     has_attachments,
                     attachment_count,
-                    text_preview,
+                    CAST(text_preview AS BLOB) AS text_preview_raw,
                     text_body_path,
                     html_body_path,
                     CASE
@@ -267,6 +285,10 @@ class MessageService:
             ).fetchall()
 
         payload = dict(row)
+        payload["text_preview"] = _decode_legacy_text_preview(
+            payload.pop("text_preview_raw"),
+            message_id=message_id,
+        )
         for key in ("has_text", "has_html", "has_attachments"):
             payload[key] = bool(payload[key])
         (
