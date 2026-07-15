@@ -432,6 +432,16 @@
       </section>
     </form>
 
+    <div class="action-bar">
+      <span class="action-bar__hint">所有修改保存后立即生效。</span>
+      <div class="action-bar__buttons">
+        <a class="button button--ghost" href="/admin/api-keys">放弃</a>
+        <button class="button button--primary" type="submit" form="api-key-update-form">
+          <i data-lucide="save"></i>保存修改
+        </button>
+      </div>
+    </div>
+
     <section class="doc-section" id="rotate">
       <header class="doc-section__intro">
         <p class="eyebrow" style="color: var(--danger-strong);">危险操作</p>
@@ -472,15 +482,6 @@
       </div>
     </section>
 
-    <div class="action-bar">
-      <span class="action-bar__hint">所有修改保存后立即生效。</span>
-      <div class="action-bar__buttons">
-        <a class="button button--ghost" href="/admin/api-keys">放弃</a>
-        <button class="button button--primary" type="submit" form="api-key-update-form">
-          <i data-lucide="save"></i>保存修改
-        </button>
-      </div>
-    </div>
   </div>
 </div>
 {% endblock %}

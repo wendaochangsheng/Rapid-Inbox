@@ -62,10 +62,7 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     gap: 10px;
-    padding: 14px 16px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--bg-subtle);
+    margin-top: 16px;
   }
   .danger-stat strong {
     display: block;
@@ -81,19 +78,28 @@
     margin-top: 2px;
   }
 
-  .danger-confirm {
-    display: inline-flex;
+  .danger-stat {
+    padding: 12px 14px;
+    border: 1px solid var(--border-faint);
+    border-radius: 10px;
+    background: var(--bg-subtle);
+  }
+
+  /* Inline checkbox options: override the base `label { flex-direction: column }`
+     so the box sits beside its text and multiple options flow in a row. */
+  .checkbox-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 20px;
+  }
+  .checkbox-row label {
+    flex-direction: row;
     align-items: center;
     gap: 8px;
-    margin-top: 14px;
-    padding: 10px 14px;
-    background: var(--danger-soft);
-    border: 1px solid rgba(177, 67, 67, 0.4);
-    border-radius: 10px;
-    color: var(--danger-strong);
-    font-size: 0.88rem;
+    font-weight: 500;
     cursor: pointer;
   }
+  .checkbox-row input[type="checkbox"] { margin: 0; }
 
   @media (max-width: 760px) {
     .horiz-row { grid-template-columns: 1fr; }
@@ -173,9 +179,9 @@
             <span class="horiz-row__label">任意域名访问策略</span>
             <p class="horiz-row__hint">默认完全私有。只有明确勾选后，未知域邮箱才可从对应公共入口查阅。</p>
           </div>
-          <div>
+          <div class="checkbox-row">
             <label><input type="checkbox" name="catch_all_public_web_enabled" value="1"{% if settings_form.catch_all_public_web_enabled %} checked{% endif %} /> 允许公共网页</label>
-            <label style="margin-left:16px"><input type="checkbox" name="catch_all_public_api_enabled" value="1"{% if settings_form.catch_all_public_api_enabled %} checked{% endif %} /> 允许公共 API</label>
+            <label><input type="checkbox" name="catch_all_public_api_enabled" value="1"{% if settings_form.catch_all_public_api_enabled %} checked{% endif %} /> 允许公共 API</label>
           </div>
         </div>
         <div class="horiz-row">
@@ -271,6 +277,8 @@
                 "每 IP 短窗口连接上限",
                 "SMTP 连接限流窗口",
                 "磁盘告警阈值",
+                "收件路由模式",
+                "清理批次",
               ] %}
                 <div class="ref-cell">
                   <span class="ref-cell__label">{{ item.label }}</span>
@@ -342,37 +350,43 @@
         <p>清除所有已接收邮件、投递记录、附件记录、邮箱记录和近期网络会话，并删除 raw、text、html、attachments、manifests 中的邮件文件，同时压缩 SQLite 数据库。域名、管理员、API 密钥和审计日志会保留。</p>
       </header>
 
-      <div class="danger-stat-row" aria-label="当前邮件数据">
-        <div class="danger-stat">
-          <strong>{{ mail_store_stats.messages }}</strong>
-          <span>邮件</span>
-        </div>
-        <div class="danger-stat">
-          <strong>{{ mail_store_stats.mailboxes }}</strong>
-          <span>邮箱记录</span>
-        </div>
-        <div class="danger-stat">
-          <strong>{{ mail_store_stats.attachments }}</strong>
-          <span>附件记录</span>
-        </div>
-        <div class="danger-stat">
-          <strong>{{ mail_store_stats.smtp_sessions }}</strong>
-          <span>近期网络会话</span>
-        </div>
-      </div>
-
       <form
+        class="danger-action"
         method="post"
         action="/admin/settings/clear-mail"
-        onsubmit="return confirm('确认清除所有已接收邮件、邮箱记录和近期网络会话？此操作不可恢复。')"
+        data-danger-action
       >
-        <label class="danger-confirm">
-          <input type="checkbox" name="confirm" value="clear-all-mail" required />
-          我确认清除所有邮件数据和近期网络会话
-        </label>
-        <div class="row" style="margin-top: 14px;">
-          <button class="button button--danger" type="submit">
-            <i data-lucide="trash-2"></i>清除所有邮件
+        <div class="danger-action__body">
+          <div class="danger-action__copy">
+            <h3 class="danger-action__title"><i data-lucide="triangle-alert"></i>当前将被永久清除的数据</h3>
+            <p>域名、管理员、API 密钥和审计日志不受影响；以下邮件数据和文件将无法恢复。</p>
+          </div>
+          <div class="danger-stat-row" aria-label="当前邮件数据">
+            <div class="danger-stat">
+              <strong>{{ mail_store_stats.messages }}</strong>
+              <span>邮件</span>
+            </div>
+            <div class="danger-stat">
+              <strong>{{ mail_store_stats.mailboxes }}</strong>
+              <span>邮箱记录</span>
+            </div>
+            <div class="danger-stat">
+              <strong>{{ mail_store_stats.attachments }}</strong>
+              <span>附件记录</span>
+            </div>
+            <div class="danger-stat">
+              <strong>{{ mail_store_stats.smtp_sessions }}</strong>
+              <span>近期网络会话</span>
+            </div>
+          </div>
+        </div>
+        <div class="danger-action__footer">
+          <label class="danger-action__confirm">
+            <input type="checkbox" name="confirm" value="clear-all-mail" required data-danger-confirm />
+            <span>我已了解这会永久清除全部邮件数据、文件和近期网络会话。</span>
+          </label>
+          <button class="button button--danger" type="submit" disabled data-no-confirm>
+            <i data-lucide="trash-2"></i>永久清除全部邮件
           </button>
         </div>
       </form>

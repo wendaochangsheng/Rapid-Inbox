@@ -35,16 +35,16 @@
   }
   .horiz-row + .horiz-row { border-top: 1px solid var(--border-faint); padding-top: 14px; margin-top: 14px; }
   .horiz-row label { display: block; }
-  .horiz-row > .horiz-row__label {
+  .horiz-row__label {
     color: var(--text-secondary);
     font-size: 0.9rem;
     font-weight: 600;
   }
-  .horiz-row > .horiz-row__hint {
+  .horiz-row__hint {
     color: var(--text-muted);
     font-size: 0.82rem;
     font-weight: 400;
-    margin-top: 3px;
+    margin: 3px 0 0;
   }
   .horiz-row__input { display: grid; gap: 6px; }
   .toggle-row {
@@ -178,10 +178,14 @@
   <nav class="split-page__nav" aria-label="详情章节">
     <p class="split-page__nav-label">章节</p>
     <a href="#overview"><i data-lucide="layers"></i>概览</a>
-    <a href="#config"><i data-lucide="settings-2"></i>配置编辑</a>
-    <a href="#dns"><i data-lucide="server"></i>DNS 建议</a>
+    {% if domain.is_catch_all %}
+      <a href="#config"><i data-lucide="settings-2"></i>全域策略</a>
+    {% else %}
+      <a href="#config"><i data-lucide="settings-2"></i>配置编辑</a>
+      <a href="#dns"><i data-lucide="server"></i>DNS 建议</a>
+    {% endif %}
     <a href="#mailboxes"><i data-lucide="inbox"></i>关联邮箱</a>
-    <a href="#danger"><i data-lucide="alert-triangle"></i>危险操作</a>
+    {% if not domain.is_catch_all %}<a href="#danger"><i data-lucide="alert-triangle"></i>危险操作</a>{% endif %}
   </nav>
 
   <div class="split-page__main">
@@ -189,7 +193,7 @@
       <header class="doc-section__intro">
         <p class="eyebrow">概览</p>
         <h2>当前配置一览</h2>
-        <p>域名的访问控制、路由规则与配额信息，可在下方"配置编辑"章节同步修改。</p>
+        <p>{% if domain.is_catch_all %}任意域名收件策略的当前状态；策略修改统一在系统设置中完成。{% else %}域名的访问控制、路由规则与配额信息，可在下方“配置编辑”章节同步修改。{% endif %}</p>
       </header>
       <ul class="def-list">
         <li>
@@ -243,6 +247,20 @@
       </ul>
     </section>
 
+    {% if domain.is_catch_all %}
+    <section class="doc-section" id="config">
+      <header class="doc-section__intro">
+        <p class="eyebrow">任意域名策略</p>
+        <h2>在系统设置中统一管理</h2>
+        <p>“*”是系统保留的全域规则，不能在普通域名详情中改名、执行 DNS 检查或删除。</p>
+      </header>
+      <div class="notice notice--info">
+        <i data-lucide="info"></i>
+        <span>前往系统设置调整收件模式、公开访问策略和默认保留天数。</span>
+      </div>
+      <a class="button button--primary" href="/admin/settings#runtime"><i data-lucide="settings"></i>打开系统设置</a>
+    </section>
+    {% else %}
     <section class="doc-section" id="config">
       <header class="doc-section__intro">
         <p class="eyebrow">配置编辑</p>
@@ -433,6 +451,7 @@
         </p>
       {% endif %}
     </section>
+    {% endif %}
 
     <section class="doc-section" id="mailboxes">
       <header class="doc-section__intro">
@@ -469,24 +488,32 @@
       {% endif %}
     </section>
 
+    {% if not domain.is_catch_all %}
     <section class="doc-section" id="danger">
       <header class="doc-section__intro">
         <p class="eyebrow" style="color: var(--danger-strong);">危险操作</p>
         <h2>删除域名</h2>
         <p>只有没有关联邮箱、投递记录和 API 授权的域名可以直接删除。已有数据的域名建议先停用。</p>
       </header>
-      <form method="post" action="/admin/domains/{{ domain.id }}/delete" onsubmit="return confirm('确认删除该域名？')">
-        <label style="display: inline-flex; gap: 8px; align-items: center; padding: 12px 14px; border: 1px solid rgba(177, 67, 67, 0.4); border-radius: 10px; background: var(--danger-soft); color: var(--danger-strong); cursor: pointer;">
-          <input type="checkbox" name="confirm" value="delete-domain" required />
-          确认删除该域名
-        </label>
-        <div class="row" style="margin-top: 16px;">
-          <button class="button button--danger" type="submit">
-            <i data-lucide="trash-2"></i>删除域名
+      <form class="danger-action" method="post" action="/admin/domains/{{ domain.id }}/delete" data-danger-action>
+        <div class="danger-action__body">
+          <div class="danger-action__copy">
+            <h3 class="danger-action__title"><i data-lucide="triangle-alert"></i>永久删除 {{ domain.root_domain_ascii }}</h3>
+            <p>删除后该域名将不再接收邮件，相关配置也无法恢复。若只是暂时停止收件，请在上方关闭“启用域名”。</p>
+          </div>
+        </div>
+        <div class="danger-action__footer">
+          <label class="danger-action__confirm">
+            <input type="checkbox" name="confirm" value="delete-domain" required data-danger-confirm />
+            <span>我已确认删除的是 <strong>{{ domain.root_domain_ascii }}</strong>，并了解此操作不可恢复。</span>
+          </label>
+          <button class="button button--danger" type="submit" disabled data-no-confirm>
+            <i data-lucide="trash-2"></i>永久删除域名
           </button>
         </div>
       </form>
     </section>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

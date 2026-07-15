@@ -248,9 +248,13 @@
       .icon-btn:focus-visible,
       .nav-link:focus-visible,
       input:focus-visible,
-      summary:focus-visible {
+      summary:focus-visible,
+      button:focus-visible,
+      a:focus-visible,
+      [tabindex]:focus-visible {
         outline: none;
         box-shadow: var(--shadow-focus);
+        border-radius: var(--radius-sm);
       }
 
       .icon-btn {

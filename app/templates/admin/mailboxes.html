@@ -71,7 +71,8 @@
     gap: 14px;
     flex-shrink: 0;
   }
-  .toggle-mini {
+  .toggle-mini { margin: 0; }
+  .toggle-mini__control {
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -84,7 +85,19 @@
     font-weight: 500;
     user-select: none;
   }
-  .toggle-mini input { display: none; }
+  /* Keep the checkbox operable and keyboard-focusable while hiding it
+     visually — display:none removes it from the a11y tree and tab order. */
+  .toggle-mini input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
   .toggle-switch-mini {
     position: relative;
     display: inline-block;
@@ -192,28 +205,30 @@
             action="/admin/mailboxes/{{ mailbox.id }}"
             class="toggle-mini"
             data-auto-submit
-            title="开启后此邮箱可在公开页面被访问"
           >
             <input type="hidden" name="limit" value="{{ pagination.limit }}" />
             <input type="hidden" name="offset" value="{{ pagination.offset }}" />
             <input type="hidden" name="public_enabled" value="0" />
-            <input type="checkbox" name="public_enabled" value="1" {% if mailbox.public_enabled %}checked{% endif %} />
-            <span class="toggle-switch-mini" aria-hidden="true"></span>
-            <span class="toggle-mini__label">公开</span>
+            <label class="toggle-mini__control" title="开启后此邮箱可在公开页面被访问">
+              <input type="checkbox" name="public_enabled" value="1" {% if mailbox.public_enabled %}checked{% endif %} />
+              <span class="toggle-switch-mini" aria-hidden="true"></span>
+              <span class="toggle-mini__label">公开</span>
+            </label>
           </form>
           <form
             method="post"
             action="/admin/mailboxes/{{ mailbox.id }}"
             class="toggle-mini"
             data-auto-submit
-            title="开启后此邮箱将从公开列表中隐藏"
           >
             <input type="hidden" name="limit" value="{{ pagination.limit }}" />
             <input type="hidden" name="offset" value="{{ pagination.offset }}" />
             <input type="hidden" name="is_hidden" value="0" />
-            <input type="checkbox" name="is_hidden" value="1" {% if mailbox.is_hidden %}checked{% endif %} />
-            <span class="toggle-switch-mini" aria-hidden="true"></span>
-            <span class="toggle-mini__label">隐藏</span>
+            <label class="toggle-mini__control" title="开启后此邮箱将从公开列表中隐藏">
+              <input type="checkbox" name="is_hidden" value="1" {% if mailbox.is_hidden %}checked{% endif %} />
+              <span class="toggle-switch-mini" aria-hidden="true"></span>
+              <span class="toggle-mini__label">隐藏</span>
+            </label>
           </form>
         </div>
 

@@ -10,9 +10,24 @@
   .admin-actions label { display: grid; gap: 5px; color: var(--text-muted); font-size: .78rem; }
   .admin-actions input, .admin-actions select { min-height: 38px; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elevated); }
   .create-card { margin-bottom: 22px; }
+  .admin-maintenance {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 14px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border-faint);
+  }
+  .admin-maintenance .admin-actions { flex: 1; }
+  .admin-delete-form { flex: 0 0 auto; margin: 0; }
   .notice { padding: 11px 14px; margin-bottom: 16px; border-radius: var(--radius); }
   .notice--error { background: var(--danger-soft); color: var(--danger-strong); }
   .notice--ok { background: var(--success-soft); color: var(--success-strong); }
+  @media (max-width: 720px) {
+    .admin-maintenance { align-items: stretch; flex-direction: column; }
+    .admin-delete-form .button { width: 100%; }
+  }
 </style>
 {% endblock %}
 
@@ -47,18 +62,24 @@
   <article class="admin-card">
     <div class="admin-card__head">
       <div><h3>{{ item.display_name or item.username }}</h3><div class="admin-card__meta">@{{ item.username }} · {{ cn_admin_role(item.role) }} · 最近登录 {{ cn_datetime(item.last_login_at) }}</div></div>
-      <span class="badge{% if item.is_active %} badge--success{% else %} badge--muted{% endif %}">{{ '启用' if item.is_active else '停用' }}</span>
+      <span class="pill{% if item.is_active %} pill--success{% else %} pill--neutral{% endif %}">{{ '启用' if item.is_active else '停用' }}</span>
     </div>
     <form class="admin-actions" method="post" action="/admin/admins/{{ item.id }}">
       <label>角色<select name="role"><option value="viewer"{% if item.role == 'viewer' %} selected{% endif %}>Viewer</option><option value="operator"{% if item.role == 'operator' %} selected{% endif %}>Operator</option><option value="superadmin"{% if item.role == 'superadmin' %} selected{% endif %}>Superadmin</option></select></label>
       <label><span>状态</span><span><input name="is_active" type="checkbox" value="1"{% if item.is_active %} checked{% endif %} /> 启用</span></label>
-      <button class="button button--secondary" type="submit">保存权限</button>
+      <button class="button button--ghost" type="submit">保存权限</button>
     </form>
-    <form class="admin-actions" method="post" action="/admin/admins/{{ item.id }}/reset-password" style="margin-top:10px">
-      <label>重置密码<input name="password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password" /></label>
-      <button class="button button--secondary" type="submit">重置并撤销会话</button>
-      {% if item.id != admin.id %}<button class="button button--danger" type="submit" formaction="/admin/admins/{{ item.id }}/delete" onclick="return confirm('确认删除该管理员？')">删除</button>{% endif %}
-    </form>
+    <div class="admin-maintenance">
+      <form class="admin-actions" method="post" action="/admin/admins/{{ item.id }}/reset-password">
+        <label>重置密码<input name="password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password" /></label>
+        <button class="button button--ghost" type="submit">重置并撤销会话</button>
+      </form>
+      {% if item.id != admin.id %}
+        <form class="admin-delete-form" method="post" action="/admin/admins/{{ item.id }}/delete" onsubmit="return confirm('确认删除该管理员？')">
+          <button class="button button--danger" type="submit"><i data-lucide="trash-2"></i>删除管理员</button>
+        </form>
+      {% endif %}
+    </div>
   </article>
 {% else %}
   <div class="empty-state">暂无管理员。</div>

@@ -347,14 +347,37 @@
   </section>
 
   <script>
-    function copyApiKey() {
+    async function copyTextResilient(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text);
+      }
+      // Fallback for non-secure origins (e.g. http accessed by IP).
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.top = '0';
+      area.style.left = '0';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(area);
+      if (!ok) throw new Error('copy command failed');
+    }
+
+    async function copyApiKey() {
       const keyText = document.getElementById('raw-api-key').textContent;
-      navigator.clipboard.writeText(keyText).then(() => {
-        const btn = document.querySelector('.copy-btn');
-        const original = btn.innerHTML;
+      const btn = document.querySelector('.copy-btn');
+      const original = btn.innerHTML;
+      try {
+        await copyTextResilient(keyText);
         btn.textContent = '已复制！';
-        setTimeout(() => { btn.innerHTML = original; if (window.lucide) window.lucide.createIcons(); }, 1800);
-      });
+      } catch (error) {
+        console.error('Failed to copy API key', error);
+        btn.textContent = '复制失败，请手动复制';
+      }
+      setTimeout(() => { btn.innerHTML = original; if (window.lucide) window.lucide.createIcons(); }, 1800);
     }
   </script>
 {% endif %}

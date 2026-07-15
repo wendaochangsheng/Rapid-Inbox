@@ -285,9 +285,9 @@
         display: flex;
         gap: 18px;
         align-items: center;
-        justify-content: space-between;
-        min-height: 72px;
-        padding: 14px 36px;
+        justify-content: flex-end;
+        min-height: 56px;
+        padding: 8px 36px;
         background: rgba(250, 249, 245, 0.85);
         backdrop-filter: saturate(140%) blur(12px);
         -webkit-backdrop-filter: saturate(140%) blur(12px);
@@ -315,6 +315,7 @@
         gap: 8px;
         align-items: center;
         justify-content: flex-end;
+        margin-left: auto;
       }
 
       .shell {
@@ -448,7 +449,7 @@
         background: var(--danger-soft);
         color: var(--danger-strong);
       }
-      .button--danger:hover {
+      .button--danger:not(:disabled):hover {
         background: var(--danger);
         border-color: var(--danger);
         color: #fff;
@@ -469,6 +470,7 @@
       }
 
       .button--block { width: 100%; }
+      .button:disabled { cursor: not-allowed; opacity: 0.48; }
 
       .button:focus-visible,
       .page-link:focus-visible,
@@ -476,8 +478,19 @@
       input:focus-visible,
       select:focus-visible,
       textarea:focus-visible,
-      summary:focus-visible {
+      summary:focus-visible,
+      button:focus-visible,
+      a:focus-visible,
+      [tabindex]:focus-visible {
         outline: none;
+        box-shadow: var(--shadow-focus);
+        border-radius: var(--radius-sm);
+      }
+
+      /* Custom toggle switch: mirror the hidden checkbox's keyboard focus
+         onto the visible slider so keyboard users see where they are. */
+      .toggle-switch input:focus-visible + .toggle-switch__slider,
+      .toggle-mini input:focus-visible + .toggle-switch-mini {
         box-shadow: var(--shadow-focus);
       }
 
@@ -575,6 +588,92 @@
         color: var(--text-muted);
         font-size: 0.85rem;
         margin: 0;
+      }
+
+      /* Keep the explanation, acknowledgement and final destructive action in
+         one visual unit instead of presenting the checkbox as a loose field. */
+      .danger-action {
+        overflow: hidden;
+        border: 1px solid rgba(177, 67, 67, 0.28);
+        border-radius: var(--radius-lg);
+        background: var(--bg-elevated);
+      }
+      .danger-action__body {
+        padding: 18px;
+      }
+      .danger-action__copy { min-width: 0; }
+      .danger-action__title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 5px;
+        color: var(--danger-strong);
+        font-size: 0.95rem;
+        font-weight: 650;
+        overflow-wrap: anywhere;
+      }
+      .danger-action__title svg { width: 16px; height: 16px; flex: 0 0 auto; }
+      .danger-action__copy p {
+        margin: 0;
+        max-width: 62ch;
+        color: var(--text-muted);
+        font-size: 0.84rem;
+        line-height: 1.55;
+      }
+      .danger-action__footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 12px 18px;
+        padding: 14px 18px;
+        border-top: 1px solid rgba(177, 67, 67, 0.16);
+        background: rgba(177, 67, 67, 0.035);
+      }
+      .danger-action__confirm {
+        display: inline-flex;
+        flex-direction: row;
+        align-items: flex-start;
+        gap: 9px;
+        max-width: 58ch;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        font-weight: 500;
+        line-height: 1.45;
+        cursor: pointer;
+        flex: 1 1 300px;
+        min-width: 0;
+      }
+      .danger-action__confirm span { min-width: 0; overflow-wrap: anywhere; }
+      .danger-action__confirm input {
+        flex: 0 0 auto;
+        margin: 2px 0 0;
+        accent-color: var(--danger);
+      }
+      .danger-action .button[disabled] { cursor: not-allowed; opacity: 0.48; }
+
+      /* Selection controls keep destructive bulk actions unavailable until
+         the operator has made an explicit choice. */
+      .bulk-action-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px 14px;
+      }
+      .bulk-action-bar__select {
+        display: inline-flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .bulk-action-bar__select input { margin: 0; }
+      .bulk-action-bar__summary {
+        color: var(--text-muted);
+        font-size: 0.84rem;
       }
 
       /* Pills / badges */
@@ -1357,6 +1456,8 @@
         .list-row__actions { justify-content: flex-start; }
         .inbox-row { grid-template-columns: 36px minmax(0, 1fr); gap: 12px; }
         .inbox-row__tail { grid-column: 1 / -1; justify-content: flex-start; }
+        .danger-action__footer { align-items: stretch; }
+        .danger-action__footer .button { width: 100%; }
       }
 
       /* Scrollbar (subtle) */
@@ -1404,12 +1505,9 @@
 
       @media (max-width: 720px) {
         .topbar {
-          flex-direction: column;
-          align-items: flex-start;
-          padding: 14px 18px;
+          padding: 8px 14px;
         }
-        .topbar__actions { width: 100%; justify-content: stretch; }
-        .topbar__actions .button, .topbar__actions form { flex: 1; }
+        .topbar__actions { width: auto; }
         .shell {
           width: min(100% - 28px, 1280px);
           padding-top: 18px;
@@ -1418,6 +1516,16 @@
           align-items: flex-start;
           flex-direction: column;
         }
+        .action-bar {
+          bottom: 8px;
+          margin-top: 24px;
+          padding: 10px;
+        }
+        .action-bar__hint { display: none; }
+        .action-bar__buttons { width: 100%; }
+        .action-bar__buttons .button { flex: 1 1 auto; }
+        .bulk-action-bar { width: 100%; }
+        .bulk-action-bar .button { width: 100%; }
       }
     </style>
     {% block head %}{% endblock %}
@@ -1495,17 +1603,10 @@
         </aside>
 
         <div class="app__main">
-          <header class="topbar">
-            <div class="topbar__title">
-              <h1>{{ page_title or "仪表盘" }}</h1>
-              <p class="topbar__subtitle">高效、优雅的域名与邮件管控平台</p>
-            </div>
+          <header class="topbar" aria-label="会话操作">
             <div class="topbar__actions">
-              <a class="button button--ghost" href="/">
-                <i data-lucide="home"></i>公开首页
-              </a>
               <form method="post" action="/admin/logout" style="margin: 0;">
-                <button class="button button--danger" type="submit">
+                <button class="button button--ghost button--sm" type="submit">
                   <i data-lucide="log-out"></i>退出登录
                 </button>
               </form>
@@ -1566,7 +1667,52 @@
         closeConfirm();
       };
 
+      // Destructive forms with an explicit acknowledgement stay disabled
+      // until the operator has checked the matching confirmation box.
+      document.querySelectorAll("[data-danger-action]").forEach((form) => {
+        const acknowledgement = form.querySelector("[data-danger-confirm]");
+        const submit = form.querySelector('button[type="submit"]');
+        if (!acknowledgement || !submit) return;
+        const sync = () => {
+          submit.disabled = !acknowledgement.checked;
+        };
+        acknowledgement.addEventListener("change", sync);
+        sync();
+      });
+
+      document.querySelectorAll("[data-bulk-delete-form]").forEach((form) => {
+        const items = Array.from(form.querySelectorAll("[data-bulk-item]:not(:disabled)"));
+        const toggle = form.querySelector("[data-bulk-toggle]");
+        const submit = form.querySelector("[data-bulk-submit]");
+        const summary = form.querySelector("[data-bulk-summary]");
+        if (!toggle || !submit || !summary) return;
+
+        const sync = () => {
+          const selected = items.filter((item) => item.checked).length;
+          submit.disabled = selected === 0;
+          summary.textContent = selected === 0 ? "请先选择要删除的投递" : `已选择 ${selected} 条投递`;
+          toggle.checked = items.length > 0 && selected === items.length;
+          toggle.indeterminate = selected > 0 && selected < items.length;
+        };
+
+        toggle.disabled = items.length === 0;
+        toggle.addEventListener("change", () => {
+          items.forEach((item) => { item.checked = toggle.checked; });
+          sync();
+        });
+        items.forEach((item) => item.addEventListener("change", sync));
+        sync();
+      });
+
       document.querySelectorAll(".button--danger").forEach((btn) => {
+        // Only intercept danger buttons that don't already have their own
+        // confirmation. Skip explicit opt-outs (e.g. logout, a reversible
+        // action) and any button/form that already declares an inline
+        // confirm(), which would otherwise double-prompt the user.
+        if (btn.hasAttribute("data-no-confirm")) return;
+        if (btn.hasAttribute("onclick")) return;
+        const ownerForm = btn.closest("form");
+        if (ownerForm && ownerForm.hasAttribute("onsubmit")) return;
         if (btn.type === "submit" || btn.tagName === "A") {
           btn.addEventListener("click", function (e) {
             if (!this.dataset.confirmed) {

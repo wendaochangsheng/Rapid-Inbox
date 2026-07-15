@@ -184,11 +184,11 @@
   </header>
 
   {% if deliveries %}
-    <form method="post" action="/admin/mailboxes/{{ mailbox.id }}/delete-deliveries">
+    <form method="post" action="/admin/mailboxes/{{ mailbox.id }}/delete-deliveries" data-bulk-delete-form>
       <div style="border-top: 1px solid var(--border-faint);">
         {% for delivery in deliveries %}
           <div class="delivery-row">
-            <input type="checkbox" name="delivery_ids" value="{{ delivery.delivery_id }}" {% if delivery.status != "active" %}disabled{% endif %} />
+            <input type="checkbox" name="delivery_ids" value="{{ delivery.delivery_id }}" data-bulk-item {% if delivery.status != "active" %}disabled{% endif %} />
             <div class="delivery-row__subject">
               <a href="/admin/messages/{{ delivery.message_id }}">{{ delivery.subject or "（无主题）" }}</a>
               <p class="delivery-row__sender">{{ delivery.from_addr or "未知发件人" }} · <code>{{ delivery.delivery_id }}</code></p>
@@ -201,9 +201,16 @@
         {% endfor %}
       </div>
       <div class="pagination-panel">
-        <button class="button button--danger" type="submit" onclick="return confirm('确认软删除选中的投递？未选择时会删除该邮箱全部有效投递。')">
-          <i data-lucide="trash-2"></i>删除选中投递
-        </button>
+        <div class="bulk-action-bar">
+          <label class="bulk-action-bar__select">
+            <input type="checkbox" data-bulk-toggle />
+            <span>选择本页全部投递</span>
+          </label>
+          <span class="bulk-action-bar__summary" data-bulk-summary aria-live="polite">请先选择要删除的投递</span>
+          <button class="button button--danger" type="submit" disabled data-bulk-submit onclick="return confirm('确认软删除选中的投递？')">
+            <i data-lucide="trash-2"></i>删除选中投递
+          </button>
+        </div>
         {{ pagination_nav(pagination) }}
       </div>
     </form>

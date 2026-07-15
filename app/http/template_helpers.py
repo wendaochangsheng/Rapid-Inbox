@@ -8,6 +8,19 @@ PRODUCT_NAME = "Rapid Inbox"
 ADMIN_PRODUCT_NAME = "Rapid Inbox"
 SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
+
+def time_greeting(now: datetime | None = None) -> str:
+    """Time-of-day greeting in the same timezone used to display all times."""
+    current = (now or datetime.now(timezone.utc)).astimezone(SHANGHAI_TZ)
+    hour = current.hour
+    if 5 <= hour < 12:
+        return "早上好"
+    if 12 <= hour < 18:
+        return "下午好"
+    if 18 <= hour < 23:
+        return "晚上好"
+    return "夜深了"
+
 _ADMIN_ROLE_LABELS = {
     "superadmin": "超级管理员",
     "operator": "运维成员",
@@ -273,4 +286,5 @@ def register_template_helpers(templates: Any) -> None:
         cn_resource_type=cn_resource_type,
         cn_action=cn_action,
         cn_plus_addressing_mode=cn_plus_addressing_mode,
+        time_greeting=time_greeting,
     )

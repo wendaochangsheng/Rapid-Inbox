@@ -51,7 +51,8 @@ async def test_admin_login_and_dashboard_page_flow(app_client, runtime) -> None:
     )
 
     assert response.status_code == 200
-    assert "高效、优雅的域名与邮件管控平台" in response.text
+    assert "调整运行参数、修改管理员密码或清除全部邮件数据" in response.text
+    assert 'aria-label="会话操作"' in response.text
     assert "当前账号仍在使用初始密码" in response.text
     assert "修改管理员密码" in response.text
 
@@ -345,6 +346,11 @@ async def test_admin_domains_page_can_create_domain_via_form(app_client, runtime
         },
     )
     updated_detail = runtime.domains.get_domain(created["id"])
+    detail_page = await app_client.get(f"/admin/domains/{created['id']}")
+    missing_confirmation = await app_client.post(
+        f"/admin/domains/{created['id']}/delete",
+        data={},
+    )
     deleted_response = await app_client.post(
         f"/admin/domains/{created['id']}/delete",
         data={"confirm": "delete-domain"},
@@ -360,10 +366,63 @@ async def test_admin_domains_page_can_create_domain_via_form(app_client, runtime
     assert updated_response.status_code == 303
     assert updated_detail["root_domain_ascii"] == "renamed-mail.adb.com"
     assert updated_detail["notes"] == "updated through admin page"
+    assert detail_page.status_code == 200
+    assert 'class="danger-action"' in detail_page.text
+    assert 'value="delete-domain" required data-danger-confirm' in detail_page.text
+    assert "永久删除 renamed-mail.adb.com" in detail_page.text
+    assert "onsubmit=\"return confirm('确认删除该域名" not in detail_page.text
+    assert missing_confirmation.status_code == 422
     assert deleted_response.status_code == 303
     assert deleted_response.headers["location"] == "/admin/domains"
     with pytest.raises(LookupError):
         runtime.domains.get_domain(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_catch_all_domain_detail_routes_management_to_settings(app_client, runtime) -> None:
+    await runtime.system_settings.update_settings({"ingress_mode": "managed_plus_catchall"})
+    catch_all = next(
+        item for item in runtime.domains.list_domains() if item["root_domain_ascii"] == "*"
+    )
+    await _login_and_change_initial_password(app_client, runtime)
+
+    response = await app_client.get(f"/admin/domains/{catch_all['id']}")
+
+    assert response.status_code == 200
+    assert "在系统设置中统一管理" in response.text
+    assert 'href="/admin/settings#runtime"' in response.text
+    assert f'action="/admin/domains/{catch_all["id"]}/delete"' not in response.text
+    assert f'action="/admin/domains/{catch_all["id"]}/dns-check"' not in response.text
+    assert 'name="root_domain"' not in response.text
+
+
+@pytest.mark.asyncio
+async def test_admin_delete_action_is_separate_from_password_reset(app_client, runtime) -> None:
+    await _login_and_change_initial_password(app_client, runtime)
+    created = await app_client.post(
+        "/admin/admins",
+        data={
+            "username": "layout-operator",
+            "display_name": "Layout Operator",
+            "password": "strong-layout-password",
+            "role": "operator",
+            "is_active": "1",
+        },
+    )
+    operator = next(
+        item for item in runtime.auth.list_admins()["items"] if item["username"] == "layout-operator"
+    )
+    page = await app_client.get("/admin/admins")
+    delete_form = re.search(
+        rf'<form class="admin-delete-form"[^>]*action="/admin/admins/{operator["id"]}/delete"[^>]*>(.*?)</form>',
+        page.text,
+        re.DOTALL,
+    )
+
+    assert created.status_code == 303
+    assert page.status_code == 200
+    assert delete_form is not None
+    assert 'name="password"' not in delete_form.group(1)
 
 
 @pytest.mark.asyncio
@@ -391,6 +450,9 @@ async def test_admin_mailboxes_page_can_toggle_visibility_via_form(app_client, r
 
     await _login_and_change_initial_password(app_client, runtime)
     mailbox = runtime.mailboxes.list_mailboxes()["items"][0]
+    message = runtime.messages.list_messages()["items"][0]
+    detail_page = await app_client.get(f"/admin/mailboxes/{mailbox['id']}")
+    message_detail_page = await app_client.get(f"/admin/messages/{message['id']}")
     response = await app_client.post(
         f"/admin/mailboxes/{mailbox['id']}",
         data={
@@ -405,6 +467,13 @@ async def test_admin_mailboxes_page_can_toggle_visibility_via_form(app_client, r
     assert response.headers["location"] == "/admin/mailboxes?limit=20&offset=0"
     assert updated["public_enabled"] is False
     assert updated["is_hidden"] is True
+    assert 'data-bulk-delete-form' in detail_page.text
+    assert 'data-bulk-item' in detail_page.text
+    assert 'disabled data-bulk-submit' in detail_page.text
+    assert "未选择时会删除" not in detail_page.text
+    assert 'data-bulk-delete-form' in message_detail_page.text
+    assert 'disabled data-bulk-submit' in message_detail_page.text
+    assert "未选择时会删除" not in message_detail_page.text
 
 
 @pytest.mark.asyncio
@@ -503,6 +572,7 @@ async def test_admin_settings_page_can_clear_all_mail(app_client, runtime, sampl
 
     await _login_and_change_initial_password(app_client, runtime)
     settings_page = await app_client.get("/admin/settings")
+    missing_confirmation = await app_client.post("/admin/settings/clear-mail", data={})
     response = await app_client.post(
         "/admin/settings/clear-mail",
         data={"confirm": "clear-all-mail"},
@@ -511,6 +581,11 @@ async def test_admin_settings_page_can_clear_all_mail(app_client, runtime, sampl
     assert settings_page.status_code == 200
     assert "清除所有邮件" in settings_page.text
     assert "近期网络会话" in settings_page.text
+    assert 'class="danger-action"' in settings_page.text
+    assert 'value="clear-all-mail" required data-danger-confirm' in settings_page.text
+    assert 'disabled data-no-confirm' in settings_page.text
+    assert "onsubmit=\"return confirm('确认清除" not in settings_page.text
+    assert missing_confirmation.status_code == 422
     assert response.status_code == 303
     assert response.headers["location"].startswith(
         "/admin/settings?mail_cleared=1&cleared_messages=1&cleared_mailboxes=1&cleared_sessions=1"

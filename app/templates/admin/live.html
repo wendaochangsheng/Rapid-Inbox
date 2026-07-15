@@ -76,6 +76,14 @@
     padding: 4px 10px;
     font-family: var(--font-mono);
     font-size: 0.78rem;
+    min-width: 0;
+    max-width: min(100%, 420px);
+  }
+  #endpoint-url {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .copy-icon-btn {
@@ -196,6 +204,7 @@
   .log-message {
     color: #ebe7d8;
     flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -231,6 +240,36 @@
     color: #76746d;
     font-family: var(--font-mono);
     font-size: 0.86rem;
+  }
+
+  @media (max-width: 720px) {
+    .live-status-bar { padding: 18px; }
+    .live-status-bar__head { align-items: flex-start; }
+    .live-status-bar__head > div:last-child { min-width: 0; }
+    #clear-logs { width: 100%; }
+    .terminal {
+      height: 62vh;
+      min-height: 360px;
+      max-height: 520px;
+    }
+    .terminal__header { padding: 10px 14px; }
+    .terminal__title {
+      max-width: 60%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .log-summary {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 6px 10px;
+      padding: 10px 14px;
+    }
+    .log-time { min-width: 0; }
+    .log-badge { min-width: 0; justify-self: start; }
+    .log-message { grid-column: 1 / 3; grid-row: 2; }
+    .log-chevron { grid-column: 3; grid-row: 1 / span 2; align-self: center; }
+    .log-details { padding: 12px 14px; }
   }
 </style>
 {% endblock %}

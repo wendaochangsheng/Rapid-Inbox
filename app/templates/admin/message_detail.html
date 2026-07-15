@@ -183,23 +183,30 @@
     <p>显示该邮件已派发到哪些邮箱。可勾选后批量软删除。</p>
   </header>
   {% if message.deliveries %}
-    <form method="post" action="/admin/messages/{{ message.id }}/delete-deliveries">
+    <form method="post" action="/admin/messages/{{ message.id }}/delete-deliveries" data-bulk-delete-form>
       <div style="border-top: 1px solid var(--border-faint);">
         {% for delivery in message.deliveries %}
           <div class="delivery-row">
-            <input type="checkbox" name="delivery_ids" value="{{ delivery.delivery_id }}" {% if delivery.status != "active" %}disabled{% endif %} />
+            <input type="checkbox" name="delivery_ids" value="{{ delivery.delivery_id }}" data-bulk-item {% if delivery.status != "active" %}disabled{% endif %} />
             <div class="delivery-row__mailbox">
               <a href="/admin/mailboxes/{{ delivery.mailbox_id }}">{{ delivery.mailbox }}</a>
               <p class="delivery-row__rcpt">{{ delivery.rcpt_to }}</p>
             </div>
-            <span class="pill pill--neutral">{{ delivery.status }}</span>
+            <span class="pill {% if delivery.status == 'active' %}pill--success{% else %}pill--neutral{% endif %}">
+              {{ "有效" if delivery.status == "active" else "已删除" }}
+            </span>
             <span class="delivery-row__time">{{ cn_datetime(delivery.delivered_at) }}</span>
           </div>
         {% endfor %}
       </div>
-      <div class="row" style="margin-top: 14px;">
-        <button class="button button--danger" type="submit" onclick="return confirm('确认软删除选中的投递？未选择时会删除该邮件全部有效投递。')">
-          <i data-lucide="trash-2"></i>删除投递
+      <div class="bulk-action-bar" style="margin-top: 14px;">
+        <label class="bulk-action-bar__select">
+          <input type="checkbox" data-bulk-toggle />
+          <span>选择全部有效投递</span>
+        </label>
+        <span class="bulk-action-bar__summary" data-bulk-summary aria-live="polite">请先选择要删除的投递</span>
+        <button class="button button--danger" type="submit" disabled data-bulk-submit onclick="return confirm('确认软删除选中的投递？')">
+          <i data-lucide="trash-2"></i>删除选中投递
         </button>
       </div>
     </form>

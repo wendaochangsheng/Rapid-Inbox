@@ -184,7 +184,7 @@
     stroke-dasharray: 3 4;
   }
   .chart-svg .chart-axis {
-    fill: var(--text-faint);
+    fill: var(--text-muted);
     font-size: 11px;
     font-family: var(--font-mono);
   }
@@ -213,11 +213,6 @@
   }
   .chart-svg .chart-hot:hover + .chart-dot,
   .chart-svg g:hover > .chart-dot { opacity: 1; }
-  .chart-svg .chart-peak-dot {
-    fill: var(--accent-strong);
-    stroke: var(--bg-elevated);
-    stroke-width: 2;
-  }
   .chart-tooltip {
     position: absolute;
     pointer-events: none;
@@ -480,18 +475,23 @@
 
   @media (max-width: 1100px) {
     .stat-row, .totals-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .stat-tile, .totals-cell { border-right: 0; border-bottom: 1px solid var(--border-faint); }
+    .stat-tile, .totals-cell { border-right: 1px solid var(--border-faint); border-bottom: 1px solid var(--border-faint); }
+    /* two columns: no divider on the right edge (even cells) */
     .stat-tile:nth-child(2n), .totals-cell:nth-child(2n) { border-right: 0; }
-    .stat-tile:nth-last-child(-n+2), .totals-cell:nth-last-child(-n+1) { border-bottom: 0; }
-    .totals-strip .totals-cell:nth-child(odd) { border-right: 1px solid var(--border-faint); }
+    /* two columns: no divider under the last visual row.
+       stat-row is always 4 (last row = tiles 3,4); totals-strip is 5 (last
+       row = the lone 5th cell, so drop the bottom border only on it). */
+    .stat-tile:nth-last-child(-n+2) { border-bottom: 0; }
+    .totals-cell:last-child { border-bottom: 0; }
     .activity-grid { grid-template-columns: 1fr; gap: 18px; }
     .ops-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 640px) {
     .dash-strip { flex-direction: column; align-items: flex-start; gap: 14px; }
     .stat-row, .totals-strip { grid-template-columns: 1fr; }
-    .stat-tile, .totals-cell { border-right: 0; }
-    .totals-strip .totals-cell:nth-child(odd) { border-right: 0; }
+    /* single column: hairline between every stacked cell, none under the last */
+    .stat-tile, .totals-cell { border-right: 0; border-bottom: 1px solid var(--border-faint); }
+    .stat-tile:last-child, .totals-cell:last-child { border-bottom: 0; }
     .health-panel { grid-template-columns: 1fr; }
     .ops-grid { grid-template-columns: 1fr; }
     .task-card { overflow-x: auto; }
@@ -503,7 +503,7 @@
 {% block content %}
 <header class="dash-strip">
   <div>
-    <h1 class="dash-strip__title">下午好，<em>{{ admin.display_name or admin.username }}</em></h1>
+    <h1 class="dash-strip__title">{{ time_greeting() }}，<em>{{ admin.display_name or admin.username }}</em></h1>
     <p class="dash-strip__lede">{{ admin_product_name }} · 系统当前的运行态势与最近活动</p>
   </div>
   <div class="page-header__actions">
@@ -511,7 +511,7 @@
       <i data-lucide="activity"></i>实时监控
     </a>
     <a href="/admin/domains" class="button button--primary button--sm">
-      <i data-lucide="plus"></i>新增域名
+      <i data-lucide="globe"></i>管理域名
     </a>
   </div>
 </header>
@@ -687,15 +687,21 @@
           <text class="chart-axis" x="6" y="{{ delivery_chart.baseline_y - 4 }}" text-anchor="start">0</text>
         {% endif %}
 
-        {# Hover targets + dots: one transparent rect per bucket for clean tooltips #}
+        {# Hover targets + dots: one transparent rect per bucket for clean tooltips.
+           Width == point spacing so adjacent zones tile seamlessly across the plot;
+           points span (view_width - 48) over (N-1) gaps (24px padding each side). #}
+        {% set bucket_gaps = (delivery_chart.buckets | length) - 1 %}
+        {% set hot_w = (delivery_chart.view_width - 48) / bucket_gaps if bucket_gaps > 0 else (delivery_chart.view_width - 48) %}
         {% for bucket in delivery_chart.buckets %}
-          {% set hot_w = (delivery_chart.view_width - 48) / (delivery_chart.buckets | length) %}
           <g
             data-chart-point
             data-x="{{ bucket.x }}"
             data-y="{{ bucket.y }}"
             data-hour="{{ '%02d' % bucket.hour }}:00"
             data-value="{{ bucket.value }}"
+            tabindex="0"
+            role="img"
+            aria-label="{{ '%02d' % bucket.hour }}:00 收件 {{ bucket.value }} 封"
           >
             <rect
               class="chart-hot"
