@@ -236,6 +236,12 @@
     <p class="eyebrow">正文</p>
     <h2>邮件正文</h2>
   </header>
+  {% if message.text_body_truncated or message.html_body_truncated or message.headers_truncated or message.inline_preview_skipped_count %}
+    <div class="notice notice--warning">
+      <i data-lucide="info"></i>
+      <span>详情已按预览预算截断；完整内容仍可通过原始邮件或附件下载获取。</span>
+    </div>
+  {% endif %}
   {% if message.text_body %}
     <div class="body-wrap"><pre class="body-text">{{ message.text_body }}</pre></div>
   {% elif message.html_preview_srcdoc %}

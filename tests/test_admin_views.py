@@ -57,7 +57,7 @@ async def test_admin_login_and_dashboard_page_flow(app_client, runtime) -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_login_allows_missing_origin_header(app_fixture, runtime) -> None:
+async def test_admin_login_rejects_missing_origin_header(app_fixture, runtime) -> None:
     app, _ = app_fixture
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -66,13 +66,14 @@ async def test_admin_login_allows_missing_origin_header(app_fixture, runtime) ->
             data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
         )
 
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin/settings?force_password_change=1"
-    assert response.cookies.get(runtime.settings.session_cookie_name) is not None
+    assert response.status_code == 403
+    assert response.json()["detail"] == "invalid origin"
+    assert response.cookies.get(runtime.settings.session_cookie_name) is None
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.asyncio
-async def test_admin_login_allows_proxy_origin_mismatch(app_fixture, runtime) -> None:
+async def test_admin_login_rejects_proxy_origin_mismatch(app_fixture, runtime) -> None:
     app, _ = app_fixture
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -82,9 +83,10 @@ async def test_admin_login_allows_proxy_origin_mismatch(app_fixture, runtime) ->
             data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
         )
 
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin/settings?force_password_change=1"
-    assert response.cookies.get(runtime.settings.session_cookie_name) is not None
+    assert response.status_code == 403
+    assert response.json()["detail"] == "invalid origin"
+    assert response.cookies.get(runtime.settings.session_cookie_name) is None
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.asyncio
@@ -198,6 +200,26 @@ async def test_admin_form_origin_check_ignores_spoofed_forwarded_host(app_client
 
 
 @pytest.mark.asyncio
+async def test_admin_security_does_not_trust_direct_forwarded_proto(app_client, runtime) -> None:
+    login = await app_client.post(
+        "/admin/login",
+        headers={"X-Forwarded-Proto": "https"},
+        data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
+    )
+    assert login.status_code == 303
+    assert "secure" not in login.headers["set-cookie"].lower()
+
+    rejected = await app_client.post(
+        "/admin/logout",
+        headers={
+            "Origin": "https://testserver",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert rejected.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_admin_form_origin_check_rejects_same_host_different_port(app_client, runtime) -> None:
     await _login_and_change_initial_password(app_client, runtime)
 
@@ -253,6 +275,21 @@ async def test_admin_login_rejects_invalid_credentials_with_error(app_client) ->
 
 
 @pytest.mark.asyncio
+async def test_admin_login_rejects_oversized_password_before_authentication(app_client, runtime, monkeypatch) -> None:
+    async def unexpected_authenticate(*_args, **_kwargs):
+        raise AssertionError("oversized password reached authentication service")
+
+    monkeypatch.setattr(runtime.auth, "authenticate_admin", unexpected_authenticate)
+    response = await app_client.post(
+        "/admin/login",
+        data={"username": "admin", "password": "x" * 1025},
+    )
+
+    assert response.status_code == 400
+    assert "用户名或密码格式无效" in response.text
+
+
+@pytest.mark.asyncio
 async def test_admin_login_rate_limit_blocks_repeated_failures(app_client) -> None:
     for _ in range(5):
         response = await app_client.post(
@@ -285,11 +322,33 @@ async def test_admin_domains_page_can_create_domain_via_form(app_client, runtime
             "local_part_case_sensitive": "0",
             "is_active": "1",
             "max_message_size_bytes": "2048",
+            "retention_days": "7",
         },
     )
 
     created = runtime.domains.list_domains()[0]
     created_detail = runtime.domains.get_domain(created["id"])
+    updated_response = await app_client.post(
+        f"/admin/domains/{created['id']}",
+        data={
+            "root_domain": "renamed-mail.adb.com",
+            "accept_exact": "1",
+            "accept_subdomains": "1",
+            "public_web_enabled": "1",
+            "public_api_enabled": "1",
+            "plus_addressing_mode": "keep",
+            "local_part_case_sensitive": "0",
+            "is_active": "1",
+            "max_message_size_bytes": "2048",
+            "retention_days": "7",
+            "notes": "updated through admin page",
+        },
+    )
+    updated_detail = runtime.domains.get_domain(created["id"])
+    deleted_response = await app_client.post(
+        f"/admin/domains/{created['id']}/delete",
+        data={"confirm": "delete-domain"},
+    )
 
     assert response.status_code == 303
     assert response.headers["location"] == f"/admin/domains/{created['id']}"
@@ -297,6 +356,14 @@ async def test_admin_domains_page_can_create_domain_via_form(app_client, runtime
     assert created_detail["accept_subdomains"] is True
     assert created_detail["public_web_enabled"] is True
     assert created_detail["max_message_size_bytes"] == 2048
+    assert created_detail["retention_days"] == 7
+    assert updated_response.status_code == 303
+    assert updated_detail["root_domain_ascii"] == "renamed-mail.adb.com"
+    assert updated_detail["notes"] == "updated through admin page"
+    assert deleted_response.status_code == 303
+    assert deleted_response.headers["location"] == "/admin/domains"
+    with pytest.raises(LookupError):
+        runtime.domains.get_domain(created["id"])
 
 
 @pytest.mark.asyncio
@@ -410,7 +477,7 @@ async def test_admin_api_keys_page_can_create_and_revoke_via_form(app_client, ru
 
 @pytest.mark.asyncio
 async def test_admin_settings_page_can_clear_all_mail(app_client, runtime, sample_email_bytes: bytes) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.ensure_smtp_session(
         "smtp_clear_all",
         SimpleNamespace(peer=("127.0.0.1", 2525), host_name="localhost", ssl=None),
@@ -490,7 +557,7 @@ async def test_admin_settings_page_can_clear_all_mail(app_client, runtime, sampl
         mailbox_count = connection.execute("SELECT COUNT(*) AS count FROM mailboxes").fetchone()["count"]
         message_count = connection.execute("SELECT COUNT(*) AS count FROM messages").fetchone()["count"]
 
-    assert mailbox_count == 1
+    assert mailbox_count == 0
     assert message_count == 0
 
 
@@ -627,6 +694,26 @@ async def test_admin_password_change_rejects_default_or_unchanged_password(app_c
 
 
 @pytest.mark.asyncio
+async def test_admin_password_change_rejects_oversized_password(app_client, runtime) -> None:
+    await app_client.post(
+        "/admin/login",
+        data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
+    )
+
+    response = await app_client.post(
+        "/admin/settings/password",
+        data={
+            "current_password": runtime.settings.bootstrap_admin_password,
+            "new_password": "x" * 1025,
+            "confirm_password": "x" * 1025,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "不能超过 1024 个字符" in response.text
+
+
+@pytest.mark.asyncio
 async def test_admin_api_keys_page_uses_checkbox_scopes_and_domain_hints(app_client, runtime) -> None:
     await runtime.create_domain("adb.com")
     await _login_and_change_initial_password(app_client, runtime)
@@ -650,7 +737,7 @@ async def test_admin_api_keys_page_uses_checkbox_scopes_and_domain_hints(app_cli
 
 @pytest.mark.asyncio
 async def test_admin_api_keys_form_without_domain_grants_allows_public_mailbox_access(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await _login_and_change_initial_password(app_client, runtime)
 
     created = await app_client.post(
@@ -676,8 +763,8 @@ async def test_admin_api_keys_form_without_domain_grants_allows_public_mailbox_a
 
 @pytest.mark.asyncio
 async def test_admin_api_keys_page_can_edit_permissions_and_domain_grants(app_client, runtime) -> None:
-    primary_domain = await runtime.create_domain("adb.com")
-    await runtime.create_domain("other.com")
+    primary_domain = await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
+    await runtime.create_domain("other.com", public_web_enabled=True, public_api_enabled=True)
     key = await runtime.api_keys.create_key(
         name="html-public-edit",
         kind="public",
@@ -845,6 +932,8 @@ async def test_admin_api_keys_and_audit_pages_paginate_results(app_client, runti
             kind="admin",
             scopes=["domains.read"],
             domain_ids=[],
+
+            domain_grant_mode="all",
             mailbox_patterns=[],
         )
         await runtime.audit.log(

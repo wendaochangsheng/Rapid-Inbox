@@ -21,7 +21,7 @@ inline void check(bool condition, const std::string& message) {
 
 namespace {
 
-constexpr std::array<const char*, 15> kConfigEnvVars = {
+constexpr std::array<const char*, 28> kConfigEnvVars = {
     "HOST",
     "PORT",
     "SMTP_HOST",
@@ -32,11 +32,24 @@ constexpr std::array<const char*, 15> kConfigEnvVars = {
     "MAX_MESSAGE_SIZE_BYTES",
     "MAX_RECIPIENTS_PER_MESSAGE",
     "SMTP_IDLE_TIMEOUT_SECONDS",
+    "SMTP_MAX_CONNECTIONS",
+    "SMTP_MAX_LINE_LENGTH",
+    "SMTP_LISTEN_BACKLOG",
+    "SMTP_CONNECTION_RATE_LIMIT_COUNT",
+    "SMTP_CONNECTION_RATE_LIMIT_WINDOW_SECONDS",
     "INGEST_QUEUE_MAX_MESSAGES",
+    "INGEST_QUEUE_MAX_BYTES",
+    "INGEST_RESERVATION_CHUNK_BYTES",
     "INGEST_BATCH_MAX_MESSAGES",
     "INGEST_FLUSH_INTERVAL_MS",
     "INGEST_SQLITE_BUSY_TIMEOUT_MS",
+    "INGEST_WORKER_COUNT",
+    "INGEST_MAX_RETRIES",
+    "DOMAIN_RELOAD_INTERVAL_MS",
+    "INGEST_DURABLE_ACK",
     "INGEST_STORAGE_FSYNC",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
 };
 
 class ScopedEnvGuard {
@@ -149,7 +162,18 @@ void test_config_defaults() {
     test::check(config.database_path == temp_dir.path() / "storage" / "app.db",
                 "default database path");
     test::check(config.ingest_batch_max_messages == 250, "default ingest batch size");
-    test::check(config.ingest_flush_interval_ms == 250, "default flush interval");
+    test::check(config.ingest_reservation_chunk_bytes == 65536,
+                "default reservation chunk size");
+    test::check(config.smtp_listen_backlog == 1024, "default listen backlog");
+    test::check(config.smtp_connection_rate_limit_count == 60000,
+                "C++ connection rate limit has a bounded high-throughput default");
+    test::check(config.ingest_flush_interval_ms == 5, "default flush interval");
+    test::check(config.ingest_durable_ack, "durable ACK defaults on");
+    test::check(config.ingest_worker_count == 4, "default worker count");
+    test::check(config.log_level == rapid_inbox::ingestd::LogLevel::Info,
+                "default C++ log level");
+    test::check(config.log_format == rapid_inbox::ingestd::LogFormat::Json,
+                "default C++ log format");
 }
 
 void test_config_dotenv_and_environment_override() {
@@ -167,11 +191,24 @@ DATABASE_PATH = custom-db/app.db
 MAX_MESSAGE_SIZE_BYTES = 4096
 MAX_RECIPIENTS_PER_MESSAGE = 33
 SMTP_IDLE_TIMEOUT_SECONDS = 11
+SMTP_MAX_CONNECTIONS = 321
+SMTP_MAX_LINE_LENGTH = 2048
+SMTP_LISTEN_BACKLOG = 777
+SMTP_CONNECTION_RATE_LIMIT_COUNT = 44
+SMTP_CONNECTION_RATE_LIMIT_WINDOW_SECONDS = 12
 INGEST_QUEUE_MAX_MESSAGES = 1234
+INGEST_QUEUE_MAX_BYTES = 1048576
+INGEST_RESERVATION_CHUNK_BYTES = 32768
 INGEST_BATCH_MAX_MESSAGES = 55
 INGEST_FLUSH_INTERVAL_MS = 77
 INGEST_SQLITE_BUSY_TIMEOUT_MS = 88
+INGEST_WORKER_COUNT = 6
+INGEST_MAX_RETRIES = 2
+DOMAIN_RELOAD_INTERVAL_MS = 250
+INGEST_DURABLE_ACK = false
 INGEST_STORAGE_FSYNC = true
+LOG_LEVEL = warning
+LOG_FORMAT = text
 )");
 
         env_guard.set("SMTP_PORT", "2526");
@@ -187,20 +224,42 @@ INGEST_STORAGE_FSYNC = true
         test::check(config.max_message_size_bytes == 4096, "parsed max message size");
         test::check(config.max_recipients_per_message == 33, "parsed recipient limit");
         test::check(config.smtp_idle_timeout_seconds == 11, "parsed smtp idle timeout");
+        test::check(config.smtp_max_connections == 321, "parsed smtp connection limit");
+        test::check(config.smtp_max_line_length == 2048, "parsed smtp line limit");
+        test::check(config.smtp_listen_backlog == 777, "parsed listen backlog");
+        test::check(config.smtp_connection_rate_limit_count == 44,
+                    "parsed C++ connection rate limit");
+        test::check(config.smtp_connection_rate_limit_window_seconds == 12,
+                    "parsed C++ connection rate window");
         test::check(config.ingest_queue_max_messages == 1234, "parsed ingest queue size");
+        test::check(config.ingest_queue_max_bytes == 1048576, "parsed ingest byte limit");
+        test::check(config.ingest_reservation_chunk_bytes == 32768,
+                    "parsed reservation chunk size");
         test::check(config.ingest_batch_max_messages == 55, "parsed ingest batch size");
         test::check(config.ingest_flush_interval_ms == 77, "parsed flush interval");
         test::check(config.ingest_sqlite_busy_timeout_ms == 88, "parsed sqlite busy timeout");
+        test::check(config.ingest_worker_count == 6, "parsed worker count");
+        test::check(config.ingest_max_retries == 2, "parsed retry count");
+        test::check(config.domain_reload_interval_ms == 250, "parsed domain reload interval");
+        test::check(!config.ingest_durable_ack, "parsed durable ACK flag");
         test::check(config.ingest_storage_fsync, "parsed fsync boolean");
+        test::check(config.log_level == rapid_inbox::ingestd::LogLevel::Warning,
+                    "parsed C++ log level");
+        test::check(config.log_format == rapid_inbox::ingestd::LogFormat::Text,
+                    "parsed C++ log format");
     }
 
     {
         ScopedEnvGuard env_guard;
         ScopedTempDir temp_dir;
-        write_env_file(temp_dir.path(), "PORT=\n");
+        write_env_file(temp_dir.path(), "PORT=\nLOG_LEVEL=\nLOG_FORMAT=   \n");
 
         rapid_inbox::ingestd::Config config = rapid_inbox::ingestd::Config::load(temp_dir.path());
         test::check(config.port == 8000, "blank PORT falls back to default");
+        test::check(config.log_level == rapid_inbox::ingestd::LogLevel::Info,
+                    "blank LOG_LEVEL falls back to default");
+        test::check(config.log_format == rapid_inbox::ingestd::LogFormat::Json,
+                    "blank LOG_FORMAT falls back to default");
     }
 
     {
@@ -255,4 +314,34 @@ INGEST_STORAGE_FSYNC = true
                                   "invalid SMTP_IDLE_TIMEOUT_SECONDS: abc");
     expect_invalid_dotenv_integer("INGEST_QUEUE_MAX_MESSAGES=999999999999999999999999\n",
                                   "invalid INGEST_QUEUE_MAX_MESSAGES: 999999999999999999999999");
+
+    {
+        ScopedEnvGuard env_guard;
+        ScopedTempDir temp_dir;
+        write_env_file(temp_dir.path(), "LOG_LEVEL=verbose\n");
+        expect_runtime_error_contains(
+            [&] { rapid_inbox::ingestd::Config::load(temp_dir.path()); },
+            "invalid LOG_LEVEL");
+    }
+    {
+        ScopedEnvGuard env_guard;
+        ScopedTempDir temp_dir;
+        write_env_file(temp_dir.path(), "LOG_FORMAT=yaml\n");
+        expect_runtime_error_contains(
+            [&] { rapid_inbox::ingestd::Config::load(temp_dir.path()); },
+            "invalid LOG_FORMAT");
+    }
+    expect_invalid_dotenv_integer("INGEST_WORKER_COUNT=0\n", "invalid INGEST_WORKER_COUNT: 0");
+    expect_invalid_dotenv_integer("SMTP_MAX_CONNECTIONS=-1\n", "invalid SMTP_MAX_CONNECTIONS: -1");
+    expect_invalid_dotenv_integer("SMTP_LISTEN_BACKLOG=0\n", "invalid SMTP_LISTEN_BACKLOG: 0");
+    expect_invalid_dotenv_integer("SMTP_CONNECTION_RATE_LIMIT_COUNT=-1\n",
+                                  "invalid SMTP_CONNECTION_RATE_LIMIT_COUNT: -1");
+    expect_invalid_dotenv_integer("SMTP_CONNECTION_RATE_LIMIT_WINDOW_SECONDS=0\n",
+                                  "invalid SMTP_CONNECTION_RATE_LIMIT_WINDOW_SECONDS: 0");
+    expect_invalid_dotenv_integer("INGEST_RESERVATION_CHUNK_BYTES=1024\n",
+                                  "invalid INGEST_RESERVATION_CHUNK_BYTES: 1024");
+    expect_invalid_dotenv_integer("INGEST_DURABLE_ACK=perhaps\n", "invalid INGEST_DURABLE_ACK: perhaps");
+    expect_invalid_dotenv_integer(
+        "MAX_MESSAGE_SIZE_BYTES=4096\nINGEST_QUEUE_MAX_BYTES=1024\n",
+        "invalid INGEST_QUEUE_MAX_BYTES: must be at least MAX_MESSAGE_SIZE_BYTES");
 }

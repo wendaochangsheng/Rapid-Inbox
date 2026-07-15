@@ -191,14 +191,27 @@ void test_domain_cache_snapshots_matcher_and_policies_together() {
     cache.reload();
 
     const auto snapshot = cache.snapshot_rules();
-    const auto match = snapshot.matcher.match_address("Code+Tag@snapshot.test");
+    test::check(snapshot->generation == cache.generation(), "snapshot exposes cache generation");
+    test::check(cache.snapshot_rules_if_changed(snapshot->generation) == nullptr,
+                "unchanged generation avoids loading another shared snapshot");
+    const auto match = snapshot->matcher.match_address("Code+Tag@snapshot.test");
     test::check(match.has_value(), "snapshot matcher matches loaded domain");
     test::check(match->domain_id == 1, "snapshot matcher domain id");
     test::check(match->address_canonical == "code@snapshot.test", "snapshot matcher flags");
-    const auto policy = snapshot.policies.find(match->domain_id);
-    test::check(policy != snapshot.policies.end(), "snapshot policy matches matcher domain id");
+    const auto policy = snapshot->policies.find(match->domain_id);
+    test::check(policy != snapshot->policies.end(), "snapshot policy matches matcher domain id");
     test::check(policy->second.root_domain_unicode == "Snapshot.Test",
                 "snapshot policy from same rules snapshot");
     test::check(policy->second.plus_addressing_mode == "strip",
                 "snapshot policy keeps same rule fields");
+
+    db.exec("UPDATE domains SET is_active = 0 WHERE id = 1");
+    cache.reload();
+    const auto refreshed = cache.snapshot_rules_if_changed(snapshot->generation);
+    test::check(refreshed != nullptr, "reload publishes a new generation");
+    test::check(refreshed->generation > snapshot->generation, "generation increases after reload");
+    test::check(!refreshed->matcher.match_address("Code@snapshot.test").has_value(),
+                "new snapshot sees disabled rule");
+    test::check(snapshot->matcher.match_address("Code@snapshot.test").has_value(),
+                "old immutable snapshot remains valid for in-flight work");
 }

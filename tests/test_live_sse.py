@@ -180,3 +180,62 @@ async def test_live_sse_stream_prefers_last_event_id_over_after_cursor(runtime) 
     assert '"session_id": "smtp_live_2"' in follow_up
     assert '"session_id": "smtp_live_1"' not in follow_up
     assert "id:" in follow_up
+
+
+@pytest.mark.asyncio
+async def test_live_sse_reports_ring_overrun_before_replaying_available_events(runtime) -> None:
+    runtime.live_state = LiveState(max_events=2)
+    generation = runtime.live_state.generation
+    for index in range(3):
+        await runtime.live_state.publish(
+            {
+                "type": "queued",
+                "session_id": f"smtp_ring_{index}",
+                "ts": "2026-04-18T20:00:00Z",
+            }
+        )
+
+    stream = stream_smtp_live_events(
+        runtime,
+        after_cursor=f"{generation}:0",
+        poll_interval=0.01,
+    )
+    try:
+        gap = await asyncio.wait_for(anext(stream), timeout=0.1)
+        first_available = await asyncio.wait_for(anext(stream), timeout=0.1)
+    finally:
+        await stream.aclose()
+
+    assert "event: gap" in gap
+    assert '"reason": "ring_overrun"' in gap
+    assert '"oldest_available_seq": 2' in gap
+    assert '"session_id": "smtp_ring_1"' in first_available
+
+
+@pytest.mark.asyncio
+async def test_live_sse_reports_generation_change_and_resumes_after_clear(runtime) -> None:
+    runtime.live_state = LiveState(max_events=2)
+    await runtime.live_state.publish(
+        {"type": "queued", "session_id": "before-clear", "ts": "2026-04-18T20:00:00Z"}
+    )
+    _, cursor = runtime.live_state.snapshot_state()
+    stream = stream_smtp_live_events(runtime, after_cursor=cursor, poll_interval=0.01)
+    pending_gap = asyncio.create_task(anext(stream))
+    try:
+        await asyncio.sleep(0.02)
+        runtime.live_state.clear()
+        await runtime.live_state.publish(
+            {"type": "queued", "session_id": "after-clear", "ts": "2026-04-18T20:00:01Z"}
+        )
+        gap = await asyncio.wait_for(pending_gap, timeout=0.2)
+        resumed = await asyncio.wait_for(anext(stream), timeout=0.1)
+    finally:
+        if not pending_gap.done():
+            pending_gap.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_gap
+        await stream.aclose()
+
+    assert "event: gap" in gap
+    assert '"reason": "generation_changed"' in gap
+    assert '"session_id": "after-clear"' in resumed

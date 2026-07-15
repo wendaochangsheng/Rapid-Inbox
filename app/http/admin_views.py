@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
-import shutil
-from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
-from app.auth.sessions import SESSION_DURATION_DAYS
+from app.auth.api_keys import ApiKeyAuthorizationError
+from app.auth.sessions import (
+    MAX_ADMIN_PASSWORD_LENGTH,
+    MIN_ADMIN_PASSWORD_LENGTH,
+    SESSION_DURATION_DAYS,
+)
+from app.auth.permissions import PermissionDenied, require_admin_role_scope, role_permission_context
 from app.db.connection import connect_database
 from app.ingest.storage import utc_now
 from app.http.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, build_pagination_context
-from app.http.template_helpers import cn_bytes
+from app.services.dashboard import get_dashboard_service
 from app.services.dns_check import DnsCheckService
 
 
@@ -106,9 +111,6 @@ def _client_ip(request: Request) -> str | None:
 
 
 def _secure_cookie(request: Request) -> bool:
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    if forwarded_proto:
-        return forwarded_proto.split(",", 1)[0].strip().lower() == "https"
     return request.url.scheme == "https"
 
 
@@ -116,6 +118,22 @@ def _render(request: Request, template_name: str, context: dict[str, Any], *, st
     response = request.app.state.templates.TemplateResponse(request, template_name, context)
     response.status_code = status_code
     return response
+
+
+async def _render_async(
+    request: Request,
+    template_name: str,
+    context: dict[str, Any],
+    *,
+    status_code: int = 200,
+) -> Response:
+    return await asyncio.to_thread(
+        _render,
+        request,
+        template_name,
+        context,
+        status_code=status_code,
+    )
 
 
 def _redirect_to_login() -> RedirectResponse:
@@ -259,12 +277,6 @@ def _count(connection, query: str, params: tuple[Any, ...] = ()) -> int:
     return int(row["count"])
 
 
-def _utc_cutoff(seconds: int) -> str:
-    return (
-        datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=seconds)
-    ).isoformat().replace("+00:00", "Z")
-
-
 async def _current_admin(request: Request) -> dict[str, Any] | None:
     cookie_name = request.app.state.settings.session_cookie_name
     token = request.cookies.get(cookie_name)
@@ -286,7 +298,39 @@ async def _require_admin(request: Request) -> dict[str, Any] | Response:
         or request.url.path in {"/admin/settings/password", "/admin/logout"}
     ):
         return _redirect_to_password_change()
+    required_scope = _required_admin_scope(request.url.path, request.method)
+    if required_scope is not None:
+        try:
+            require_admin_role_scope(admin, required_scope)
+        except PermissionDenied:
+            return HTMLResponse(
+                "<h1>403</h1><p>当前管理员角色无权执行此操作。</p>",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
     return admin
+
+
+def _required_admin_scope(path: str, method: str) -> str | None:
+    if path in {"/admin/login", "/admin/logout", "/admin/settings/password"}:
+        return None
+    write = method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+    if path.startswith("/admin/domains"):
+        return "domains.write" if write else "domains.read"
+    if path.startswith("/admin/mailboxes"):
+        return "mailboxes.write" if write else "mailboxes.read"
+    if path.startswith("/admin/messages"):
+        return "messages.write" if write else "messages.read"
+    if path.startswith("/admin/api-keys"):
+        return "api_keys.write" if write else "api_keys.read"
+    if path.startswith("/admin/admins"):
+        return "admins.write" if write else "admins.read"
+    if path.startswith("/admin/audit"):
+        return "audit.read"
+    if path.startswith("/admin/settings"):
+        return "system.write" if write else "system.read"
+    if path.startswith("/admin/live"):
+        return "live.read"
+    return "system.read"
 
 
 async def _log_admin_audit(
@@ -313,258 +357,6 @@ async def _log_admin_audit(
         )
     except Exception:
         return
-
-
-def _delivery_chart(connection: sqlite3.Connection, *, hours: int = 24) -> dict[str, Any]:
-    """Build a per-hour delivery histogram for the last ``hours`` hours.
-
-    Returns a structure shaped for SVG curve rendering, with the buckets ordered
-    chronologically (oldest → newest). Empty hours are filled with zero so the
-    timeline stays continuous.
-    """
-
-    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    buckets: list[dict[str, Any]] = []
-    bucket_index: dict[str, int] = {}
-    for offset in range(hours - 1, -1, -1):
-        ts = now - timedelta(hours=offset)
-        key = ts.strftime("%Y-%m-%dT%H:00:00Z")
-        bucket_index[key] = len(buckets)
-        buckets.append({"ts": key, "hour": ts.hour, "value": 0})
-
-    cutoff = (now - timedelta(hours=hours - 1)).strftime("%Y-%m-%dT%H:00:00Z")
-    rows = connection.execute(
-        """
-        SELECT
-            substr(bucket_ts, 1, 13) || ':00:00Z' AS bucket,
-            SUM(deliveries) AS count
-        FROM mail_metric_buckets
-        WHERE bucket_ts >= ?
-        GROUP BY bucket
-        """,
-        (cutoff,),
-    ).fetchall()
-    for row in rows:
-        idx = bucket_index.get(row["bucket"])
-        if idx is not None:
-            buckets[idx]["value"] = int(row["count"])
-
-    values = [item["value"] for item in buckets]
-    peak = max(values) if values else 0
-    total = sum(values)
-
-    # Build smooth-curve SVG path data on a fixed 1000x240 viewBox so the chart
-    # scales fluidly. We use a Catmull-Rom→cubic-Bézier approximation for a
-    # natural "curve" feel without depending on any client library.
-    width = 1000.0
-    height = 240.0
-    pad_x = 24.0
-    pad_top = 18.0
-    pad_bottom = 30.0
-    inner_w = width - pad_x * 2
-    inner_h = height - pad_top - pad_bottom
-    n = len(buckets)
-    y_scale_max = max(peak, 1)
-
-    coords: list[tuple[float, float]] = []
-    for index, item in enumerate(buckets):
-        x = pad_x + (index / max(n - 1, 1)) * inner_w
-        y = pad_top + inner_h - (item["value"] / y_scale_max) * inner_h
-        coords.append((x, y))
-        item["x"] = round(x, 2)
-        item["y"] = round(y, 2)
-
-    def _segment(p0, p1, p2, p3) -> str:
-        # Catmull-Rom to cubic Bézier conversion (tension = 0.5).
-        c1x = p1[0] + (p2[0] - p0[0]) / 6
-        c1y = p1[1] + (p2[1] - p0[1]) / 6
-        c2x = p2[0] - (p3[0] - p1[0]) / 6
-        c2y = p2[1] - (p3[1] - p1[1]) / 6
-        return f"C {c1x:.2f} {c1y:.2f}, {c2x:.2f} {c2y:.2f}, {p2[0]:.2f} {p2[1]:.2f}"
-
-    if coords:
-        path_parts = [f"M {coords[0][0]:.2f} {coords[0][1]:.2f}"]
-        for index in range(len(coords) - 1):
-            p0 = coords[index - 1] if index > 0 else coords[index]
-            p1 = coords[index]
-            p2 = coords[index + 1]
-            p3 = coords[index + 2] if index + 2 < len(coords) else p2
-            path_parts.append(_segment(p0, p1, p2, p3))
-        line_path = " ".join(path_parts)
-        baseline = pad_top + inner_h
-        area_path = (
-            f"{line_path} L {coords[-1][0]:.2f} {baseline:.2f}"
-            f" L {coords[0][0]:.2f} {baseline:.2f} Z"
-        )
-    else:
-        line_path = ""
-        area_path = ""
-
-    # Reduce x-axis labels to 5 evenly-spaced tick marks for readability.
-    tick_indices = sorted({0, n // 4, n // 2, (3 * n) // 4, n - 1}) if n else []
-    ticks = [
-        {"x": buckets[i]["x"], "label": f"{buckets[i]['hour']:02d}:00"}
-        for i in tick_indices
-    ]
-
-    return {
-        "buckets": buckets,
-        "peak": peak,
-        "total": total,
-        "line_path": line_path,
-        "area_path": area_path,
-        "ticks": ticks,
-        "view_width": int(width),
-        "view_height": int(height),
-        "baseline_y": round(pad_top + inner_h, 2),
-        "pad_top": pad_top,
-    }
-
-
-def _metric_sum(connection: sqlite3.Connection, column: str, cutoff: str) -> int:
-    if column not in {"deliveries", "parse_failures"}:
-        raise ValueError("invalid metric column")
-    row = connection.execute(
-        f"SELECT COALESCE(SUM({column}), 0) AS count FROM mail_metric_buckets WHERE bucket_ts >= ?",
-        (cutoff,),
-    ).fetchone()
-    return 0 if row is None else int(row["count"])
-
-
-def _dashboard_stats(request: Request) -> dict[str, Any]:
-    runtime = request.app.state.runtime
-    one_minute_cutoff = _utc_cutoff(60)
-    five_minute_cutoff = _utc_cutoff(5 * 60)
-    day_cutoff = _utc_cutoff(24 * 60 * 60)
-    disk_usage = shutil.disk_usage(runtime.settings.storage_root)
-    disk_used_percent = 0.0 if disk_usage.total == 0 else (disk_usage.used / disk_usage.total) * 100
-    with connect_database(runtime.settings.database_path) as connection:
-        stats = {
-            "open_sessions": _count(connection, "SELECT COUNT(*) AS count FROM smtp_sessions WHERE status = 'open'"),
-            "active_connections": runtime.active_smtp_connection_count(),
-            "received_last_minute": _metric_sum(connection, "deliveries", one_minute_cutoff),
-            "received_last_five_minutes": _metric_sum(connection, "deliveries", five_minute_cutoff),
-            "received_last_day": _metric_sum(connection, "deliveries", day_cutoff),
-            "failed_last_day": _metric_sum(connection, "parse_failures", day_cutoff),
-            "domains": _count(connection, "SELECT COUNT(*) AS count FROM domains"),
-            "mailboxes": _count(connection, "SELECT COUNT(*) AS count FROM mailboxes"),
-            "messages": _count(connection, "SELECT COUNT(*) AS count FROM messages"),
-            "pending_messages": _count(connection, "SELECT COUNT(*) AS count FROM messages WHERE parse_status = 'pending'"),
-            "failed_messages": _count(connection, "SELECT COUNT(*) AS count FROM messages WHERE parse_status = 'failed'"),
-            "api_keys": _count(connection, "SELECT COUNT(*) AS count FROM api_keys"),
-            "audit_logs": _count(connection, "SELECT COUNT(*) AS count FROM audit_logs"),
-        }
-        recent_messages = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT
-                    m.id,
-                    m.subject,
-                    m.from_addr,
-                    m.received_at,
-                    m.parse_status,
-                    m.attachment_count
-                FROM messages AS m
-                ORDER BY m.received_at DESC, m.id DESC
-                LIMIT 5
-                """
-            ).fetchall()
-        ]
-        recent_domains = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT
-                    id,
-                    root_domain_ascii,
-                    is_active,
-                    created_at
-                FROM domains
-                ORDER BY created_at DESC, id DESC
-                LIMIT 5
-                """
-            ).fetchall()
-        ]
-        delivery_chart = _delivery_chart(connection, hours=24)
-
-    sessions_value = stats["active_connections"]
-    disk_threshold = runtime.settings.disk_warning_threshold_percent
-    disk_state = (
-        "danger" if disk_used_percent >= disk_threshold
-        else ("warning" if disk_used_percent >= max(disk_threshold - 15, 0) else "ok")
-    )
-    failed_today = stats["failed_last_day"]
-    failed_state = "danger" if failed_today > 0 else "ok"
-    pending_state = "warning" if stats["pending_messages"] > 0 else "ok"
-
-    return {
-        # Layer 1 — live signals (top of dashboard, real-time)
-        "live_stats": [
-            {
-                "label": "当前 SMTP 会话",
-                "value": sessions_value,
-                "hint": "仍在监听器上保持连接的 SMTP 会话数。",
-                "state": "ok" if sessions_value else "idle",
-            },
-            {
-                "label": "1 分钟接收速率",
-                "value": f"{stats['received_last_minute']}/min",
-                "hint": "最近 60 秒成功投递的邮件数。",
-                "state": "ok",
-            },
-            {
-                "label": "5 分钟接收速率",
-                "value": f"{stats['received_last_five_minutes'] / 5:.1f}/min",
-                "hint": "最近 5 分钟平均每分钟投递数。",
-                "state": "ok",
-            },
-            {
-                "label": "24 小时接收量",
-                "value": stats["received_last_day"],
-                "hint": "过去 24 小时投递到邮箱的邮件数。",
-                "state": "ok",
-            },
-        ],
-        # Layer 2 — today's processing health
-        "today_stats": [
-            {
-                "label": "待解析邮件",
-                "value": stats["pending_messages"],
-                "hint": "已入库、仍在等待 MIME 解析。",
-                "state": pending_state,
-            },
-            {
-                "label": "解析失败",
-                "value": stats["failed_messages"],
-                "hint": "解析出错、需要人工关注。",
-                "state": "danger" if stats["failed_messages"] > 0 else "ok",
-            },
-            {
-                "label": "24 小时解析失败",
-                "value": failed_today,
-                "hint": "过去 24 小时进入解析失败的邮件。",
-                "state": failed_state,
-            },
-            {
-                "label": "磁盘使用",
-                "value": f"{disk_used_percent:.1f}%",
-                "hint": f"已用 {cn_bytes(disk_usage.used)} / {cn_bytes(disk_usage.total)}，阈值 {disk_threshold}%。",
-                "state": disk_state,
-            },
-        ],
-        # Layer 3 — totals (small reference at bottom)
-        "totals": [
-            {"label": "已接入域名", "value": stats["domains"], "icon": "globe"},
-            {"label": "已收录邮箱", "value": stats["mailboxes"], "icon": "inbox"},
-            {"label": "邮件总数", "value": stats["messages"], "icon": "mail"},
-            {"label": "API 密钥", "value": stats["api_keys"], "icon": "key-round"},
-            {"label": "审计记录", "value": stats["audit_logs"], "icon": "scroll-text"},
-        ],
-        "recent_domains": recent_domains,
-        "recent_messages": recent_messages,
-        "delivery_chart": delivery_chart,
-    }
 
 
 def _list_recent_messages(request: Request, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -710,6 +502,21 @@ def _api_keys_page_context(
     }
 
 
+def _render_api_keys_page(
+    request: Request,
+    admin: dict[str, Any],
+    *,
+    status_code: int = 200,
+    **context_kwargs: Any,
+) -> Response:
+    return _render(
+        request,
+        "admin/api_keys.html",
+        _api_keys_page_context(request, admin, **context_kwargs),
+        status_code=status_code,
+    )
+
+
 def _api_key_form_values(form: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = form or {}
     scopes = payload.get("scopes", [])
@@ -770,11 +577,13 @@ def _api_key_edit_context(
     form: dict[str, Any] | None = None,
     updated: bool = False,
     rotated_api_key: dict[str, Any] | None = None,
+    api_key: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    try:
-        api_key = request.app.state.runtime.api_keys.get_key(api_key_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if api_key is None:
+        try:
+            api_key = request.app.state.runtime.api_keys.get_key(api_key_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return {
         "page_title": f"编辑 API 密钥：{api_key['name']}",
         "admin": admin,
@@ -789,6 +598,22 @@ def _api_key_edit_context(
     }
 
 
+def _render_api_key_detail(
+    request: Request,
+    admin: dict[str, Any],
+    api_key_id: int,
+    *,
+    status_code: int = 200,
+    **context_kwargs: Any,
+) -> Response:
+    return _render(
+        request,
+        "admin/api_key_detail.html",
+        _api_key_edit_context(request, admin, api_key_id, **context_kwargs),
+        status_code=status_code,
+    )
+
+
 def _domain_form_values(request: Request, form: dict[str, str] | None = None) -> dict[str, Any]:
     settings = request.app.state.runtime.get_settings()
     payload = form or {}
@@ -796,8 +621,8 @@ def _domain_form_values(request: Request, form: dict[str, str] | None = None) ->
         "root_domain": payload.get("root_domain", ""),
         "accept_exact": _form_bool(payload["accept_exact"]) if "accept_exact" in payload else True,
         "accept_subdomains": _form_bool(payload["accept_subdomains"]) if "accept_subdomains" in payload else True,
-        "public_web_enabled": _form_bool(payload["public_web_enabled"]) if "public_web_enabled" in payload else True,
-        "public_api_enabled": _form_bool(payload["public_api_enabled"]) if "public_api_enabled" in payload else True,
+        "public_web_enabled": _form_bool(payload["public_web_enabled"]) if "public_web_enabled" in payload else False,
+        "public_api_enabled": _form_bool(payload["public_api_enabled"]) if "public_api_enabled" in payload else False,
         "local_part_case_sensitive": (
             _form_bool(payload["local_part_case_sensitive"]) if "local_part_case_sensitive" in payload else False
         ),
@@ -808,6 +633,7 @@ def _domain_form_values(request: Request, form: dict[str, str] | None = None) ->
             str(settings["max_message_size_bytes"]),
         )
         or str(settings["max_message_size_bytes"]),
+        "retention_days": payload.get("retention_days", ""),
     }
 
 
@@ -918,6 +744,7 @@ def _domain_detail_context(
     updated: bool = False,
     dns_checked: bool = False,
     form: dict[str, Any] | None = None,
+    raw_form: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     try:
         domain = request.app.state.runtime.domains.get_domain(domain_id)
@@ -928,11 +755,68 @@ def _domain_detail_context(
         "admin": admin,
         "domain": domain,
         "mailboxes": _domain_mailboxes(request, domain_id),
-        "form": form or _domain_edit_form_values(domain),
+        "form": form if form is not None else _domain_edit_form_values(domain, raw_form),
         "error": error,
         "updated": updated,
         "dns_checked": dns_checked,
     }
+
+
+def _mailboxes_page_data(
+    request: Request,
+    *,
+    limit: int,
+    offset: int,
+    query: str | None,
+    domain_id: int | None,
+    public_enabled: bool | None,
+    is_hidden: bool | None,
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+    service = request.app.state.runtime.mailboxes
+    filters = {
+        "query": query,
+        "domain_id": domain_id,
+        "public_enabled": public_enabled,
+        "is_hidden": is_hidden,
+    }
+    mailboxes = service.list_mailboxes(limit=limit, offset=offset, **filters)["items"]
+    total_count = service.count_mailboxes(**filters)
+    domains = request.app.state.runtime.list_domains()
+    return mailboxes, total_count, domains
+
+
+def _mailbox_detail_data(
+    request: Request,
+    mailbox_id: int,
+    *,
+    limit: int,
+    offset: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    service = request.app.state.runtime.mailboxes
+    mailbox = service.get_mailbox(mailbox_id)
+    deliveries = service.list_mailbox_deliveries(mailbox_id, limit=limit, offset=offset)
+    return mailbox, deliveries
+
+
+def _messages_page_data(
+    request: Request,
+    *,
+    limit: int,
+    offset: int,
+    query: str | None,
+    parse_status: str | None,
+    mailbox_id: int | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    runtime = request.app.state.runtime
+    result = runtime.messages.list_messages(
+        limit=limit,
+        offset=offset,
+        query=query,
+        parse_status=parse_status,
+        mailbox_id=mailbox_id,
+    )
+    mailboxes = runtime.mailboxes.list_mailboxes(limit=1000)["items"]
+    return result, mailboxes
 
 
 @router.get("/admin/login", response_class=HTMLResponse)
@@ -940,7 +824,7 @@ async def login_page(request: Request) -> Response:
     admin = await _current_admin(request)
     if admin is not None:
         return _redirect_to_dashboard()
-    return _render(
+    return await _render_async(
         request,
         "admin/login.html",
         {
@@ -956,7 +840,12 @@ async def login(request: Request) -> Response:
     form = _parse_form_body(await request.body())
     username = form.get("username", "").strip()
     password = form.get("password", "")
-    if not username or not password:
+    invalid_username = (
+        len(username) > 128
+        or any(ord(character) < 32 for character in username)
+    )
+    invalid_password = len(password) > MAX_ADMIN_PASSWORD_LENGTH
+    if not username or not password or invalid_username or invalid_password:
         await _log_admin_audit(
             request,
             None,
@@ -964,14 +853,23 @@ async def login(request: Request) -> Response:
             "admin",
             None,
             "failure",
-            details={"username": username, "reason": "missing_credentials"},
+            details={
+                "username": username[:128],
+                "reason": (
+                    "invalid_username"
+                    if invalid_username
+                    else "invalid_password_length"
+                    if invalid_password
+                    else "missing_credentials"
+                ),
+            },
         )
-        return _render(
+        return await _render_async(
             request,
             "admin/login.html",
             {
                 "page_title": "管理员登录",
-                "error": "用户名和密码不能为空。",
+                "error": "用户名或密码格式无效。",
                 "username": username,
             },
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -989,7 +887,7 @@ async def login(request: Request) -> Response:
             "failure",
             details={"username": username, "reason": "rate_limited"},
         )
-        return _render(
+        return await _render_async(
             request,
             "admin/login.html",
             {
@@ -1009,7 +907,7 @@ async def login(request: Request) -> Response:
             "failure",
             details={"username": username},
         )
-        return _render(
+        return await _render_async(
             request,
             "admin/login.html",
             {
@@ -1020,11 +918,40 @@ async def login(request: Request) -> Response:
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
 
-    session = await request.app.state.runtime.auth.create_session(
-        admin_id=admin["id"],
-        ip=_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
-    )
+    password_hash_proof = admin.pop("_password_hash_proof", None)
+    try:
+        session = await request.app.state.runtime.auth.create_session(
+            admin_id=admin["id"],
+            ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            expected_password_hash=(
+                None if password_hash_proof is None else str(password_hash_proof)
+            ),
+        )
+    except LookupError:
+        request.app.state.runtime.auth.record_login_failure(
+            username,
+            ip=_client_ip(request),
+        )
+        await _log_admin_audit(
+            request,
+            None,
+            "admin.login",
+            "admin",
+            None,
+            "failure",
+            details={"username": username, "reason": "credential_changed"},
+        )
+        return await _render_async(
+            request,
+            "admin/login.html",
+            {
+                "page_title": "管理员登录",
+                "error": "用户名或密码不正确。",
+                "username": username,
+            },
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
     await _log_admin_audit(request, admin, "admin.login", "admin", str(admin["id"]), "success")
     response = _redirect_to_password_change() if admin.get("must_change_password") else _redirect_to_dashboard()
     response.set_cookie(
@@ -1061,8 +988,8 @@ async def dashboard_page(request: Request) -> Response:
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    summary = _dashboard_stats(request)
-    return _render(
+    summary = await get_dashboard_service(request.app).snapshot()
+    return await _render_async(
         request,
         "admin/dashboard.html",
         {
@@ -1079,7 +1006,7 @@ async def domains_page(request: Request) -> Response:
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    return _render_domains_page(request, admin_or_response)
+    return await asyncio.to_thread(_render_domains_page, request, admin_or_response)
 
 
 @router.post("/admin/domains")
@@ -1105,9 +1032,17 @@ async def create_domain_from_form(request: Request) -> Response:
                 default=int(request.app.state.runtime.get_settings()["max_message_size_bytes"]),
                 field_name="max_message_size_bytes",
             ),
+            retention_days=form.get("retention_days") or None,
+            authorization_principal=role_permission_context(admin_or_response),
         )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
-        return _render_domains_page(
+        return await asyncio.to_thread(
+            _render_domains_page,
             request,
             admin_or_response,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1125,16 +1060,18 @@ async def domain_detail_page(domain_id: int, request: Request) -> Response:
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    return _render(
+    context = await asyncio.to_thread(
+        _domain_detail_context,
+        request,
+        admin_or_response,
+        domain_id,
+        updated=bool(request.query_params.get("updated")),
+        dns_checked=bool(request.query_params.get("dns_checked")),
+    )
+    return await _render_async(
         request,
         "admin/domain_detail.html",
-        _domain_detail_context(
-            request,
-            admin_or_response,
-            domain_id,
-            updated=bool(request.query_params.get("updated")),
-            dns_checked=bool(request.query_params.get("dns_checked")),
-        ),
+        context,
     )
 
 
@@ -1163,21 +1100,31 @@ async def update_domain_from_form(domain_id: int, request: Request) -> Response:
             "retention_days": form.get("retention_days") or None,
             "notes": form.get("notes"),
         }
-        await request.app.state.runtime.domains.update_domain(domain_id, payload)
+        await request.app.state.runtime.domains.update_domain(
+            domain_id,
+            payload,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
-        current = request.app.state.runtime.domains.get_domain(domain_id)
-        return _render(
+        context = await asyncio.to_thread(
+            _domain_detail_context,
+            request,
+            admin_or_response,
+            domain_id,
+            error=_domain_form_error_message(exc),
+            raw_form=form,
+        )
+        return await _render_async(
             request,
             "admin/domain_detail.html",
-            _domain_detail_context(
-                request,
-                admin_or_response,
-                domain_id,
-                error=_domain_form_error_message(exc),
-                form=_domain_edit_form_values(current, form),
-            ),
+            context,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -1191,7 +1138,10 @@ async def run_domain_dns_check_from_form(domain_id: int, request: Request) -> Re
     if isinstance(admin_or_response, Response):
         return admin_or_response
     try:
-        domain = request.app.state.runtime.domains.get_domain(domain_id)
+        domain = await asyncio.to_thread(
+            request.app.state.runtime.domains.get_domain,
+            domain_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -1204,26 +1154,23 @@ async def run_domain_dns_check_from_form(domain_id: int, request: Request) -> Re
         **check_result,
     }
 
-    def operation(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            UPDATE domains
-            SET dns_status = ?,
-                dns_last_checked_at = ?,
-                dns_details_json = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                check_result["status"],
-                checked_at,
-                json.dumps(stored_result, ensure_ascii=False),
-                checked_at,
-                domain_id,
-            ),
+    try:
+        await request.app.state.runtime.domains.record_dns_check(
+            domain_id,
+            expected_root_domain_ascii=str(domain["root_domain_ascii"]),
+            checked_at=checked_at,
+            details=stored_result,
+            authorization_principal=role_permission_context(admin_or_response),
         )
-
-    await request.app.state.runtime.writer.execute(operation)
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await _log_admin_audit(request, admin_or_response, "domains.dns_check", "domain", str(domain_id), "success")
     return RedirectResponse(f"/admin/domains/{domain_id}?dns_checked=1", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1237,19 +1184,29 @@ async def delete_domain_from_form(domain_id: int, request: Request) -> Response:
     if form.get("confirm") != "delete-domain":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="confirmation required")
     try:
-        await request.app.state.runtime.domains.delete_domain(domain_id)
+        await request.app.state.runtime.domains.delete_domain(
+            domain_id,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except sqlite3.IntegrityError as exc:
-        return _render(
+        context = await asyncio.to_thread(
+            _domain_detail_context,
+            request,
+            admin_or_response,
+            domain_id,
+            error="该域名仍有关联邮箱、投递记录或 API 授权，无法直接删除。请先清理相关数据或停用域名。",
+        )
+        return await _render_async(
             request,
             "admin/domain_detail.html",
-            _domain_detail_context(
-                request,
-                admin_or_response,
-                domain_id,
-                error="该域名仍有关联邮箱、投递记录或 API 授权，无法直接删除。请先清理相关数据或停用域名。",
-            ),
+            context,
             status_code=status.HTTP_409_CONFLICT,
         )
     await _log_admin_audit(request, admin_or_response, "domains.delete", "domain", str(domain_id), "success")
@@ -1275,15 +1232,11 @@ async def mailboxes_page(
     public_enabled_filter = _parse_optional_query_bool(public_enabled, field_name="public_enabled")
     is_hidden_filter = _parse_optional_query_bool(is_hidden, field_name="is_hidden")
 
-    mailboxes = request.app.state.runtime.mailboxes.list_mailboxes(
+    mailboxes, total_count, domains = await asyncio.to_thread(
+        _mailboxes_page_data,
+        request,
         limit=limit,
         offset=offset,
-        query=query,
-        domain_id=domain_filter,
-        public_enabled=public_enabled_filter,
-        is_hidden=is_hidden_filter,
-    )["items"]
-    total_count = request.app.state.runtime.mailboxes.count_mailboxes(
         query=query,
         domain_id=domain_filter,
         public_enabled=public_enabled_filter,
@@ -1295,14 +1248,14 @@ async def mailboxes_page(
         "public_enabled": "" if public_enabled_filter is None else str(int(public_enabled_filter)),
         "is_hidden": "" if is_hidden_filter is None else str(int(is_hidden_filter)),
     }
-    return _render(
+    return await _render_async(
         request,
         "admin/mailboxes.html",
         {
             "page_title": "邮箱",
             "admin": admin_or_response,
             "mailboxes": mailboxes,
-            "domains": request.app.state.runtime.list_domains(),
+            "domains": domains,
             "filters": filters,
             "pagination": build_pagination_context(
                 path="/admin/mailboxes",
@@ -1327,15 +1280,16 @@ async def mailbox_detail_page(
     if isinstance(admin_or_response, Response):
         return admin_or_response
     try:
-        mailbox = request.app.state.runtime.mailboxes.get_mailbox(mailbox_id)
-        deliveries = request.app.state.runtime.mailboxes.list_mailbox_deliveries(
+        mailbox, deliveries = await asyncio.to_thread(
+            _mailbox_detail_data,
+            request,
             mailbox_id,
             limit=limit,
             offset=offset,
         )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return _render(
+    return await _render_async(
         request,
         "admin/mailbox_detail.html",
         {
@@ -1370,7 +1324,16 @@ async def update_mailbox_visibility(mailbox_id: int, request: Request) -> Respon
     offset = _parse_non_negative_int(form.get("offset"), default=0, field_name="offset")
 
     try:
-        await request.app.state.runtime.mailboxes.update_mailbox(mailbox_id, updates)
+        await request.app.state.runtime.mailboxes.update_mailbox(
+            mailbox_id,
+            updates,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1390,13 +1353,23 @@ async def delete_mailbox_deliveries_from_form(mailbox_id: int, request: Request)
         return admin_or_response
     form = _parse_form_body_lists(await request.body())
     selected_ids = _parse_multi_text_values(form.get("delivery_ids"))
-    if not selected_ids:
-        result = await request.app.state.runtime.mailboxes.soft_delete_mailbox_deliveries(mailbox_id)
-    else:
-        result = await request.app.state.runtime.mailboxes.soft_delete_mailbox_deliveries(
-            mailbox_id,
-            delivery_ids=selected_ids,
-        )
+    try:
+        if not selected_ids:
+            result = await request.app.state.runtime.mailboxes.soft_delete_mailbox_deliveries(
+                mailbox_id,
+                authorization_principal=role_permission_context(admin_or_response),
+            )
+        else:
+            result = await request.app.state.runtime.mailboxes.soft_delete_mailbox_deliveries(
+                mailbox_id,
+                delivery_ids=selected_ids,
+                authorization_principal=role_permission_context(admin_or_response),
+            )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     await _log_admin_audit(
         request,
         admin_or_response,
@@ -1423,7 +1396,9 @@ async def messages_page(
         return admin_or_response
 
     try:
-        result = request.app.state.runtime.messages.list_messages(
+        result, mailbox_options = await asyncio.to_thread(
+            _messages_page_data,
+            request,
             limit=limit,
             offset=offset,
             query=q,
@@ -1438,14 +1413,14 @@ async def messages_page(
         "parse_status": parse_status or "",
         "mailbox_id": "" if mailbox_id is None else str(mailbox_id),
     }
-    return _render(
+    return await _render_async(
         request,
         "admin/messages.html",
         {
             "page_title": "邮件",
             "admin": admin_or_response,
             "messages": messages,
-            "mailboxes": request.app.state.runtime.mailboxes.list_mailboxes(limit=1000)["items"],
+            "mailboxes": mailbox_options,
             "filters": filters,
             "pagination": build_pagination_context(
                 path="/admin/messages",
@@ -1465,10 +1440,14 @@ async def message_detail_page(message_id: str, request: Request) -> Response:
     if isinstance(admin_or_response, Response):
         return admin_or_response
     try:
-        message = request.app.state.runtime.messages.get_admin_message_detail(message_id)
+        message = await asyncio.to_thread(
+            request.app.state.runtime.messages.get_admin_message_detail,
+            message_id,
+            include_html_preview=True,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return _render(
+    return await _render_async(
         request,
         "admin/message_detail.html",
         {
@@ -1485,10 +1464,13 @@ async def admin_message_raw(message_id: str, request: Request) -> Response:
     if isinstance(admin_or_response, Response):
         return admin_or_response
     try:
-        raw = request.app.state.runtime.messages.get_admin_raw_message(message_id)
+        raw = await asyncio.to_thread(
+            request.app.state.runtime.messages.get_admin_raw_file,
+            message_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return Response(raw, media_type="message/rfc822")
+    return FileResponse(raw["path"], media_type="message/rfc822", filename=f"{message_id}.eml")
 
 
 @router.get("/admin/messages/{message_id}/attachments/{attachment_id}")
@@ -1497,13 +1479,18 @@ async def admin_message_attachment(message_id: str, attachment_id: str, request:
     if isinstance(admin_or_response, Response):
         return admin_or_response
     try:
-        attachment = request.app.state.runtime.messages.get_admin_attachment(message_id, attachment_id)
+        attachment = await asyncio.to_thread(
+            request.app.state.runtime.messages.get_admin_attachment_file,
+            message_id,
+            attachment_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     safe_filename = attachment.get("safe_filename") or "attachment.bin"
-    return Response(
-        attachment["content"],
+    return FileResponse(
+        attachment["path"],
         media_type=attachment.get("content_type") or "application/octet-stream",
+        filename=safe_filename,
         headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
 
@@ -1514,7 +1501,15 @@ async def reparse_message_from_form(message_id: str, request: Request) -> Respon
     if isinstance(admin_or_response, Response):
         return admin_or_response
     try:
-        await request.app.state.runtime.messages.reparse_message(message_id)
+        await request.app.state.runtime.messages.reparse_message(
+            message_id,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except (ApiKeyAuthorizationError, PermissionDenied) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     await _log_admin_audit(request, admin_or_response, "messages.reparse", "message", message_id, "success")
@@ -1528,10 +1523,25 @@ async def delete_message_deliveries_from_form(message_id: str, request: Request)
         return admin_or_response
     form = _parse_form_body_lists(await request.body())
     selected_ids = _parse_multi_text_values(form.get("delivery_ids"))
-    if not selected_ids:
-        detail = request.app.state.runtime.messages.get_admin_message_detail(message_id)
-        selected_ids = [str(item["delivery_id"]) for item in detail["deliveries"] if item["status"] == "active"]
-    result = await request.app.state.runtime.messages.soft_delete_deliveries(selected_ids)
+    principal = role_permission_context(admin_or_response)
+    try:
+        if selected_ids:
+            result = await request.app.state.runtime.messages.soft_delete_deliveries(
+                selected_ids,
+                authorization_principal=principal,
+            )
+        else:
+            result = await request.app.state.runtime.messages.soft_delete_message(
+                message_id,
+                authorization_principal=principal,
+            )
+    except (ApiKeyAuthorizationError, PermissionDenied) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     await _log_admin_audit(
         request,
         admin_or_response,
@@ -1554,10 +1564,12 @@ async def api_keys_page(
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    return _render(
+    return await asyncio.to_thread(
+        _render_api_keys_page,
         request,
-        "admin/api_keys.html",
-        _api_keys_page_context(request, admin_or_response, limit=limit, offset=offset),
+        admin_or_response,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -1592,10 +1604,12 @@ async def create_api_key(request: Request) -> Response:
                 "mailbox_patterns": (form.get("mailbox_patterns") or [""])[-1],
             }
         )
-        return _render(
+        return await asyncio.to_thread(
+            _render_api_keys_page,
             request,
-            "admin/api_keys.html",
-            _api_keys_page_context(request, admin_or_response, error=error_message, create_form=create_form),
+            admin_or_response,
+            error=error_message,
+            create_form=create_form,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
     create_form = _api_key_form_values(
@@ -1610,10 +1624,12 @@ async def create_api_key(request: Request) -> Response:
     )
 
     if not name:
-        return _render(
+        return await asyncio.to_thread(
+            _render_api_keys_page,
             request,
-            "admin/api_keys.html",
-            _api_keys_page_context(request, admin_or_response, error="名称不能为空。", create_form=create_form),
+            admin_or_response,
+            error="名称不能为空。",
+            create_form=create_form,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -1623,21 +1639,35 @@ async def create_api_key(request: Request) -> Response:
             kind=kind,
             scopes=scopes,
             domain_ids=domain_ids,
+            domain_grant_mode=domain_grant_mode,
             mailbox_patterns=mailbox_patterns,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        return await asyncio.to_thread(
+            _render_api_keys_page,
+            request,
+            admin_or_response,
+            error="管理员权限已变化，请重新加载后再试。",
+            create_form=create_form,
+            status_code=status.HTTP_403_FORBIDDEN,
         )
     except (ValueError, sqlite3.IntegrityError) as exc:
-        return _render(
+        return await asyncio.to_thread(
+            _render_api_keys_page,
             request,
-            "admin/api_keys.html",
-            _api_keys_page_context(request, admin_or_response, error=str(exc), create_form=create_form),
+            admin_or_response,
+            error=str(exc),
+            create_form=create_form,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
     await _log_admin_audit(request, admin_or_response, "api_keys.create", "api_key", str(created["id"]), "success")
-    return _render(
+    return await asyncio.to_thread(
+        _render_api_keys_page,
         request,
-        "admin/api_keys.html",
-        _api_keys_page_context(request, admin_or_response, created_api_key=created),
+        admin_or_response,
+        created_api_key=created,
         status_code=status.HTTP_200_OK,
     )
 
@@ -1652,10 +1682,12 @@ async def api_key_detail_page(
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    return _render(
+    return await asyncio.to_thread(
+        _render_api_key_detail,
         request,
-        "admin/api_key_detail.html",
-        _api_key_edit_context(request, admin_or_response, api_key_id, updated=bool(updated)),
+        admin_or_response,
+        api_key_id,
+        updated=bool(updated),
     )
 
 
@@ -1666,7 +1698,10 @@ async def update_api_key_from_form(api_key_id: int, request: Request) -> Respons
         return admin_or_response
 
     try:
-        current_api_key = request.app.state.runtime.api_keys.get_key(api_key_id)
+        current_api_key = await asyncio.to_thread(
+            request.app.state.runtime.api_keys.get_key,
+            api_key_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -1711,16 +1746,14 @@ async def update_api_key_from_form(api_key_id: int, request: Request) -> Respons
                 "expires_at": expires_at or "",
             },
         )
-        return _render(
+        return await asyncio.to_thread(
+            _render_api_key_detail,
             request,
-            "admin/api_key_detail.html",
-            _api_key_edit_context(
-                request,
-                admin_or_response,
-                api_key_id,
-                error=error_message,
-                form=edit_form,
-            ),
+            admin_or_response,
+            api_key_id,
+            api_key=current_api_key,
+            error=error_message,
+            form=edit_form,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -1741,16 +1774,14 @@ async def update_api_key_from_form(api_key_id: int, request: Request) -> Respons
     }
 
     if not name:
-        return _render(
+        return await asyncio.to_thread(
+            _render_api_key_detail,
             request,
-            "admin/api_key_detail.html",
-            _api_key_edit_context(
-                request,
-                admin_or_response,
-                api_key_id,
-                error="名称不能为空。",
-                form=_api_key_edit_form_values(current_api_key, edit_form),
-            ),
+            admin_or_response,
+            api_key_id,
+            api_key=current_api_key,
+            error="名称不能为空。",
+            form=_api_key_edit_form_values(current_api_key, edit_form),
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -1763,26 +1794,28 @@ async def update_api_key_from_form(api_key_id: int, request: Request) -> Respons
             status=status_value,
             scopes=scopes,
             domain_ids=domain_ids,
+            domain_grant_mode=domain_grant_mode,
             mailbox_patterns=_parse_csv_values(mailbox_patterns_raw),
             allow_header=edit_form["allow_header"],
             allow_query=edit_form["allow_query"],
             rate_limit_per_min=rate_limit_per_min,
             allowed_ip_cidrs=_parse_csv_values(allowed_ip_cidrs_raw),
             expires_at=expires_at,
+            authorization_principal=role_permission_context(admin_or_response),
         )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
-        return _render(
+        return await asyncio.to_thread(
+            _render_api_key_detail,
             request,
-            "admin/api_key_detail.html",
-            _api_key_edit_context(
-                request,
-                admin_or_response,
-                api_key_id,
-                error=str(exc),
-                form=_api_key_edit_form_values(current_api_key, edit_form),
-            ),
+            admin_or_response,
+            api_key_id,
+            api_key=current_api_key,
+            error=str(exc),
+            form=_api_key_edit_form_values(current_api_key, edit_form),
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -1797,17 +1830,24 @@ async def rotate_api_key_from_form(api_key_id: int, request: Request) -> Respons
         return admin_or_response
 
     try:
-        rotated = await request.app.state.runtime.api_keys.rotate_key(api_key_id)
+        rotated = await request.app.state.runtime.api_keys.rotate_key(
+            api_key_id,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     await _log_admin_audit(request, admin_or_response, "api_keys.rotate", "api_key", str(api_key_id), "success")
-    return _render(
+    return await asyncio.to_thread(
+        _render_api_key_detail,
         request,
-        "admin/api_key_detail.html",
-        _api_key_edit_context(request, admin_or_response, api_key_id, rotated_api_key=rotated),
+        admin_or_response,
+        api_key_id,
+        rotated_api_key=rotated,
         status_code=status.HTTP_200_OK,
     )
 
@@ -1819,7 +1859,12 @@ async def revoke_api_key(api_key_id: int, request: Request) -> Response:
         return admin_or_response
 
     try:
-        await request.app.state.runtime.api_keys.revoke_key(api_key_id)
+        await request.app.state.runtime.api_keys.revoke_key(
+            api_key_id,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -1840,7 +1885,12 @@ async def delete_api_key_from_form(api_key_id: int, request: Request) -> Respons
         return admin_or_response
 
     try:
-        await request.app.state.runtime.api_keys.delete_key(api_key_id)
+        await request.app.state.runtime.api_keys.delete_key(
+            api_key_id,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1854,6 +1904,104 @@ async def delete_api_key_from_form(api_key_id: int, request: Request) -> Respons
         f"/admin/api-keys?limit={limit}&offset={offset}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
+
+
+@router.get("/admin/admins", response_class=HTMLResponse)
+async def admins_page(request: Request) -> Response:
+    admin_or_response = await _require_admin(request)
+    if isinstance(admin_or_response, Response):
+        return admin_or_response
+    result = await asyncio.to_thread(
+        request.app.state.runtime.auth.list_admins,
+        limit=500,
+        offset=0,
+    )
+    return await _render_async(
+        request,
+        "admin/admins.html",
+        {
+            "page_title": "管理员与权限",
+            "admin": admin_or_response,
+            "admins": result["items"],
+            "error": request.query_params.get("error"),
+            "updated": request.query_params.get("updated"),
+        },
+    )
+
+
+@router.post("/admin/admins")
+async def create_admin_from_form(request: Request) -> Response:
+    current = await _require_admin(request)
+    if isinstance(current, Response):
+        return current
+    form = _parse_form_body(await request.body())
+    try:
+        created = await request.app.state.runtime.auth.create_admin(
+            username=form.get("username", ""),
+            password=form.get("password", ""),
+            role=form.get("role", "viewer"),
+            display_name=form.get("display_name") or None,
+            is_active=_form_bool(form.get("is_active")),
+            must_change_password=True,
+            authorization_principal=role_permission_context(current),
+        )
+    except (ApiKeyAuthorizationError, ValueError, sqlite3.IntegrityError) as exc:
+        return RedirectResponse(f"/admin/admins?error={quote(str(exc))}", status_code=303)
+    await _log_admin_audit(request, current, "admins.create", "admin", str(created["id"]), "success")
+    return RedirectResponse("/admin/admins?updated=created", status_code=303)
+
+
+@router.post("/admin/admins/{admin_id}")
+async def update_admin_from_form(admin_id: int, request: Request) -> Response:
+    current = await _require_admin(request)
+    if isinstance(current, Response):
+        return current
+    form = _parse_form_body(await request.body())
+    try:
+        await request.app.state.runtime.auth.update_admin(
+            admin_id,
+            role=form.get("role", "viewer"),
+            is_active=_form_bool(form.get("is_active")),
+            authorization_principal=role_permission_context(current),
+        )
+    except (ApiKeyAuthorizationError, LookupError, ValueError, sqlite3.IntegrityError) as exc:
+        return RedirectResponse(f"/admin/admins?error={quote(str(exc))}", status_code=303)
+    await _log_admin_audit(request, current, "admins.update", "admin", str(admin_id), "success")
+    return RedirectResponse("/admin/admins?updated=1", status_code=303)
+
+
+@router.post("/admin/admins/{admin_id}/reset-password")
+async def reset_admin_password_from_form(admin_id: int, request: Request) -> Response:
+    current = await _require_admin(request)
+    if isinstance(current, Response):
+        return current
+    form = _parse_form_body(await request.body())
+    try:
+        await request.app.state.runtime.auth.reset_admin_password(
+            admin_id,
+            form.get("password", ""),
+            authorization_principal=role_permission_context(current),
+        )
+    except (ApiKeyAuthorizationError, LookupError, ValueError) as exc:
+        return RedirectResponse(f"/admin/admins?error={quote(str(exc))}", status_code=303)
+    await _log_admin_audit(request, current, "admins.password_reset", "admin", str(admin_id), "success")
+    return RedirectResponse("/admin/admins?updated=password", status_code=303)
+
+
+@router.post("/admin/admins/{admin_id}/delete")
+async def delete_admin_from_form(admin_id: int, request: Request) -> Response:
+    current = await _require_admin(request)
+    if isinstance(current, Response):
+        return current
+    try:
+        await request.app.state.runtime.auth.delete_admin(
+            admin_id,
+            authorization_principal=role_permission_context(current),
+        )
+    except (ApiKeyAuthorizationError, LookupError, ValueError) as exc:
+        return RedirectResponse(f"/admin/admins?error={quote(str(exc))}", status_code=303)
+    await _log_admin_audit(request, current, "admins.delete", "admin", str(admin_id), "success")
+    return RedirectResponse("/admin/admins?updated=deleted", status_code=303)
 
 
 @router.get("/admin/audit", response_class=HTMLResponse)
@@ -1871,7 +2019,8 @@ async def audit_page(
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    audit_result = request.app.state.runtime.audit.list_logs(
+    audit_result = await asyncio.to_thread(
+        request.app.state.runtime.audit.list_logs,
         limit=limit,
         offset=offset,
         actor=actor,
@@ -1888,7 +2037,7 @@ async def audit_page(
         "start_time": start_time or "",
         "end_time": end_time or "",
     }
-    return _render(
+    return await _render_async(
         request,
         "admin/audit.html",
         {
@@ -1959,6 +2108,16 @@ def _settings_items(request: Request) -> list[dict[str, Any]]:
             "hint": "Dashboard 磁盘使用率超过该百分比时需要关注。",
         },
         {
+            "label": "收件路由模式",
+            "value": runtime_settings["ingress_mode"],
+            "hint": "managed_only 仅接收已配置域名；managed_plus_catchall 接收任意域名。",
+        },
+        {
+            "label": "清理批次",
+            "value": runtime_settings["cleanup_batch_size"],
+            "hint": "每轮最多清理的投递、日志与会话数量。",
+        },
+        {
             "label": "会话 Cookie 名称",
             "value": app_settings.session_cookie_name,
             "hint": "管理后台 HTML 会话使用的 Cookie 名称。",
@@ -1994,6 +2153,35 @@ def _settings_form_values(request: Request, form: dict[str, str] | None = None) 
             "disk_warning_threshold_percent",
             str(values["disk_warning_threshold_percent"]),
         ),
+        "ingress_mode": payload.get("ingress_mode", str(values["ingress_mode"])),
+        "catch_all_public_web_enabled": (
+            _form_bool(payload.get("catch_all_public_web_enabled"))
+            if form is not None
+            else bool(values["catch_all_public_web_enabled"])
+        ),
+        "catch_all_public_api_enabled": (
+            _form_bool(payload.get("catch_all_public_api_enabled"))
+            if form is not None
+            else bool(values["catch_all_public_api_enabled"])
+        ),
+        "catch_all_retention_days": payload.get(
+            "catch_all_retention_days", str(values["catch_all_retention_days"])
+        ),
+        "retention_cleanup_interval_seconds": payload.get(
+            "retention_cleanup_interval_seconds", str(values["retention_cleanup_interval_seconds"])
+        ),
+        "smtp_session_retention_seconds": payload.get(
+            "smtp_session_retention_seconds", str(values["smtp_session_retention_seconds"])
+        ),
+        "empty_mailbox_retention_seconds": payload.get(
+            "empty_mailbox_retention_seconds", str(values["empty_mailbox_retention_seconds"])
+        ),
+        "metric_retention_seconds": payload.get(
+            "metric_retention_seconds", str(values["metric_retention_seconds"])
+        ),
+        "audit_retention_days": payload.get("audit_retention_days", str(values["audit_retention_days"])),
+        "cleanup_batch_size": payload.get("cleanup_batch_size", str(values["cleanup_batch_size"])),
+        "file_gc_batch_size": payload.get("file_gc_batch_size", str(values["file_gc_batch_size"])),
     }
 
 
@@ -2024,6 +2212,21 @@ def _settings_context(
     }
 
 
+def _render_settings_page(
+    request: Request,
+    admin: dict[str, Any],
+    *,
+    status_code: int = 200,
+    **context_kwargs: Any,
+) -> Response:
+    return _render(
+        request,
+        "admin/settings.html",
+        _settings_context(request, admin, **context_kwargs),
+        status_code=status_code,
+    )
+
+
 @router.get("/admin/settings", response_class=HTMLResponse)
 async def settings_page(
     request: Request,
@@ -2042,24 +2245,21 @@ async def settings_page(
     if isinstance(admin_or_response, Response):
         return admin_or_response
 
-    return _render(
+    return await asyncio.to_thread(
+        _render_settings_page,
         request,
-        "admin/settings.html",
-        _settings_context(
-            request,
-            admin_or_response,
-            mail_clear_result={
-                "messages": cleared_messages,
-                "mailboxes": cleared_mailboxes,
-                "smtp_sessions": cleared_sessions,
-                "database_size_before_bytes": database_size_before_bytes,
-                "database_size_after_bytes": database_size_after_bytes,
-                "database_vacuumed": database_vacuumed,
-            } if mail_cleared else None,
-            settings_updated=bool(settings_updated),
-            password_changed=bool(password_changed),
-            force_password_change=bool(force_password_change),
-        ),
+        admin_or_response,
+        mail_clear_result={
+            "messages": cleared_messages,
+            "mailboxes": cleared_mailboxes,
+            "smtp_sessions": cleared_sessions,
+            "database_size_before_bytes": database_size_before_bytes,
+            "database_size_after_bytes": database_size_after_bytes,
+            "database_vacuumed": database_vacuumed,
+        } if mail_cleared else None,
+        settings_updated=bool(settings_updated),
+        password_changed=bool(password_changed),
+        force_password_change=bool(force_password_change),
     )
 
 
@@ -2072,17 +2272,22 @@ async def update_system_settings_from_form(request: Request) -> Response:
     form = _parse_form_body(await request.body())
     payload = _settings_form_values(request, form)
     try:
-        updated = await request.app.state.runtime.system_settings.update_settings(payload)
+        updated = await request.app.state.runtime.system_settings.update_settings(
+            payload,
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except ValueError as exc:
-        return _render(
+        return await asyncio.to_thread(
+            _render_settings_page,
             request,
-            "admin/settings.html",
-            _settings_context(
-                request,
-                admin_or_response,
-                settings_error=str(exc),
-                settings_form=payload,
-            ),
+            admin_or_response,
+            settings_error=str(exc),
+            settings_form=payload,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -2112,16 +2317,21 @@ async def change_admin_password(request: Request) -> Response:
     password_error: str | None = None
     if not current_password or not new_password or not confirm_password:
         password_error = "请填写当前密码和新密码。"
-    elif len(new_password) < 8:
-        password_error = "新密码至少需要 8 个字符。"
+    elif len(current_password) > MAX_ADMIN_PASSWORD_LENGTH:
+        password_error = "当前密码格式无效。"
+    elif len(new_password) < MIN_ADMIN_PASSWORD_LENGTH:
+        password_error = f"新密码至少需要 {MIN_ADMIN_PASSWORD_LENGTH} 个字符。"
+    elif len(new_password) > MAX_ADMIN_PASSWORD_LENGTH or len(confirm_password) > MAX_ADMIN_PASSWORD_LENGTH:
+        password_error = f"新密码不能超过 {MAX_ADMIN_PASSWORD_LENGTH} 个字符。"
     elif new_password != confirm_password:
         password_error = "两次输入的新密码不一致。"
 
     if password_error is not None:
-        return _render(
+        return await asyncio.to_thread(
+            _render_settings_page,
             request,
-            "admin/settings.html",
-            _settings_context(request, admin_or_response, password_error=password_error),
+            admin_or_response,
+            password_error=password_error,
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -2130,23 +2340,31 @@ async def change_admin_password(request: Request) -> Response:
             int(admin_or_response["id"]),
             current_password,
             new_password,
+            current_session_id=str(admin_or_response["session_id"]),
         )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     except ValueError as exc:
         error_map = {
             "password must not use the default bootstrap value": "新密码不能继续使用默认初始密码。",
             "password must be changed": "新密码不能与当前密码相同。",
         }
-        return _render(
+        return await asyncio.to_thread(
+            _render_settings_page,
             request,
-            "admin/settings.html",
-            _settings_context(request, admin_or_response, password_error=error_map.get(str(exc), "新密码不符合安全要求。")),
+            admin_or_response,
+            password_error=error_map.get(str(exc), "新密码不符合安全要求。"),
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     except LookupError:
-        return _render(
+        return await asyncio.to_thread(
+            _render_settings_page,
             request,
-            "admin/settings.html",
-            _settings_context(request, admin_or_response, password_error="当前密码不正确。"),
+            admin_or_response,
+            password_error="当前密码不正确。",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -2171,7 +2389,15 @@ async def clear_mail_store(request: Request) -> Response:
     if form.get("confirm") != "clear-all-mail":
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="confirmation required")
 
-    result = await request.app.state.runtime.clear_all_mail()
+    try:
+        result = await request.app.state.runtime.clear_all_mail(
+            authorization_principal=role_permission_context(admin_or_response),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="administrator authorization changed",
+        ) from exc
     await request.app.state.runtime.audit.log(
         "admin",
         str(admin_or_response.get("username") or admin_or_response.get("id") or "admin"),

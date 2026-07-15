@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from typing import Any
@@ -26,7 +27,11 @@ class AuditService:
         details: Any | None = None,
     ) -> dict[str, Any]:
         created_at = utc_now()
-        details_json = None if details is None else json.dumps(details, ensure_ascii=False)
+        actor_ref = self._bounded_text(actor_ref, 256)
+        resource_ref = self._bounded_text(resource_ref, 512)
+        ip = self._bounded_text(ip, 128)
+        user_agent = self._bounded_text(user_agent, 512)
+        details_json = self._bounded_details_json(details)
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             cursor = connection.execute(
@@ -72,6 +77,29 @@ class AuditService:
             }
 
         return await self._runtime.writer.execute(operation)
+
+    @staticmethod
+    def _bounded_text(value: str | None, maximum: int) -> str | None:
+        if value is None:
+            return None
+        return str(value)[:maximum]
+
+    @staticmethod
+    def _bounded_details_json(details: Any | None) -> str | None:
+        if details is None:
+            return None
+        encoded = json.dumps(details, ensure_ascii=False, default=str)
+        payload = encoded.encode("utf-8")
+        if len(payload) <= 65_536:
+            return encoded
+        return json.dumps(
+            {
+                "truncated": True,
+                "original_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            ensure_ascii=False,
+        )
 
     def list_logs(
         self,

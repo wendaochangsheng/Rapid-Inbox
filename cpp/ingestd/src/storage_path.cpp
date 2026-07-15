@@ -5,6 +5,8 @@
 namespace rapid_inbox::ingestd {
 namespace {
 
+constexpr std::size_t kMaxSafeFilenameBytes = 160;
+
 bool is_safe_filename_char(char ch) {
     return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
            (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
@@ -42,6 +44,24 @@ std::string safe_filename(const std::string& filename) {
     const auto last = safe.find_last_not_of("._");
     safe = safe.substr(first, last - first + 1);
 
+    if (safe.empty()) {
+        return "attachment.bin";
+    }
+    if (safe.size() <= kMaxSafeFilenameBytes) {
+        return safe;
+    }
+
+    const auto dot = safe.rfind('.');
+    if (dot != std::string::npos && dot > 0 && safe.size() - dot <= 16) {
+        const std::string extension = safe.substr(dot);
+        safe.resize(kMaxSafeFilenameBytes - extension.size());
+        safe += extension;
+    } else {
+        safe.resize(kMaxSafeFilenameBytes);
+    }
+    while (!safe.empty() && (safe.back() == '.' || safe.back() == '_')) {
+        safe.pop_back();
+    }
     return safe.empty() ? "attachment.bin" : safe;
 }
 

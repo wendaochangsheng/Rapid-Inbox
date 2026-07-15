@@ -47,6 +47,9 @@ void test_time_and_path_parts() {
     test::check(leap_day_parts.year == "2024", "leap day year");
     test::check(leap_day_parts.month == "02", "leap day month");
     test::check(leap_day_parts.day == "29", "leap day day");
+    test::check(rapid_inbox::ingestd::utc_add_days("2024-02-28T23:59:59Z", 2) ==
+                    "2024-03-01T23:59:59Z",
+                "UTC retention expiry crosses leap day");
 
     const std::string accepted_timestamps[] = {
         "2026-05-12T03",
@@ -126,6 +129,11 @@ void test_storage_paths_match_python_layout() {
     test::check(rapid_inbox::ingestd::safe_filename("") == "attachment.bin", "empty filename");
     test::check(rapid_inbox::ingestd::safe_filename("...___") == "attachment.bin",
                 "punctuation-only filename");
+    const std::string long_filename(300, 'a');
+    test::check(rapid_inbox::ingestd::safe_filename(long_filename + ".txt").size() <= 160,
+                "safe filename is bounded for filesystem NAME_MAX");
+    test::check(rapid_inbox::ingestd::safe_filename(long_filename + ".txt").ends_with(".txt"),
+                "safe filename preserves short extension when truncated");
 }
 
 void test_json_escape() {

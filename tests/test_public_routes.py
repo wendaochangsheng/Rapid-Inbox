@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.policy import SMTP
@@ -9,6 +12,7 @@ import httpx
 import pytest
 
 from app.config import default_settings
+import app.http.public_views as public_views_module
 import app.runtime as runtime_module
 from app.main import create_app
 from app.services.messages import MessageService
@@ -26,6 +30,27 @@ def _mail_bytes(subject: str, message_id: str, body: str) -> bytes:
         "\r\n"
         f"{body}\r\n"
     ).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_public_template_rendering_does_not_block_event_loop(app_client, monkeypatch) -> None:
+    original_render = public_views_module._render_template
+    started = threading.Event()
+
+    def slow_render(*args, **kwargs):
+        started.set()
+        time.sleep(0.2)
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr(public_views_module, "_render_template", slow_render)
+    request_task = asyncio.create_task(app_client.get("/"))
+
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1.0)
+    assert not request_task.done()
+    await asyncio.sleep(0)
+    response = await request_task
+
+    assert response.status_code == 200
 
 
 def _rich_mail_bytes(
@@ -77,7 +102,7 @@ async def test_mailbox_page_and_public_api_show_received_message(tmp_path, sampl
 
     async with app.router.lifespan_context(app):
         runtime = app.state.runtime
-        await runtime.create_domain("adb.com")
+        await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
         await runtime.accept_message(
             rcpt_tos=["foo@adb.com"],
             envelope_from="sender@example.com",
@@ -91,6 +116,8 @@ async def test_mailbox_page_and_public_api_show_received_message(tmp_path, sampl
             kind="public",
             scopes=["public.read"],
             domain_ids=[],
+
+            domain_grant_mode="all",
             mailbox_patterns=["foo@adb.com"],
         )
 
@@ -113,7 +140,7 @@ async def test_mailbox_page_and_public_api_show_received_message(tmp_path, sampl
 
 @pytest.mark.asyncio
 async def test_public_message_page_displays_shanghai_time(app_client, runtime, monkeypatch, sample_email_bytes: bytes) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     monkeypatch.setattr(runtime_module, "utc_now", lambda: "2026-04-18T20:00:00Z")
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
@@ -134,7 +161,7 @@ async def test_public_message_page_displays_shanghai_time(app_client, runtime, m
 async def test_public_mailbox_page_exposes_pagination_links(app_client, runtime, monkeypatch) -> None:
     _patch_sequenced_utc_now(monkeypatch)
 
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="sender@example.com",
@@ -169,7 +196,7 @@ async def test_public_mailbox_page_exposes_pagination_links(app_client, runtime,
 async def test_public_mailbox_page_defaults_to_twenty_results(app_client, runtime, monkeypatch) -> None:
     _patch_sequenced_utc_now(monkeypatch)
 
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     for index in range(21):
         await runtime.accept_message(
             rcpt_tos=["foo@adb.com"],
@@ -190,7 +217,7 @@ async def test_public_mailbox_page_defaults_to_twenty_results(app_client, runtim
 async def test_public_mailbox_api_returns_pagination_metadata(app_client, runtime, monkeypatch) -> None:
     _patch_sequenced_utc_now(monkeypatch)
 
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="sender@example.com",
@@ -212,6 +239,8 @@ async def test_public_mailbox_api_returns_pagination_metadata(app_client, runtim
         kind="public",
         scopes=["public.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=["foo@adb.com"],
     )
 
@@ -243,7 +272,7 @@ async def test_public_mailbox_api_returns_pagination_metadata(app_client, runtim
 async def test_public_mailbox_api_supports_delivery_cursor_pagination(app_client, runtime, monkeypatch) -> None:
     _patch_sequenced_utc_now(monkeypatch)
 
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     for subject in ("Oldest", "Middle", "Newest"):
         await runtime.accept_message(
             rcpt_tos=["foo@adb.com"],
@@ -256,6 +285,8 @@ async def test_public_mailbox_api_supports_delivery_cursor_pagination(app_client
         kind="public",
         scopes=["public.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=["foo@adb.com"],
     )
 
@@ -268,14 +299,37 @@ async def test_public_mailbox_api_supports_delivery_cursor_pagination(app_client
         f"/api/v1/public/mailboxes/foo@adb.com/messages?limit=1&cursor={cursor}",
         headers={"X-API-Key": public_key["plain_text"]},
     )
+    encoded, signature = cursor.split(".", 1)
+    tampered = await app_client.get(
+        "/api/v1/public/mailboxes/foo@adb.com/messages",
+        params={
+            "limit": 1,
+            "cursor": f"{encoded}.{'A' if signature[0] != 'A' else 'B'}{signature[1:]}",
+        },
+        headers={"X-API-Key": public_key["plain_text"]},
+    )
+    cross_mailbox = await app_client.get(
+        "/api/v1/public/mailboxes/bar@adb.com/messages",
+        params={"limit": 1, "cursor": cursor},
+        headers={"X-API-Key": public_key["plain_text"]},
+    )
+    oversized = await app_client.get(
+        "/api/v1/public/mailboxes/foo@adb.com/messages",
+        params={"cursor": "A" * 2049},
+        headers={"X-API-Key": public_key["plain_text"]},
+    )
 
     assert first_page.status_code == 200
     assert first_page.json()["items"][0]["subject"] == "Newest"
     assert first_page.json()["pagination"]["mode"] == "offset"
     assert cursor
+    assert "." in cursor
     assert second_page.status_code == 200
     assert second_page.json()["pagination"]["mode"] == "cursor"
     assert second_page.json()["items"][0]["subject"] == "Middle"
+    assert tampered.status_code == 422
+    assert cross_mailbox.status_code == 422
+    assert oversized.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -304,7 +358,7 @@ async def test_public_mailbox_routes_respect_mailbox_visibility_flags(
     sample_email_bytes: bytes,
     mailbox_updates: dict[str, bool],
 ) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="sender@example.com",
@@ -316,6 +370,8 @@ async def test_public_mailbox_routes_respect_mailbox_visibility_flags(
         kind="public",
         scopes=["public.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=["foo@adb.com"],
     )
 
@@ -334,7 +390,7 @@ async def test_public_mailbox_routes_respect_mailbox_visibility_flags(
 
 @pytest.mark.asyncio
 async def test_public_mailbox_page_shows_copy_button_for_openai_verification_code(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="noreply@openai.com",
@@ -356,7 +412,7 @@ async def test_public_mailbox_page_shows_copy_button_for_openai_verification_cod
 
 @pytest.mark.asyncio
 async def test_public_mailbox_page_ignores_numbers_without_verification_keywords(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="sender@example.com",
@@ -378,7 +434,7 @@ async def test_public_mailbox_page_ignores_numbers_without_verification_keywords
 
 @pytest.mark.asyncio
 async def test_public_mailbox_page_ignores_mail_with_multiple_candidate_codes(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="sender@example.com",
@@ -402,7 +458,7 @@ async def test_public_mailbox_page_ignores_mail_with_multiple_candidate_codes(ap
 
 @pytest.mark.asyncio
 async def test_public_mailbox_page_extracts_html_openai_verification_code(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="noreply@openai.com",
@@ -434,7 +490,7 @@ async def test_public_mailbox_page_extracts_chatgpt_login_code_from_css_heavy_op
         f".rule-{index} {{ font-family: Sohne; background-image: url(https://cdn.openai.com/font-{index}.woff2); }}"
         for index in range(20)
     )
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="noreply@tm.openai.com",
@@ -464,12 +520,14 @@ async def test_public_mailbox_page_extracts_chatgpt_login_code_from_css_heavy_op
 
 @pytest.mark.asyncio
 async def test_public_api_lists_mailbox_verification_codes(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     public_key = await runtime.api_keys.create_key(
         name="public-code-list",
         kind="public",
         scopes=["public.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=["foo@adb.com"],
     )
     await runtime.accept_message(
@@ -498,12 +556,14 @@ async def test_public_api_lists_mailbox_verification_codes(app_client, runtime) 
 
 @pytest.mark.asyncio
 async def test_public_api_gets_single_message_verification_code(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     public_key = await runtime.api_keys.create_key(
         name="public-code-detail",
         kind="public",
         scopes=["public.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=["foo@adb.com"],
     )
     await runtime.accept_message(
@@ -533,7 +593,7 @@ async def test_public_api_gets_single_message_verification_code(app_client, runt
 
 @pytest.mark.asyncio
 async def test_public_mailbox_page_includes_websocket_bootstrap_on_first_page(app_client, runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.accept_message(
         rcpt_tos=["foo@adb.com"],
         envelope_from="sender@example.com",
@@ -551,7 +611,7 @@ async def test_public_mailbox_page_includes_websocket_bootstrap_on_first_page(ap
 
 @pytest.mark.asyncio
 async def test_public_mailbox_live_events_include_new_delivery_and_parse_update(runtime) -> None:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     _, cursor = runtime.live_state.snapshot_state()
     _, seq_text = cursor.rsplit(":", 1)
     last_seq = int(seq_text)

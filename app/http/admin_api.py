@@ -1,27 +1,41 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 
-from app.auth.permissions import PermissionContext
+from app.auth.api_keys import ApiKeyAuthorizationError
+from app.auth.permissions import (
+    PermissionContext,
+    PermissionDenied,
+    delegated_api_key_policy_is_within_principal,
+    mailbox_pattern_matches,
+    role_permission_context,
+)
+from app.db.connection import connect_database
 from app.http.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, build_pagination_context
 from app.http.sse import (
     LIVE_SSE_EVENT_TYPES,
-    count_smtp_sessions,
-    recent_smtp_sessions,
     smtp_live_snapshot,
+    smtp_sessions_page,
     stream_smtp_live_events,
 )
 from app.ingest.storage import utc_now
+from app.services.dashboard import get_dashboard_service
 from app.services.dns_check import DnsCheckService
 
 
 router = APIRouter()
+
+
+LEGACY_API_MAX_PAGE_SIZE = 200
+LEGACY_API_MAX_EVENT_PAGE_SIZE = 1000
+LEGACY_API_MAX_BULK_DELIVERY_IDS = 1000
 
 
 def _client_ip(request: Request) -> str | None:
@@ -41,16 +55,7 @@ async def _current_admin_session(request: Request) -> dict[str, Any] | None:
 
 
 def _session_permission_context(admin: dict[str, Any]) -> PermissionContext:
-    return PermissionContext(
-        scopes=("live.read",),
-        domain_ids=(),
-        mailbox_patterns=(),
-        api_key_id=None,
-        public_id=str(admin.get("session_id") or admin.get("username") or "admin-session"),
-        name=str(admin.get("display_name") or admin.get("username") or "admin-session"),
-        kind="admin",
-        legacy_credential=True,
-    )
+    return role_permission_context(admin)
 
 
 def _render_template(request: Request, template_name: str, context: dict[str, Any], *, status_code: int = 200) -> Response:
@@ -129,7 +134,10 @@ async def require_admin_key(
         )
 
     try:
-        context = request.app.state.runtime.api_keys.authenticate_plain_text(x_api_key)
+        context = await asyncio.to_thread(
+            request.app.state.runtime.api_keys.authenticate_plain_text,
+            x_api_key,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=401, detail="invalid admin api key") from exc
 
@@ -151,6 +159,292 @@ def require_admin_scope(admin: PermissionContext, required_scope: str) -> None:
             if write_scope in admin.scopes:
                 return
         raise HTTPException(status_code=403, detail=required_scope)
+
+
+def _allowed_domain_ids(admin: PermissionContext) -> tuple[int, ...] | None:
+    if admin.legacy_credential or admin.domain_grant_mode == "all":
+        return None
+    if admin.domain_grant_mode == "selected":
+        return tuple(int(item) for item in admin.domain_ids)
+    return ()
+
+
+def _require_global_grant(admin: PermissionContext) -> None:
+    if _allowed_domain_ids(admin) is not None:
+        raise HTTPException(status_code=403, detail="operation requires an all-domain grant")
+
+
+def _require_domain_grant(admin: PermissionContext, domain_id: int) -> None:
+    allowed = _allowed_domain_ids(admin)
+    if allowed is not None and int(domain_id) not in allowed:
+        raise HTTPException(status_code=403, detail="resource outside domain grant")
+
+
+async def _require_mailbox_grant(
+    request: Request,
+    admin: PermissionContext,
+    mailbox_id: int,
+) -> dict[str, Any]:
+    try:
+        mailbox = await asyncio.to_thread(
+            request.app.state.runtime.mailboxes.get_mailbox,
+            mailbox_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_domain_grant(admin, int(mailbox["domain_id"]))
+    if admin.mailbox_patterns and not any(
+        mailbox_pattern_matches(str(mailbox["address_canonical"]), pattern)
+        for pattern in admin.mailbox_patterns
+    ):
+        raise HTTPException(status_code=403, detail="resource outside mailbox grant")
+    return mailbox
+
+
+def _message_grant_rows(database_path, message_id: str) -> list[dict[str, Any]]:
+    with connect_database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT mb.domain_id, mb.address_canonical
+            FROM message_deliveries AS d
+            JOIN mailboxes AS mb ON mb.id = d.mailbox_id
+            WHERE d.message_id = ?
+            """,
+            (message_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+async def _require_message_grant(
+    request: Request,
+    admin: PermissionContext,
+    message_id: str,
+) -> None:
+    allowed = _allowed_domain_ids(admin)
+    if allowed is None and not admin.mailbox_patterns:
+        return
+    rows = await asyncio.to_thread(
+        _message_grant_rows,
+        request.app.state.settings.database_path,
+        message_id,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="message not found")
+    resource_domains = {int(row["domain_id"]) for row in rows}
+    if allowed is not None and not resource_domains.issubset(set(allowed)):
+        raise HTTPException(status_code=403, detail="resource outside domain grant")
+    if admin.mailbox_patterns and any(
+        not any(
+            mailbox_pattern_matches(str(row["address_canonical"]), pattern)
+            for pattern in admin.mailbox_patterns
+        )
+        for row in rows
+    ):
+        raise HTTPException(status_code=403, detail="resource outside mailbox grant")
+
+
+def _delivery_message_id(database_path, delivery_id: str) -> str | None:
+    with connect_database(database_path) as connection:
+        row = connection.execute(
+            "SELECT message_id FROM message_deliveries WHERE id = ?",
+            (delivery_id,),
+        ).fetchone()
+    return None if row is None else str(row["message_id"])
+
+
+async def _require_delivery_grant(
+    request: Request,
+    admin: PermissionContext,
+    delivery_id: str,
+) -> str:
+    message_id = await asyncio.to_thread(
+        _delivery_message_id,
+        request.app.state.settings.database_path,
+        delivery_id,
+    )
+    if message_id is None:
+        raise HTTPException(status_code=404, detail="delivery not found")
+    await _require_message_grant(request, admin, message_id)
+    return message_id
+
+
+def _require_key_management_grant(admin: PermissionContext, target: dict[str, Any]) -> None:
+    if admin.legacy_credential:
+        return
+    if not delegated_api_key_policy_is_within_principal(admin, target):
+        raise HTTPException(status_code=403, detail="target key exceeds caller operational policy")
+    effective_scopes = set(admin.scopes)
+    effective_scopes.update(
+        f"{scope[:-6]}.read" for scope in admin.scopes if scope.endswith(".write")
+    )
+    if not set(target.get("scopes") or ()).issubset(effective_scopes):
+        raise HTTPException(status_code=403, detail="target key exceeds caller scopes")
+    target_mode = str(target.get("domain_grant_mode") or "none")
+    if target_mode == "all" and admin.domain_grant_mode != "all":
+        raise HTTPException(status_code=403, detail="target key exceeds caller domain grant")
+    if target_mode == "selected":
+        allowed = _allowed_domain_ids(admin)
+        if allowed is not None and not set(target.get("domain_ids") or ()).issubset(set(allowed)):
+            raise HTTPException(status_code=403, detail="target key exceeds caller domain grant")
+
+    parent_patterns = set(admin.mailbox_patterns)
+    target_patterns = set(str(item) for item in target.get("mailbox_patterns") or ())
+    if parent_patterns:
+        if not target_patterns:
+            raise HTTPException(status_code=403, detail="target key exceeds caller mailbox grant")
+        for target_pattern in target_patterns:
+            if target_pattern in parent_patterns:
+                continue
+            # Glob containment is not generally decidable by comparing two
+            # patterns. As in API v2, only an exact child pattern or a literal
+            # address that demonstrably matches a parent glob is delegated.
+            if "*" in target_pattern or "?" in target_pattern:
+                raise HTTPException(status_code=403, detail="target key exceeds caller mailbox grant")
+            if not any(
+                mailbox_pattern_matches(target_pattern, parent_pattern)
+                for parent_pattern in parent_patterns
+            ):
+                raise HTTPException(status_code=403, detail="target key exceeds caller mailbox grant")
+
+
+def _key_is_within_grant(admin: PermissionContext, target: dict[str, Any]) -> bool:
+    try:
+        _require_key_management_grant(admin, target)
+    except HTTPException:
+        return False
+    return True
+
+
+def _key_mutation_principal(admin: PermissionContext) -> PermissionContext | None:
+    return None if admin.legacy_credential else admin
+
+
+def _list_mailboxes_page(service, **filters: Any) -> dict[str, Any]:
+    result = service.list_mailboxes(**filters)
+    count_filters = dict(filters)
+    count_filters.pop("limit", None)
+    count_filters.pop("offset", None)
+    result["total_count"] = service.count_mailboxes(**count_filters)
+    return result
+
+
+def _mailbox_detail(
+    service,
+    admin: PermissionContext,
+    mailbox_id: int,
+    *,
+    limit: int,
+    offset: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    mailbox = service.get_mailbox(mailbox_id)
+    _require_domain_grant(admin, int(mailbox["domain_id"]))
+    if admin.mailbox_patterns and not any(
+        mailbox_pattern_matches(str(mailbox["address_canonical"]), pattern)
+        for pattern in admin.mailbox_patterns
+    ):
+        raise HTTPException(status_code=403, detail="resource outside mailbox grant")
+    deliveries = service.list_mailbox_deliveries(mailbox_id, limit=limit, offset=offset)
+    return mailbox, deliveries
+
+
+def _domains_page(
+    database_path,
+    *,
+    allowed_domain_ids: tuple[int, ...] | None,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if allowed_domain_ids is not None:
+        if not allowed_domain_ids:
+            clauses.append("0 = 1")
+        else:
+            placeholders = ", ".join("?" for _ in allowed_domain_ids)
+            clauses.append(f"id IN ({placeholders})")
+            params.extend(allowed_domain_ids)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect_database(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                id,
+                root_domain_ascii,
+                accept_exact,
+                accept_subdomains,
+                public_web_enabled,
+                public_api_enabled,
+                is_active,
+                created_at,
+                updated_at
+            FROM domains
+            {where_sql}
+            ORDER BY root_domain_ascii ASC, id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+        total = connection.execute(
+            f"SELECT COUNT(*) AS count FROM domains {where_sql}",
+            tuple(params),
+        ).fetchone()
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["is_catch_all"] = item.get("root_domain_ascii") == "*"
+        for field in (
+            "accept_exact",
+            "accept_subdomains",
+            "public_web_enabled",
+            "public_api_enabled",
+            "is_active",
+        ):
+            item[field] = bool(item[field])
+        items.append(item)
+    return {
+        "items": items,
+        "total_count": 0 if total is None else int(total["count"]),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+def _smtp_session_detail(
+    database_path,
+    session_id: str,
+    *,
+    event_limit: int,
+    event_offset: int,
+) -> dict[str, Any] | None:
+    with connect_database(database_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM smtp_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        events = connection.execute(
+            """
+            SELECT id, seq, event_type, ts, payload_json
+            FROM smtp_events
+            WHERE session_id = ?
+            ORDER BY seq ASC
+            LIMIT ? OFFSET ?
+            """,
+            (session_id, event_limit, event_offset),
+        ).fetchall()
+        event_total = connection.execute(
+            "SELECT COUNT(*) AS count FROM smtp_events WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    result = dict(row)
+    result["tls_used"] = bool(result["tls_used"])
+    result["events"] = [dict(event) for event in events]
+    result["events_total_count"] = 0 if event_total is None else int(event_total["count"])
+    result["events_limit"] = event_limit
+    result["events_offset"] = event_offset
+    return result
 
 
 async def _record_admin_key_usage(request: Request, admin: PermissionContext) -> None:
@@ -195,6 +489,7 @@ async def require_admin_live_access(
     if x_api_key is not None:
         admin = await require_admin_key(request, x_api_key)
         require_admin_scope(admin, "live.read")
+        _require_global_grant(admin)
         await _record_admin_key_usage(request, admin)
         return admin
 
@@ -220,9 +515,21 @@ async def live_page(
 
     runtime = request.app.state.runtime
     live_events, live_cursor = runtime.live_state.snapshot_state()
-    initial_events = live_events[-DEFAULT_PAGE_SIZE:] if live_events else smtp_live_snapshot(runtime, history_limit=DEFAULT_PAGE_SIZE)
-    sessions = recent_smtp_sessions(runtime, limit=limit, offset=offset)
-    return _render_template(
+    initial_events = live_events[-DEFAULT_PAGE_SIZE:]
+    if not initial_events:
+        initial_events = await asyncio.to_thread(
+            smtp_live_snapshot,
+            runtime,
+            history_limit=DEFAULT_PAGE_SIZE,
+        )
+    sessions, total_count = await asyncio.to_thread(
+        smtp_sessions_page,
+        runtime,
+        limit=limit,
+        offset=offset,
+    )
+    return await asyncio.to_thread(
+        _render_template,
         request,
         "admin/live.html",
         {
@@ -237,11 +544,22 @@ async def live_page(
                 path="/admin/live",
                 limit=limit,
                 offset=offset,
-                total_count=count_smtp_sessions(runtime),
+                total_count=total_count,
                 item_count=len(sessions),
             ),
         },
     )
+
+
+@router.get("/api/v1/admin/dashboard/metrics")
+async def dashboard_metrics(
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "system.read")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    return await get_dashboard_service(request.app).snapshot()
 
 
 @router.get("/api/v1/admin/live/smtp/stream")
@@ -269,11 +587,12 @@ async def run_domain_dns_check(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "domains.write")
+    _require_domain_grant(admin, domain_id)
     await _record_admin_key_usage(request, admin)
     runtime = request.app.state.runtime
 
     try:
-        domain = runtime.domains.get_domain(domain_id)
+        domain = await asyncio.to_thread(runtime.domains.get_domain, domain_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -287,27 +606,20 @@ async def run_domain_dns_check(
         **check_result,
     }
 
-    def operation(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            UPDATE domains
-            SET dns_status = ?,
-                dns_last_checked_at = ?,
-                dns_details_json = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                check_result["status"],
-                checked_at,
-                json.dumps(stored_result, ensure_ascii=False),
-                checked_at,
-                domain_id,
-            ),
+    try:
+        updated_domain = await runtime.domains.record_dns_check(
+            domain_id,
+            expected_root_domain_ascii=str(domain["root_domain_ascii"]),
+            checked_at=checked_at,
+            details=stored_result,
+            authorization_principal=admin,
         )
-
-    await runtime.writer.execute(operation)
-    updated_domain = runtime.domains.get_domain(domain_id)
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="domain authorization changed") from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     updated_domain["dns_check"] = stored_result
     await _write_audit_best_effort(request, admin, "domains.dns_check", "domain", str(domain_id), "success")
     return updated_domain
@@ -317,11 +629,19 @@ async def run_domain_dns_check(
 async def list_domains(
     request: Request,
     admin: PermissionContext = Depends(require_admin_key),
+    limit: int = Query(default=100, ge=1, le=LEGACY_API_MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> dict:
     require_admin_scope(admin, "domains.read")
     await _record_admin_key_usage(request, admin)
-    runtime = request.app.state.runtime
-    return {"items": runtime.list_domains()}
+    allowed = _allowed_domain_ids(admin)
+    return await asyncio.to_thread(
+        _domains_page,
+        request.app.state.settings.database_path,
+        allowed_domain_ids=allowed,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("/api/v1/admin/domains", status_code=status.HTTP_201_CREATED)
@@ -331,6 +651,8 @@ async def create_domain(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict:
     require_admin_scope(admin, "domains.write")
+    if _allowed_domain_ids(admin) is not None:
+        raise HTTPException(status_code=403, detail="creating domains requires an all-domain grant")
     await _record_admin_key_usage(request, admin)
     runtime = request.app.state.runtime
     root_domain = payload.get("root_domain")
@@ -343,13 +665,17 @@ async def create_domain(
             root_domain,
             accept_exact=payload.get("accept_exact", True),
             accept_subdomains=payload.get("accept_subdomains", True),
-            public_web_enabled=payload.get("public_web_enabled", True),
-            public_api_enabled=payload.get("public_api_enabled", True),
+            public_web_enabled=payload.get("public_web_enabled", False),
+            public_api_enabled=payload.get("public_api_enabled", False),
             plus_addressing_mode=payload.get("plus_addressing_mode", "keep"),
             local_part_case_sensitive=payload.get("local_part_case_sensitive", False),
             is_active=payload.get("is_active", True),
             max_message_size_bytes=payload.get("max_message_size_bytes", settings["max_message_size_bytes"]),
+            retention_days=payload.get("retention_days"),
+            authorization_principal=admin,
         )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="domain authorization changed") from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     await _write_audit_best_effort(request, admin, "domains.create", "domain", str(created["id"]), "success")
@@ -363,9 +689,10 @@ async def get_domain(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "domains.read")
+    _require_domain_grant(admin, domain_id)
     await _record_admin_key_usage(request, admin)
     try:
-        return request.app.state.runtime.domains.get_domain(domain_id)
+        return await asyncio.to_thread(request.app.state.runtime.domains.get_domain, domain_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -378,9 +705,18 @@ async def update_domain(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "domains.write")
+    _require_domain_grant(admin, domain_id)
+    if "root_domain" in payload:
+        _require_global_grant(admin)
     await _record_admin_key_usage(request, admin)
     try:
-        updated = await request.app.state.runtime.domains.update_domain(domain_id, payload)
+        updated = await request.app.state.runtime.domains.update_domain(
+            domain_id,
+            payload,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="domain authorization changed") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
@@ -396,11 +732,19 @@ async def delete_domain(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "domains.write")
+    _require_domain_grant(admin, domain_id)
     await _record_admin_key_usage(request, admin)
     try:
-        deleted = await request.app.state.runtime.domains.delete_domain(domain_id)
+        deleted = await request.app.state.runtime.domains.delete_domain(
+            domain_id,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="domain authorization changed") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="domain has dependent mailboxes or grants") from exc
     await _write_audit_best_effort(request, admin, "domains.delete", "domain", str(domain_id), "success")
@@ -420,20 +764,21 @@ async def list_mailboxes(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "mailboxes.read")
     await _record_admin_key_usage(request, admin)
+    allowed_domains = _allowed_domain_ids(admin)
+    if domain_id is not None:
+        _require_domain_grant(admin, domain_id)
     service = request.app.state.runtime.mailboxes
-    result = service.list_mailboxes(
+    result = await asyncio.to_thread(
+        _list_mailboxes_page,
+        service,
         limit=limit,
         offset=offset,
         query=q,
         domain_id=domain_id,
         public_enabled=public_enabled,
         is_hidden=is_hidden,
-    )
-    result["total_count"] = service.count_mailboxes(
-        query=q,
-        domain_id=domain_id,
-        public_enabled=public_enabled,
-        is_hidden=is_hidden,
+        allowed_domain_ids=allowed_domains,
+        allowed_mailbox_patterns=tuple(admin.mailbox_patterns),
     )
     return result
 
@@ -449,8 +794,10 @@ async def get_mailbox(
     require_admin_scope(admin, "mailboxes.read")
     await _record_admin_key_usage(request, admin)
     try:
-        mailbox = request.app.state.runtime.mailboxes.get_mailbox(mailbox_id)
-        deliveries = request.app.state.runtime.mailboxes.list_mailbox_deliveries(
+        mailbox, deliveries = await asyncio.to_thread(
+            _mailbox_detail,
+            request.app.state.runtime.mailboxes,
+            admin,
             mailbox_id,
             limit=limit,
             offset=offset,
@@ -469,6 +816,7 @@ async def update_mailbox(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "mailboxes.write")
     await _record_admin_key_usage(request, admin)
+    await _require_mailbox_grant(request, admin, mailbox_id)
 
     updates: dict[str, Any] = {}
     if "public_enabled" in payload:
@@ -479,7 +827,13 @@ async def update_mailbox(
         raise HTTPException(status_code=422, detail="public_enabled or is_hidden is required")
 
     try:
-        updated = await request.app.state.runtime.mailboxes.update_mailbox(mailbox_id, updates)
+        updated = await request.app.state.runtime.mailboxes.update_mailbox(
+            mailbox_id,
+            updates,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="mailbox authorization changed") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -497,8 +851,14 @@ async def delete_mailbox_deliveries(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "mailboxes.write")
     await _record_admin_key_usage(request, admin)
+    await _require_mailbox_grant(request, admin, mailbox_id)
     try:
-        result = await request.app.state.runtime.mailboxes.soft_delete_mailbox_deliveries(mailbox_id)
+        result = await request.app.state.runtime.mailboxes.soft_delete_mailbox_deliveries(
+            mailbox_id,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="mailbox authorization changed") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     await _write_audit_best_effort(
@@ -524,13 +884,19 @@ async def list_messages(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "messages.read")
     await _record_admin_key_usage(request, admin)
+    allowed_domains = _allowed_domain_ids(admin)
+    if mailbox_id is not None:
+        await _require_mailbox_grant(request, admin, mailbox_id)
     try:
-        return request.app.state.runtime.messages.list_messages(
+        return await asyncio.to_thread(
+            request.app.state.runtime.messages.list_messages,
             limit=limit,
             offset=offset,
             query=q,
             parse_status=parse_status,
             mailbox_id=mailbox_id,
+            allowed_domain_ids=allowed_domains,
+            allowed_mailbox_patterns=tuple(admin.mailbox_patterns),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -543,9 +909,25 @@ async def bulk_delete_deliveries(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "messages.write")
-    await _record_admin_key_usage(request, admin)
     delivery_ids = _coerce_text_list(payload.get("delivery_ids"))
-    result = await request.app.state.runtime.messages.soft_delete_deliveries(delivery_ids)
+    if len(delivery_ids) > LEGACY_API_MAX_BULK_DELIVERY_IDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "delivery_ids exceeds the maximum of "
+                f"{LEGACY_API_MAX_BULK_DELIVERY_IDS} items"
+            ),
+        )
+    await _record_admin_key_usage(request, admin)
+    for delivery_id in delivery_ids:
+        await _require_delivery_grant(request, admin, delivery_id)
+    try:
+        result = await request.app.state.runtime.messages.soft_delete_deliveries(
+            delivery_ids,
+            authorization_principal=admin,
+        )
+    except (ApiKeyAuthorizationError, PermissionDenied) as exc:
+        raise HTTPException(status_code=403, detail="message authorization changed") from exc
     await _write_audit_best_effort(
         request,
         admin,
@@ -565,8 +947,14 @@ async def reparse_message(
 ) -> dict:
     require_admin_scope(admin, "messages.write")
     await _record_admin_key_usage(request, admin)
+    await _require_message_grant(request, admin, message_id)
     try:
-        await request.app.state.runtime.messages.reparse_message(message_id)
+        await request.app.state.runtime.messages.reparse_message(
+            message_id,
+            authorization_principal=admin,
+        )
+    except (ApiKeyAuthorizationError, PermissionDenied) as exc:
+        raise HTTPException(status_code=403, detail="message authorization changed") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     await _write_audit_best_effort(request, admin, "messages.reparse", "message", message_id, "success")
@@ -581,8 +969,12 @@ async def get_message(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "messages.read")
     await _record_admin_key_usage(request, admin)
+    await _require_message_grant(request, admin, message_id)
     try:
-        return request.app.state.runtime.messages.get_admin_message_detail(message_id)
+        return await asyncio.to_thread(
+            request.app.state.runtime.messages.get_admin_message_detail,
+            message_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -595,11 +987,15 @@ async def download_message_raw(
 ) -> Response:
     require_admin_scope(admin, "messages.read")
     await _record_admin_key_usage(request, admin)
+    await _require_message_grant(request, admin, message_id)
     try:
-        raw = request.app.state.runtime.messages.get_admin_raw_message(message_id)
+        raw = await asyncio.to_thread(
+            request.app.state.runtime.messages.get_admin_raw_file,
+            message_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return Response(raw, media_type="message/rfc822")
+    return FileResponse(raw["path"], media_type="message/rfc822", filename=f"{message_id}.eml")
 
 
 @router.get("/api/v1/admin/messages/{message_id}/attachments/{attachment_id}")
@@ -611,14 +1007,20 @@ async def download_message_attachment(
 ) -> Response:
     require_admin_scope(admin, "messages.read")
     await _record_admin_key_usage(request, admin)
+    await _require_message_grant(request, admin, message_id)
     try:
-        attachment = request.app.state.runtime.messages.get_admin_attachment(message_id, attachment_id)
+        attachment = await asyncio.to_thread(
+            request.app.state.runtime.messages.get_admin_attachment_file,
+            message_id,
+            attachment_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     safe_filename = attachment.get("safe_filename") or "attachment.bin"
-    return Response(
-        attachment["content"],
+    return FileResponse(
+        attachment["path"],
         media_type=attachment.get("content_type") or "application/octet-stream",
+        filename=safe_filename,
         headers={
             "Content-Disposition": f'attachment; filename="{safe_filename}"',
             "X-Content-Type-Options": "nosniff",
@@ -634,12 +1036,16 @@ async def delete_message_deliveries(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "messages.write")
     await _record_admin_key_usage(request, admin)
+    await _require_message_grant(request, admin, message_id)
     try:
-        detail = request.app.state.runtime.messages.get_admin_message_detail(message_id)
+        result = await request.app.state.runtime.messages.soft_delete_message(
+            message_id,
+            authorization_principal=admin,
+        )
+    except (ApiKeyAuthorizationError, PermissionDenied) as exc:
+        raise HTTPException(status_code=403, detail="message authorization changed") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    delivery_ids = [str(item["delivery_id"]) for item in detail["deliveries"]]
-    result = await request.app.state.runtime.messages.soft_delete_deliveries(delivery_ids)
     await _write_audit_best_effort(request, admin, "deliveries.bulk_delete", "message", message_id, "success")
     return result
 
@@ -653,13 +1059,27 @@ async def delete_message_delivery(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "messages.write")
     await _record_admin_key_usage(request, admin)
+    await _require_message_grant(request, admin, message_id)
+    await _require_delivery_grant(request, admin, delivery_id)
     try:
-        detail = request.app.state.runtime.messages.get_admin_message_detail(message_id)
+        delivery_exists = await asyncio.to_thread(
+            request.app.state.runtime.messages.message_has_delivery,
+            message_id,
+            delivery_id,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if delivery_id not in {str(item["delivery_id"]) for item in detail["deliveries"]}:
+    if not delivery_exists:
         raise HTTPException(status_code=404, detail="delivery not found")
-    result = await request.app.state.runtime.messages.soft_delete_delivery(delivery_id)
+    try:
+        result = await request.app.state.runtime.messages.soft_delete_delivery(
+            delivery_id,
+            authorization_principal=admin,
+        )
+    except (ApiKeyAuthorizationError, PermissionDenied) as exc:
+        raise HTTPException(status_code=403, detail="message authorization changed") from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     await _write_audit_best_effort(request, admin, "deliveries.delete", "delivery", delivery_id, "success")
     return result
 
@@ -672,12 +1092,16 @@ async def list_smtp_sessions(
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "smtp.read")
+    _require_global_grant(admin)
     await _record_admin_key_usage(request, admin)
     runtime = request.app.state.runtime
-    return {
-        "items": recent_smtp_sessions(runtime, limit=limit, offset=offset),
-        "total_count": count_smtp_sessions(runtime),
-    }
+    items, total_count = await asyncio.to_thread(
+        smtp_sessions_page,
+        runtime,
+        limit=limit,
+        offset=offset,
+    )
+    return {"items": items, "total_count": total_count}
 
 
 @router.get("/api/v1/admin/smtp-sessions/{session_id}")
@@ -685,32 +1109,23 @@ async def get_smtp_session(
     session_id: str,
     request: Request,
     admin: PermissionContext = Depends(require_admin_key),
+    event_limit: int = Query(default=100, ge=1, le=LEGACY_API_MAX_EVENT_PAGE_SIZE),
+    event_offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> dict[str, Any]:
     require_admin_scope(admin, "smtp.read")
+    _require_global_grant(admin)
     await _record_admin_key_usage(request, admin)
     runtime = request.app.state.runtime
-    with sqlite3.connect(runtime.settings.database_path, check_same_thread=False) as connection:
-        connection.row_factory = sqlite3.Row
-        row = connection.execute(
-            "SELECT * FROM smtp_sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="smtp session not found")
-        events = connection.execute(
-            """
-            SELECT id, seq, event_type, ts, payload_json
-            FROM smtp_events
-            WHERE session_id = ?
-            ORDER BY seq ASC
-            """,
-            (session_id,),
-        ).fetchall()
-    return {
-        **dict(row),
-        "tls_used": bool(row["tls_used"]),
-        "events": [dict(event) for event in events],
-    }
+    result = await asyncio.to_thread(
+        _smtp_session_detail,
+        runtime.settings.database_path,
+        session_id,
+        event_limit=event_limit,
+        event_offset=event_offset,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="smtp session not found")
+    return result
 
 
 @router.get("/api/v1/admin/audit-logs")
@@ -726,8 +1141,10 @@ async def list_audit_logs(
     end_time: str | None = Query(default=None),
 ) -> dict:
     require_admin_scope(admin, "audit.read")
+    _require_global_grant(admin)
     await _record_admin_key_usage(request, admin)
-    return request.app.state.runtime.audit.list_logs(
+    return await asyncio.to_thread(
+        request.app.state.runtime.audit.list_logs,
         limit=limit,
         offset=offset,
         actor=actor,
@@ -744,6 +1161,7 @@ async def get_settings(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict:
     require_admin_scope(admin, "system.read")
+    _require_global_grant(admin)
     await _record_admin_key_usage(request, admin)
     return request.app.state.runtime.system_settings.get_settings()
 
@@ -755,9 +1173,15 @@ async def update_settings(
     admin: PermissionContext = Depends(require_admin_key),
 ) -> dict:
     require_admin_scope(admin, "system.write")
+    _require_global_grant(admin)
     await _record_admin_key_usage(request, admin)
     try:
-        updated = await request.app.state.runtime.system_settings.update_settings(payload)
+        updated = await request.app.state.runtime.system_settings.update_settings(
+            payload,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="settings authorization changed") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     await _write_audit_best_effort(request, admin, "settings.update", "system_settings", None, "success")
@@ -773,7 +1197,182 @@ async def list_api_keys(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "api_keys.read")
     await _record_admin_key_usage(request, admin)
-    return request.app.state.runtime.api_keys.list_keys(limit=limit, offset=offset)
+    result = await asyncio.to_thread(
+        request.app.state.runtime.api_keys.list_keys,
+        limit=limit,
+        offset=offset,
+    )
+    if not admin.legacy_credential:
+        result["items"] = [
+            item for item in result["items"]
+            if _key_is_within_grant(admin, item)
+        ]
+        result["total_count"] = len(result["items"])
+    return result
+
+
+@router.get("/api/v1/admin/admins")
+async def list_admins(
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.read")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    return await asyncio.to_thread(
+        request.app.state.runtime.auth.list_admins,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/api/v1/admin/admins", status_code=status.HTTP_201_CREATED)
+async def create_admin_account(
+    payload: dict[str, Any],
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.write")
+    require_admin_scope(admin, "admins.credentials.write")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    try:
+        created = await request.app.state.runtime.auth.create_admin(
+            username=str(payload.get("username") or ""),
+            password=str(payload.get("password") or ""),
+            role=str(payload.get("role") or "viewer"),
+            display_name=_nullable_text(payload.get("display_name")),
+            is_active=_coerce_bool(payload.get("is_active", True)),
+            must_change_password=_coerce_bool(payload.get("must_change_password", True)),
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await _write_audit_best_effort(request, admin, "admins.create", "admin", str(created["id"]), "success")
+    return created
+
+
+@router.get("/api/v1/admin/admins/{admin_id}")
+async def get_admin_account(
+    admin_id: int,
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.read")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    try:
+        return await asyncio.to_thread(request.app.state.runtime.auth.get_admin, admin_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.patch("/api/v1/admin/admins/{admin_id}")
+async def update_admin_account(
+    admin_id: int,
+    payload: dict[str, Any],
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.write")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    updates = {
+        key: payload[key]
+        for key in ("username", "display_name", "role", "is_active", "must_change_password")
+        if key in payload
+    }
+    try:
+        updated = await request.app.state.runtime.auth.update_admin(
+            admin_id,
+            **updates,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _write_audit_best_effort(request, admin, "admins.update", "admin", str(admin_id), "success")
+    return updated
+
+
+@router.post("/api/v1/admin/admins/{admin_id}/reset-password")
+async def reset_admin_account_password(
+    admin_id: int,
+    payload: dict[str, Any],
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.credentials.write")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    try:
+        updated = await request.app.state.runtime.auth.reset_admin_password(
+            admin_id,
+            str(payload.get("password") or ""),
+            must_change_password=_coerce_bool(payload.get("must_change_password", True)),
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await _write_audit_best_effort(request, admin, "admins.password_reset", "admin", str(admin_id), "success")
+    return updated
+
+
+@router.post("/api/v1/admin/admins/{admin_id}/revoke-sessions")
+async def revoke_admin_account_sessions(
+    admin_id: int,
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.sessions.write")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    try:
+        revoked = await request.app.state.runtime.auth.revoke_admin_sessions(
+            admin_id,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await _write_audit_best_effort(request, admin, "admins.sessions_revoke", "admin", str(admin_id), "success")
+    return {"admin_id": admin_id, "revoked_sessions": revoked}
+
+
+@router.delete("/api/v1/admin/admins/{admin_id}")
+async def delete_admin_account(
+    admin_id: int,
+    request: Request,
+    admin: PermissionContext = Depends(require_admin_key),
+) -> dict[str, Any]:
+    require_admin_scope(admin, "admins.write")
+    _require_global_grant(admin)
+    await _record_admin_key_usage(request, admin)
+    try:
+        deleted = await request.app.state.runtime.auth.delete_admin(
+            admin_id,
+            authorization_principal=admin,
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _write_audit_best_effort(request, admin, "admins.delete", "admin", str(admin_id), "success")
+    return {"deleted": True, "admin": deleted}
 
 
 @router.post("/api/v1/admin/api-keys", status_code=status.HTTP_201_CREATED)
@@ -790,7 +1389,19 @@ async def create_api_key(
     scopes = _coerce_text_list(payload.get("scopes"))
     grant_all_domains = _coerce_bool(payload.get("grant_all_domains")) if "grant_all_domains" in payload else False
     domain_ids = [] if grant_all_domains else _coerce_int_list(payload.get("domain_ids"))
+    domain_grant_mode = str(payload.get("domain_grant_mode") or ("all" if grant_all_domains else ("selected" if domain_ids else "none")))
     mailbox_patterns = _coerce_text_list(payload.get("mailbox_patterns"))
+    try:
+        rate_limit_per_min = _coerce_non_negative_int(
+            payload.get("rate_limit_per_min", 3600),
+            "rate_limit_per_min",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    allowed_ip_cidrs = _coerce_text_list(payload.get("allowed_ip_cidrs"))
+    expires_at = _nullable_text(payload.get("expires_at"))
+    allow_header = _coerce_bool(payload.get("allow_header", True))
+    allow_query = _coerce_bool(payload.get("allow_query", False))
 
     if not name:
         raise HTTPException(status_code=422, detail="name is required")
@@ -798,6 +1409,20 @@ async def create_api_key(
         raise HTTPException(status_code=422, detail="kind is required")
     if not scopes:
         raise HTTPException(status_code=422, detail="scopes are required")
+    _require_key_management_grant(
+        admin,
+        {
+            "scopes": scopes,
+            "domain_grant_mode": domain_grant_mode,
+            "domain_ids": domain_ids,
+            "mailbox_patterns": mailbox_patterns,
+            "rate_limit_per_min": rate_limit_per_min,
+            "allowed_ip_cidrs": allowed_ip_cidrs,
+            "expires_at": expires_at,
+            "allow_header": allow_header,
+            "allow_query": allow_query,
+        },
+    )
 
     try:
         created = await request.app.state.runtime.api_keys.create_key(
@@ -805,8 +1430,17 @@ async def create_api_key(
             kind=kind,
             scopes=scopes,
             domain_ids=domain_ids,
+            domain_grant_mode=domain_grant_mode,
             mailbox_patterns=mailbox_patterns,
+            rate_limit_per_min=rate_limit_per_min,
+            allowed_ip_cidrs=allowed_ip_cidrs,
+            expires_at=expires_at,
+            allow_header=allow_header,
+            allow_query=allow_query,
+            authorization_principal=_key_mutation_principal(admin),
         )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="api key authorization changed") from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -823,7 +1457,9 @@ async def get_api_key(
     require_admin_scope(admin, "api_keys.read")
     await _record_admin_key_usage(request, admin)
     try:
-        return request.app.state.runtime.api_keys.get_key(api_key_id)
+        target = await asyncio.to_thread(request.app.state.runtime.api_keys.get_key, api_key_id)
+        _require_key_management_grant(admin, target)
+        return target
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -837,6 +1473,11 @@ async def update_api_key(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "api_keys.write")
     await _record_admin_key_usage(request, admin)
+    try:
+        existing_key = await asyncio.to_thread(request.app.state.runtime.api_keys.get_key, api_key_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_key_management_grant(admin, existing_key)
 
     updates: dict[str, Any] = {}
     if "name" in payload:
@@ -868,16 +1509,28 @@ async def update_api_key(
     grant_all_domains = _coerce_bool(payload.get("grant_all_domains")) if "grant_all_domains" in payload else False
     if grant_all_domains:
         updates["domain_ids"] = []
+        updates["domain_grant_mode"] = "all"
     elif "domain_ids" in payload:
         try:
             updates["domain_ids"] = _coerce_int_list(payload.get("domain_ids"))
+            updates["domain_grant_mode"] = str(payload.get("domain_grant_mode") or ("selected" if updates["domain_ids"] else "none"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid domain_ids") from exc
     if "mailbox_patterns" in payload:
         updates["mailbox_patterns"] = _coerce_text_list(payload.get("mailbox_patterns"))
 
+    proposed_key = dict(existing_key)
+    proposed_key.update(updates)
+    _require_key_management_grant(admin, proposed_key)
+
     try:
-        updated = await request.app.state.runtime.api_keys.update_key(api_key_id, **updates)
+        updated = await request.app.state.runtime.api_keys.update_key(
+            api_key_id,
+            **updates,
+            authorization_principal=_key_mutation_principal(admin),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=404, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (ValueError, sqlite3.IntegrityError) as exc:
@@ -895,11 +1548,23 @@ async def rotate_api_key(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "api_keys.write")
     await _record_admin_key_usage(request, admin)
-
     try:
-        rotated = await request.app.state.runtime.api_keys.rotate_key(api_key_id)
+        target = await asyncio.to_thread(request.app.state.runtime.api_keys.get_key, api_key_id)
+        _require_key_management_grant(admin, target)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        rotated = await request.app.state.runtime.api_keys.rotate_key(
+            api_key_id,
+            authorization_principal=_key_mutation_principal(admin),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=404, detail="api key not found") from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="api key rotation conflict") from exc
 
@@ -915,9 +1580,19 @@ async def revoke_api_key(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "api_keys.write")
     await _record_admin_key_usage(request, admin)
+    try:
+        target = await asyncio.to_thread(request.app.state.runtime.api_keys.get_key, api_key_id)
+        _require_key_management_grant(admin, target)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     try:
-        revoked = await request.app.state.runtime.api_keys.revoke_key(api_key_id)
+        revoked = await request.app.state.runtime.api_keys.revoke_key(
+            api_key_id,
+            authorization_principal=_key_mutation_principal(admin),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=404, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -933,9 +1608,19 @@ async def delete_api_key(
 ) -> dict[str, Any]:
     require_admin_scope(admin, "api_keys.write")
     await _record_admin_key_usage(request, admin)
+    try:
+        target = await asyncio.to_thread(request.app.state.runtime.api_keys.get_key, api_key_id)
+        _require_key_management_grant(admin, target)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     try:
-        deleted = await request.app.state.runtime.api_keys.delete_key(api_key_id)
+        deleted = await request.app.state.runtime.api_keys.delete_key(
+            api_key_id,
+            authorization_principal=_key_mutation_principal(admin),
+        )
+    except ApiKeyAuthorizationError as exc:
+        raise HTTPException(status_code=404, detail="api key not found") from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

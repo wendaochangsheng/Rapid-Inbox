@@ -48,8 +48,11 @@ std::int64_t column_int64_or_default(sqlite3_stmt* statement,
 DomainCache::DomainCache(std::filesystem::path database_path, int busy_timeout_ms)
     : database_path_(std::move(database_path)),
       busy_timeout_ms_(busy_timeout_ms),
-      matcher_(std::vector<DomainRule>{}),
-      domain_policies_() {}
+      rules_(std::make_shared<const DomainRulesSnapshot>(DomainRulesSnapshot{
+          .matcher = DomainMatcher(std::vector<DomainRule>{}),
+          .policies = {},
+          .generation = 0,
+      })) {}
 
 void DomainCache::reload() {
     SqliteDb db(database_path_, busy_timeout_ms_);
@@ -70,6 +73,7 @@ SELECT id,
        dns_status
 FROM domains
 WHERE is_active = 1
+ORDER BY id ASC
 )SQL");
 
     std::vector<DomainRule> rules;
@@ -128,28 +132,48 @@ WHERE is_active = 1
 
     DomainMatcher next_matcher(std::move(rules));
     const std::lock_guard lock(mutex_);
-    matcher_ = std::move(next_matcher);
-    domain_policies_ = std::move(domain_policies);
+    const std::uint64_t next_generation = generation_.load(std::memory_order_relaxed) + 1;
+    auto next_rules = std::make_shared<const DomainRulesSnapshot>(DomainRulesSnapshot{
+        .matcher = std::move(next_matcher),
+        .policies = std::move(domain_policies),
+        .generation = next_generation,
+    });
+    // Publish the immutable snapshot before its generation. An acquire load of
+    // the new generation therefore guarantees the matching snapshot is visible.
+    rules_.store(std::move(next_rules), std::memory_order_release);
+    generation_.store(next_generation, std::memory_order_release);
 }
 
 std::optional<DomainMatch> DomainCache::match_address(const std::string& address) const {
-    const std::lock_guard lock(mutex_);
-    return matcher_.match_address(address);
+    return rules_.load(std::memory_order_acquire)->matcher.match_address(address);
 }
 
-DomainRulesSnapshot DomainCache::snapshot_rules() const {
-    const std::lock_guard lock(mutex_);
-    return DomainRulesSnapshot{matcher_, domain_policies_};
+std::shared_ptr<const DomainRulesSnapshot> DomainCache::snapshot_rules() const noexcept {
+    return rules_.load(std::memory_order_acquire);
+}
+
+std::shared_ptr<const DomainRulesSnapshot> DomainCache::snapshot_rules_if_changed(
+    std::uint64_t known_generation) const noexcept {
+    if (generation_.load(std::memory_order_acquire) == known_generation) {
+        return nullptr;
+    }
+    auto snapshot = rules_.load(std::memory_order_acquire);
+    if (snapshot->generation == known_generation) {
+        return nullptr;
+    }
+    return snapshot;
+}
+
+std::uint64_t DomainCache::generation() const noexcept {
+    return generation_.load(std::memory_order_acquire);
 }
 
 DomainMatcher DomainCache::snapshot_matcher() const {
-    const std::lock_guard lock(mutex_);
-    return matcher_;
+    return rules_.load(std::memory_order_acquire)->matcher;
 }
 
 std::unordered_map<int, DomainPolicySnapshot> DomainCache::snapshot_policies() const {
-    const std::lock_guard lock(mutex_);
-    return domain_policies_;
+    return rules_.load(std::memory_order_acquire)->policies;
 }
 
 }  // namespace rapid_inbox::ingestd

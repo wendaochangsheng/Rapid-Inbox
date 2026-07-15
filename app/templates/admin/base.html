@@ -1464,6 +1464,11 @@
 
           <p class="nav-section-label">系统</p>
           <nav class="nav">
+            {% if admin.role == 'superadmin' %}
+            <a class="nav__link{% if request.url.path.startswith('/admin/admins') %} is-active{% endif %}" href="/admin/admins">
+              <i data-lucide="users"></i>管理员与权限
+            </a>
+            {% endif %}
             <a class="nav__link{% if request.url.path.startswith('/admin/api-keys') %} is-active{% endif %}" href="/admin/api-keys">
               <i data-lucide="key-round"></i>API 密钥
             </a>

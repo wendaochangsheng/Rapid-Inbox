@@ -33,6 +33,7 @@ struct RecipientDelivery {
 
 struct MailJob {
     std::string smtp_session_id;
+    std::string remote_ip = "unknown";
     std::string message_id;
     std::string envelope_from;
     std::string received_at;
@@ -41,6 +42,7 @@ struct MailJob {
     std::string raw_sha256;
     std::string raw_content;
     std::vector<RecipientDelivery> recipients;
+    bool artifacts_persisted = false;
 };
 
 }

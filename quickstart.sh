@@ -7,6 +7,7 @@ VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/.rapid-inbox-run}"
 HTTP_HOST="${HTTP_HOST:-${HOST:-}}"
 HTTP_PORT="${HTTP_PORT:-${PORT:-}}"
+HTTP_CONCURRENCY_LIMIT="${HTTP_CONCURRENCY_LIMIT:-}"
 SMTP_HOST="${SMTP_HOST:-}"
 SMTP_PORT="${SMTP_PORT:-}"
 INSTALL_EXTRAS="${INSTALL_EXTRAS:-1}"
@@ -17,6 +18,7 @@ INGESTD_VERSION="${INGESTD_VERSION:-latest}"
 INGESTD_BINARY_URL="${INGESTD_BINARY_URL:-}"
 INGESTD_BIN_DIR="${INGESTD_BIN_DIR:-$RUN_DIR/bin}"
 INGESTD_BIN="$INGESTD_BIN_DIR/rapid-inbox-ingestd"
+GENERATED_BOOTSTRAP_PASSWORD=""
 
 usage() {
     cat <<'EOF'
@@ -25,7 +27,7 @@ Usage: bash quickstart.sh [--python-smtp] [--build-local] [--binary-url URL] [--
 Starts Rapid Inbox with a one-command newbie flow.
 
 Default mode:
-  - Python HTTP bound to 0.0.0.0:8000
+  - Python HTTP bound to 127.0.0.1:8000
   - C++ rapid-inbox-ingestd bound to 0.0.0.0:25
   - Downloads a prebuilt ingestd binary from GitHub Releases when available
 
@@ -35,7 +37,10 @@ Fallback mode:
 
 Release options:
   --binary-url URL          Download ingestd from an explicit .tar.gz URL
-  --ingestd-version VALUE   Release tag to download, or "latest" (default)
+  --ingestd-version VALUE   Release tag to download, or mutable "latest" (default)
+
+For repeatable deployments, pin a reviewed release tag with --ingestd-version.
+Using "latest" prints a warning because it can select a different binary later.
 
 Open:
   - Admin login: http://127.0.0.1:8000/admin/login
@@ -122,7 +127,7 @@ install_python_deps() {
 build_cpp_ingestd() {
     require_cmd cmake
     require_cmd c++
-    cmake -S "$ROOT_DIR/cpp/ingestd" -B "$ROOT_DIR/cpp/ingestd/build"
+    cmake -S "$ROOT_DIR/cpp/ingestd" -B "$ROOT_DIR/cpp/ingestd/build" -DCMAKE_BUILD_TYPE=Release
     cmake --build "$ROOT_DIR/cpp/ingestd/build"
     INGESTD_BIN="$ROOT_DIR/cpp/ingestd/build/rapid-inbox-ingestd"
 }
@@ -162,6 +167,7 @@ download_cpp_ingestd() {
     mkdir -p "$INGESTD_BIN_DIR"
     printf 'Downloading prebuilt ingestd: %s\n' "$url"
     "$PYTHON_BIN" - "$url" "$INGESTD_BIN_DIR" <<'PY'
+import hashlib
 import os
 import stat
 import sys
@@ -183,6 +189,20 @@ with tempfile.TemporaryDirectory(prefix="rapid-inbox-ingestd-") as tmp:
     archive_path = Path(tmp) / "ingestd.tar.gz"
     with urllib.request.urlopen(request, timeout=30) as response:
         archive_path.write_bytes(response.read())
+
+    expected_sha256 = os.environ.get("INGESTD_SHA256", "").strip().lower()
+    if not expected_sha256:
+        checksum_request = urllib.request.Request(
+            url + ".sha256",
+            headers={"User-Agent": "Rapid-Inbox quickstart"},
+        )
+        if token:
+            checksum_request.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(checksum_request, timeout=30) as response:
+            expected_sha256 = response.read().decode("ascii").strip().split()[0].lower()
+    actual_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    if len(expected_sha256) != 64 or actual_sha256 != expected_sha256:
+        raise SystemExit("ingestd archive SHA-256 verification failed")
 
     with tarfile.open(archive_path, "r:gz") as archive:
         member = next(
@@ -220,6 +240,93 @@ prepare_cpp_ingestd() {
     build_cpp_ingestd
 }
 
+initialize_env() {
+    if [ -f "$ROOT_DIR/.env" ] || [ ! -f "$ROOT_DIR/.env.example" ]; then
+        return
+    fi
+    GENERATED_BOOTSTRAP_PASSWORD="$($PYTHON_BIN - "$ROOT_DIR/.env.example" "$ROOT_DIR/.env" <<'PY'
+import secrets
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+target = Path(sys.argv[2])
+password = secrets.token_urlsafe(24)
+cursor_secret = secrets.token_urlsafe(48)
+metrics_secret = secrets.token_urlsafe(32)
+source = source.replace(
+    "BOOTSTRAP_ADMIN_PASSWORD=change-me-now",
+    f"BOOTSTRAP_ADMIN_PASSWORD={password}",
+)
+source = source.replace(
+    "API_CURSOR_SECRET=",
+    f"API_CURSOR_SECRET={cursor_secret}",
+)
+source = source.replace(
+    "# METRICS_TOKEN=replace-with-a-long-random-token",
+    f"METRICS_TOKEN={metrics_secret}",
+)
+target.write_text(source, encoding="utf-8")
+target.chmod(0o600)
+print(password)
+PY
+)"
+}
+
+initialize_database_schema() {
+    printf 'Initializing database schema and migrations...\n'
+    "$PYTHON_BIN" - "$ROOT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+
+from app.config import default_settings
+from app.db.connection import initialize_database
+
+settings = default_settings(root)
+initialize_database(settings.database_path)
+PY
+}
+
+warn_if_external_http_bind() {
+    local normalized_host
+    normalized_host="${HTTP_HOST#[}"
+    normalized_host="${normalized_host%]}"
+    case "${normalized_host,,}" in
+        localhost|::1|127.*)
+            return
+            ;;
+    esac
+
+    cat >&2 <<EOF
+
+************************************************************************
+SECURITY WARNING: HTTP is bound to non-loopback address ${HTTP_HOST}:${HTTP_PORT}.
+Rapid Inbox does not terminate HTTP TLS. Put this management endpoint behind
+a trusted HTTPS reverse proxy before exposing it to any untrusted network.
+************************************************************************
+
+EOF
+}
+
+warn_if_mutable_ingestd_release() {
+    if [ "$USE_CPP_INGESTD" -ne 1 ] \
+        || [ "$BUILD_LOCAL_INGESTD" -eq 1 ] \
+        || [ -n "$INGESTD_BINARY_URL" ] \
+        || [ "$INGESTD_VERSION" != "latest" ]; then
+        return
+    fi
+
+    cat >&2 <<'EOF'
+quickstart: WARNING: INGESTD_VERSION=latest is a mutable release pointer.
+The SHA-256 check verifies the downloaded asset, but does not pin its version.
+For repeatable deployments, use --ingestd-version with a reviewed release tag
+or use --build-local from a reviewed source checkout.
+EOF
+}
+
 wait_for_tcp() {
     local host="$1"
     local port="$2"
@@ -245,6 +352,32 @@ while time.monotonic() < deadline:
             continue
         raise SystemExit(0)
 raise SystemExit(f"{label} did not become ready: {last_error}")
+PY
+}
+
+wait_for_http_ready() {
+    local host="$1"
+    local port="$2"
+    "$PYTHON_BIN" - "$host" "$port" "HTTP" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+url = f"http://{sys.argv[1]}:{int(sys.argv[2])}/health/ready"
+deadline = time.monotonic() + 30
+last_error = None
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            payload = json.load(response)
+            if response.status == 200 and payload.get("status") == "ready":
+                raise SystemExit(0)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        last_error = exc
+    time.sleep(0.2)
+raise SystemExit(f"HTTP readiness check failed: {last_error}")
 PY
 }
 
@@ -330,9 +463,7 @@ trap handle_signal INT TERM
 require_cmd python3
 ensure_venv
 
-if [ ! -f "$ROOT_DIR/.env" ] && [ -f "$ROOT_DIR/.env.example" ]; then
-    cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
-fi
+initialize_env
 
 if [ -z "${BOOTSTRAP_ADMIN_USERNAME:-}" ]; then
     BOOTSTRAP_ADMIN_USERNAME="$(dotenv_value BOOTSTRAP_ADMIN_USERNAME || true)"
@@ -341,28 +472,35 @@ if [ -z "${BOOTSTRAP_ADMIN_PASSWORD:-}" ]; then
     BOOTSTRAP_ADMIN_PASSWORD="$(dotenv_value BOOTSTRAP_ADMIN_PASSWORD || true)"
 fi
 
-resolve_dotenv_value HTTP_HOST HOST "0.0.0.0"
+resolve_dotenv_value HTTP_HOST HOST "127.0.0.1"
 resolve_dotenv_value HTTP_PORT PORT "8000"
+resolve_dotenv_value HTTP_CONCURRENCY_LIMIT HTTP_CONCURRENCY_LIMIT "1000"
 resolve_dotenv_value SMTP_HOST SMTP_HOST "0.0.0.0"
 resolve_dotenv_value SMTP_PORT SMTP_PORT "25"
 
 export HOST="$HTTP_HOST"
 export PORT="$HTTP_PORT"
+export HTTP_CONCURRENCY_LIMIT
 export SMTP_HOST="$SMTP_HOST"
 export SMTP_PORT="$SMTP_PORT"
 
-mkdir -p "$RUN_DIR"
+mkdir -p -m 700 "$RUN_DIR"
 : > "$RUN_DIR/http.log"
 : > "$RUN_DIR/ingestd.log"
+chmod 600 "$RUN_DIR/http.log" "$RUN_DIR/ingestd.log"
 
 install_python_deps
+initialize_database_schema
+warn_if_external_http_bind
 
 if [ "$USE_CPP_INGESTD" -eq 1 ]; then
+    warn_if_mutable_ingestd_release
     prepare_cpp_ingestd
 fi
 
 if [ "$USE_CPP_INGESTD" -eq 1 ]; then
-    "$VENV_DIR/bin/uvicorn" app.main:app --host "$HTTP_HOST" --port "$HTTP_PORT" > "$RUN_DIR/http.log" 2>&1 &
+    "$VENV_DIR/bin/uvicorn" app.main:app --host "$HTTP_HOST" --port "$HTTP_PORT" \
+        --limit-concurrency "$HTTP_CONCURRENCY_LIMIT" > "$RUN_DIR/http.log" 2>&1 &
     HTTP_PID=$!
     "$INGESTD_BIN" --base-dir "$ROOT_DIR" > "$RUN_DIR/ingestd.log" 2>&1 &
     INGESTD_PID=$!
@@ -375,7 +513,7 @@ WAIT_HTTP_HOST="$HTTP_HOST"
 if [ "$WAIT_HTTP_HOST" = "0.0.0.0" ] || [ "$WAIT_HTTP_HOST" = "::" ]; then
     WAIT_HTTP_HOST="127.0.0.1"
 fi
-wait_for_tcp "$WAIT_HTTP_HOST" "$HTTP_PORT" "HTTP"
+wait_for_http_ready "$WAIT_HTTP_HOST" "$HTTP_PORT"
 if [ "$USE_CPP_INGESTD" -eq 1 ]; then
     WAIT_SMTP_HOST="$SMTP_HOST"
     if [ "$WAIT_SMTP_HOST" = "0.0.0.0" ] || [ "$WAIT_SMTP_HOST" = "::" ]; then
@@ -387,6 +525,9 @@ fi
 printf 'Rapid Inbox is ready.\n'
 printf 'HTTP bound to: %s:%s\n' "$HTTP_HOST" "$HTTP_PORT"
 printf 'Admin login: http://127.0.0.1:%s/admin/login\n' "$HTTP_PORT"
+if [ -n "$GENERATED_BOOTSTRAP_PASSWORD" ]; then
+    printf 'Generated admin password (shown once): %s\n' "$GENERATED_BOOTSTRAP_PASSWORD"
+fi
 if [ "$USE_CPP_INGESTD" -eq 1 ]; then
     printf 'SMTP ingestd bound to: %s:%s\n' "$SMTP_HOST" "$SMTP_PORT"
 else

@@ -19,19 +19,30 @@ class AttachmentService:
         surface: str = "web",
         request_ip: str | None = None,
     ) -> dict[str, Any]:
-        detail = await self._messages.get_public_delivery_detail(
+        return await self._runtime.get_public_attachment(
             mailbox_address,
             delivery_id,
+            attachment_id,
             surface=surface,
             request_ip=request_ip,
         )
-        for attachment in detail["attachments"]:
-            if attachment["id"] != attachment_id:
-                continue
-            payload = dict(attachment)
-            payload["content"] = self._runtime.storage.read_bytes(attachment["storage_path"])
-            return payload
-        raise LookupError("attachment not found")
+
+    async def get_delivery_attachment_file(
+        self,
+        mailbox_address: str,
+        delivery_id: str,
+        attachment_id: str,
+        *,
+        surface: str = "web",
+        request_ip: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._runtime.get_public_attachment_file(
+            mailbox_address,
+            delivery_id,
+            attachment_id,
+            surface=surface,
+            request_ip=request_ip,
+        )
 
     def build_attachment_response_headers(self, attachment: dict[str, Any]) -> dict[str, str]:
         disposition = "inline" if self._should_inline_attachment(attachment) else "attachment"

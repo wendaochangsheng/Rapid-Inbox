@@ -34,6 +34,36 @@ class LiveState:
         with self._lock:
             return [dict(event) for event in self._events if int(event.get("seq", 0)) > seq]
 
+    def snapshot_stream_window(
+        self,
+        expected_generation: str,
+        seq: int,
+    ) -> tuple[str, list[dict[str, Any]], str | None, int, int]:
+        """Return an atomic stream window and explicitly report cursor loss."""
+
+        with self._lock:
+            generation = self._generation
+            events = [dict(event) for event in self._events]
+            latest_seq = self._next_seq - 1
+            oldest_seq = int(events[0].get("seq", self._next_seq)) if events else self._next_seq
+            gap_reason: str | None = None
+            if expected_generation != generation:
+                gap_reason = "generation_changed"
+            elif seq < oldest_seq - 1:
+                gap_reason = "ring_overrun"
+            elif seq > latest_seq:
+                gap_reason = "cursor_ahead"
+
+            if gap_reason is not None:
+                return generation, events, gap_reason, oldest_seq, latest_seq
+            return (
+                generation,
+                [event for event in events if int(event.get("seq", 0)) > seq],
+                None,
+                oldest_seq,
+                latest_seq,
+            )
+
     def clear(self) -> None:
         with self._lock:
             self._events.clear()
@@ -42,7 +72,8 @@ class LiveState:
 
     @property
     def generation(self) -> str:
-        return self._generation
+        with self._lock:
+            return self._generation
 
     def _format_cursor(self, seq: int) -> str:
         return f"{self._generation}:{seq}"

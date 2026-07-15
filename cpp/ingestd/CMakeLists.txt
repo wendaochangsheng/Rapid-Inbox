@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(SQLite3 REQUIRED)
+find_package(SQLite3 3.20 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ICU REQUIRED COMPONENTS uc)
 find_library(UNISTRING_LIBRARY NAMES unistring libunistring.so.2 REQUIRED)
@@ -17,7 +17,9 @@ set(INGESTD_LIB_SOURCES
     src/domain_matcher.cpp
     src/id.cpp
     src/ingest_app.cpp
+    src/instance_lock.cpp
     src/json_util.cpp
+    src/logger.cpp
     src/mail_queue.cpp
     src/mime_parser.cpp
     src/sha256.cpp
@@ -47,6 +49,9 @@ add_executable(ingestd_tests
     tests/test_config.cpp
     tests/test_domain_cache.cpp
     tests/test_domain_matcher.cpp
+    tests/test_ingest_app.cpp
+    tests/test_instance_lock.cpp
+    tests/test_logger.cpp
     tests/test_mail_queue.cpp
     tests/test_mime_parser.cpp
     tests/test_smtp_server.cpp

@@ -82,6 +82,7 @@ async def admin_client(app_client: httpx.AsyncClient, runtime: RapidInboxRuntime
         name="fixture-admin",
         kind="admin",
         scopes=[
+            "public.read",
             "domains.write",
             "messages.write",
             "messages.read",
@@ -96,7 +97,14 @@ async def admin_client(app_client: httpx.AsyncClient, runtime: RapidInboxRuntime
             "smtp.read",
         ],
         domain_ids=[],
+        domain_grant_mode="all",
         mailbox_patterns=[],
+        # The shared test administrator represents an unrestricted root
+        # credential. Bounded API-key managers may not delegate an unlimited
+        # child, so make that root policy explicit instead of relying on the
+        # ordinary 3600/min default.
+        rate_limit_per_min=0,
+        allow_query=True,
     )
     app_client.headers["X-API-Key"] = key["plain_text"]
     return app_client
@@ -104,7 +112,7 @@ async def admin_client(app_client: httpx.AsyncClient, runtime: RapidInboxRuntime
 
 @pytest_asyncio.fixture
 async def seeded_message(runtime: RapidInboxRuntime, sample_email_bytes: bytes) -> SeededMessage:
-    await runtime.create_domain("adb.com")
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
     await runtime.ensure_smtp_session(
         "smtp_fixture_1",
         SimpleNamespace(peer=("127.0.0.1", 2525), host_name="pytest", ssl=None),
@@ -114,6 +122,7 @@ async def seeded_message(runtime: RapidInboxRuntime, sample_email_bytes: bytes) 
         kind="public",
         scopes=["public.read"],
         domain_ids=[],
+        domain_grant_mode="all",
         mailbox_patterns=["foo@adb.com"],
     )
     await runtime.accept_message(

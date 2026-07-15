@@ -771,7 +771,7 @@ code = items[<span class="tk-key">0</span>].<span class="tk-fn">get</span>(<span
       </details>
       <details class="faq-item">
         <summary>支持哪些邮件协议？</summary>
-        <p>系统通过标准 SMTP 协议接收邮件并支持 STARTTLS。任何能够发送 SMTP 邮件的服务都可以投递到本系统已接入的域名。</p>
+        <p>系统通过标准 SMTP 协议接收邮件。生产环境如需 STARTTLS，请由前置 MTA 终止 TLS 后再投递到本系统；任何能够发送 SMTP 邮件的服务都可以投递到已接入的域名。</p>
       </details>
       <details class="faq-item">
         <summary>能否限制特定邮箱不公开？</summary>

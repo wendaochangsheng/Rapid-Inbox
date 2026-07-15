@@ -11,6 +11,7 @@ struct DateParts {
 };
 
 std::string utc_now();
+std::string utc_add_days(const std::string& timestamp, int days);
 DateParts path_date_parts(const std::string& timestamp);
 
 }

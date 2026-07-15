@@ -445,6 +445,12 @@
   {% set attachment_count = attachments|length if attachments else 0 %}
   {% set header_count = headers|length if headers else 0 %}
 
+  {% if text_body_truncated or html_body_truncated or headers_truncated %}
+    <div class="notice">
+      <span>为保持高并发稳定性，此处仅展示有界预览；可下载原始 EML 查看完整正文和邮件头。</span>
+    </div>
+  {% endif %}
+
   {% if has_html or has_text or attachment_count or header_count %}
     <section class="surface body-panel" id="body-panel">
       <div class="tab-bar" role="tablist" aria-label="邮件正文">

@@ -180,6 +180,54 @@ std::string utc_now() {
     return output.str();
 }
 
+std::string utc_add_days(const std::string& timestamp, int days_to_add) {
+    if (days_to_add < 0 || timestamp.size() != 20 || timestamp[4] != '-' ||
+        timestamp[7] != '-' || timestamp[10] != 'T' || timestamp[13] != ':' ||
+        timestamp[16] != ':' || timestamp[19] != 'Z') {
+        throw std::invalid_argument("malformed UTC timestamp: " + timestamp);
+    }
+
+    int year_value = 0;
+    int month_value = 0;
+    int day_value = 0;
+    int hour_value = 0;
+    int minute_value = 0;
+    int second_value = 0;
+    if (!parse_fixed_int(timestamp, 0, 4, year_value) ||
+        !parse_fixed_int(timestamp, 5, 2, month_value) ||
+        !parse_fixed_int(timestamp, 8, 2, day_value) ||
+        !parse_fixed_int(timestamp, 11, 2, hour_value) ||
+        !parse_fixed_int(timestamp, 14, 2, minute_value) ||
+        !parse_fixed_int(timestamp, 17, 2, second_value)) {
+        throw std::invalid_argument("malformed UTC timestamp: " + timestamp);
+    }
+
+    const std::chrono::year_month_day date{
+        std::chrono::year{year_value},
+        std::chrono::month{static_cast<unsigned>(month_value)},
+        std::chrono::day{static_cast<unsigned>(day_value)},
+    };
+    if (!date.ok() || hour_value < 0 || hour_value > 23 || minute_value < 0 ||
+        minute_value > 59 || second_value < 0 || second_value > 59) {
+        throw std::invalid_argument("malformed UTC timestamp: " + timestamp);
+    }
+
+    const auto instant = std::chrono::sys_days{date} + std::chrono::days{days_to_add} +
+                         std::chrono::hours{hour_value} + std::chrono::minutes{minute_value} +
+                         std::chrono::seconds{second_value};
+    const std::time_t result_time =
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::time_point{instant});
+    std::tm utc_tm{};
+#if defined(_WIN32)
+    gmtime_s(&utc_tm, &result_time);
+#else
+    gmtime_r(&result_time, &utc_tm);
+#endif
+    std::ostringstream output;
+    output << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%SZ");
+    return output.str();
+}
+
 DateParts path_date_parts(const std::string& timestamp) {
     if (!has_iso_date_prefix(timestamp) || !is_valid_timestamp_suffix(timestamp)) {
         throw std::invalid_argument("malformed timestamp: " + timestamp);

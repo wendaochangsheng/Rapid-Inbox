@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,7 +14,9 @@ from app.db.connection import connect_database
 from app.ingest.parser import ParsedMessage
 from app.ingest.queue import ParseTask
 from app.main import create_app
+from app.services.settings import SettingsService
 from app.smtp.handler import RapidInboxHandler
+import app.http.admin_api as admin_api_module
 
 
 @pytest.mark.asyncio
@@ -44,6 +48,101 @@ async def test_admin_domain_api_creates_and_lists_domains(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_admin_sync_domain_read_does_not_block_event_loop(
+    admin_client,
+    runtime,
+    monkeypatch,
+) -> None:
+    original_domains_page = admin_api_module._domains_page
+    started = threading.Event()
+
+    def slow_domains_page(*args, **kwargs):
+        started.set()
+        time.sleep(0.2)
+        return original_domains_page(*args, **kwargs)
+
+    monkeypatch.setattr(admin_api_module, "_domains_page", slow_domains_page)
+    request_task = asyncio.create_task(admin_client.get("/api/v1/admin/domains"))
+
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1.0)
+    assert not request_task.done()
+
+    response = await request_task
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_domain_list_is_sql_paginated_and_hard_limited(admin_client, runtime) -> None:
+    for root_domain in ("paged-a.example", "paged-b.example", "paged-c.example"):
+        await runtime.create_domain(root_domain)
+
+    first = await admin_client.get("/api/v1/admin/domains", params={"limit": 2, "offset": 0})
+    second = await admin_client.get("/api/v1/admin/domains", params={"limit": 2, "offset": 2})
+    oversized = await admin_client.get("/api/v1/admin/domains", params={"limit": 201})
+
+    assert first.status_code == 200
+    assert first.json()["limit"] == 2
+    assert first.json()["offset"] == 0
+    assert first.json()["total_count"] == 3
+    assert len(first.json()["items"]) == 2
+    assert second.status_code == 200
+    assert len(second.json()["items"]) == 1
+    assert oversized.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_admin_bulk_delete_rejects_too_many_ids_before_resource_queries(
+    admin_client,
+    monkeypatch,
+) -> None:
+    checked_ids: list[str] = []
+
+    async def track_delivery_grant(_request, _admin, delivery_id: str) -> str:
+        checked_ids.append(delivery_id)
+        return "message-id"
+
+    monkeypatch.setattr(admin_api_module, "_require_delivery_grant", track_delivery_grant)
+    response = await admin_client.post(
+        "/api/v1/admin/messages/bulk-delete",
+        json={"delivery_ids": [f"delivery-{index}" for index in range(1001)]},
+    )
+
+    assert response.status_code == 422
+    assert "maximum of 1000" in response.json()["detail"]
+    assert checked_ids == []
+
+
+@pytest.mark.asyncio
+async def test_admin_smtp_session_events_are_paginated_and_hard_limited(
+    admin_client,
+    runtime,
+) -> None:
+    session_id = "smtp_v1_event_page"
+    await runtime.ensure_smtp_session(
+        session_id,
+        SimpleNamespace(peer=("127.0.0.1", 2525), host_name="pytest", ssl=None),
+    )
+    for index in range(3):
+        await runtime.record_smtp_event(session_id, "command", {"index": index})
+
+    page = await admin_client.get(
+        f"/api/v1/admin/smtp-sessions/{session_id}",
+        params={"event_limit": 1, "event_offset": 1},
+    )
+    oversized = await admin_client.get(
+        f"/api/v1/admin/smtp-sessions/{session_id}",
+        params={"event_limit": 1001},
+    )
+
+    assert page.status_code == 200
+    assert page.json()["events_total_count"] >= 3
+    assert page.json()["events_limit"] == 1
+    assert page.json()["events_offset"] == 1
+    assert len(page.json()["events"]) == 1
+    assert oversized.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_admin_api_supports_message_reparse_and_settings_update(admin_client, runtime, seeded_message) -> None:
     reparse = await admin_client.post(f"/api/v1/admin/messages/{seeded_message.message_id}/reparse")
     settings_response = await admin_client.patch(
@@ -66,6 +165,8 @@ async def test_live_sse_api_key_enforces_ip_restrictions(app_client, runtime) ->
         kind="admin",
         scopes=["live.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=[],
         allowed_ip_cidrs=["203.0.113.0/24"],
     )
@@ -155,8 +256,8 @@ async def test_admin_api_can_create_and_revoke_api_keys_through_http(admin_clien
 
 @pytest.mark.asyncio
 async def test_admin_api_can_update_api_key_permissions_and_grants(admin_client, runtime) -> None:
-    primary_domain = await runtime.create_domain("adb.com")
-    await runtime.create_domain("other.com")
+    primary_domain = await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
+    await runtime.create_domain("other.com", public_web_enabled=True, public_api_enabled=True)
     key = await runtime.api_keys.create_key(
         name="patch-public",
         kind="public",
@@ -231,6 +332,8 @@ async def test_admin_api_read_endpoints_accept_read_scopes(admin_client, runtime
         kind="admin",
         scopes=["domains.read", "system.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=[],
     )
 
@@ -450,7 +553,7 @@ async def test_admin_api_parse_failure_keeps_attachment_files_when_db_write_fail
     monkeypatch.setattr(runtime.writer, "execute", failing_execute)
 
     with pytest.raises(RuntimeError, match="db write failed"):
-        await runtime._parse_message(ParseTask(message_id=message_id))
+        await runtime._parse_message(ParseTask(message_id=message_id, raw_size_bytes=1))
 
     assert attachment_path.exists() is True
 
@@ -665,7 +768,7 @@ async def test_admin_api_attachment_cleanup_errors_do_not_stop_later_reparses(ru
 
 @pytest.mark.asyncio
 async def test_admin_api_settings_update_applies_live_message_size_limit(admin_client, runtime) -> None:
-    runtime.settings.max_message_size_bytes = 10
+    await runtime.update_settings({"max_message_size_bytes": 10})
     await runtime.create_domain("adb.com")
     handler = RapidInboxHandler(runtime)
     session = SimpleNamespace(peer=("127.0.0.1", 2525), host_name="pytest", ssl=None)
@@ -715,6 +818,8 @@ async def test_admin_api_settings_reload_from_database_on_restart(tmp_path) -> N
                 kind="admin",
                 scopes=["system.write"],
                 domain_ids=[],
+
+                domain_grant_mode="all",
                 mailbox_patterns=[],
             )
             response = await client.patch(
@@ -768,15 +873,7 @@ async def test_admin_api_settings_allowlist_rejects_unsupported_keys_and_filters
 
     assert rejected.status_code == 422
     assert "admin_token" not in listed.json()
-    assert set(listed.json()) == {
-        "max_message_size_bytes",
-        "max_recipients_per_message",
-        "smtp_idle_timeout_seconds",
-        "smtp_max_concurrent_connections",
-        "smtp_connection_rate_limit_count",
-        "smtp_connection_rate_limit_window_seconds",
-        "disk_warning_threshold_percent",
-    }
+    assert set(listed.json()) == SettingsService.SUPPORTED_SETTINGS
 
 
 @pytest.mark.asyncio
@@ -879,6 +976,8 @@ async def test_admin_api_mirrors_domain_mailbox_message_session_and_key_rotate(
         kind="admin",
         scopes=["domains.read"],
         domain_ids=[],
+
+        domain_grant_mode="all",
         mailbox_patterns=[],
     )
     key_detail = await admin_client.get(f"/api/v1/admin/api-keys/{key['id']}")

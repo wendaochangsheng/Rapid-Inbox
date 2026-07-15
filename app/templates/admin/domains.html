@@ -269,6 +269,10 @@
           <input type="number" min="1" step="1" name="max_message_size_bytes" value="{{ create_form.max_message_size_bytes }}" required />
         </label>
         <label>
+          <span>保留天数</span>
+          <input type="number" min="1" step="1" name="retention_days" value="{{ create_form.retention_days }}" placeholder="留空 = 永久保留" />
+        </label>
+        <label>
           <span>加号寻址策略</span>
           <select name="plus_addressing_mode">
             <option value="keep" {% if create_form.plus_addressing_mode == "keep" %}selected{% endif %}>保留原样</option>

@@ -32,14 +32,36 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
     FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
 );
 
+CREATE TRIGGER IF NOT EXISTS prevent_last_active_superadmin_update
+BEFORE UPDATE OF role, is_active ON admins
+WHEN OLD.role = 'superadmin'
+    AND OLD.is_active = 1
+    AND (NEW.role <> 'superadmin' OR NEW.is_active <> 1)
+    AND (SELECT COUNT(*) FROM admins WHERE role = 'superadmin' AND is_active = 1) <= 1
+BEGIN
+    SELECT RAISE(ABORT, 'cannot remove last active superadmin');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_last_active_superadmin_delete
+BEFORE DELETE ON admins
+WHEN OLD.role = 'superadmin'
+    AND OLD.is_active = 1
+    AND (SELECT COUNT(*) FROM admins WHERE role = 'superadmin' AND is_active = 1) <= 1
+BEGIN
+    SELECT RAISE(ABORT, 'cannot remove last active superadmin');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin_active
+ON admin_sessions(admin_id, revoked_at, expires_at);
+
 CREATE TABLE IF NOT EXISTS domains (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     root_domain_ascii TEXT NOT NULL UNIQUE,
     root_domain_unicode TEXT,
     accept_exact INTEGER NOT NULL DEFAULT 1 CHECK (accept_exact IN (0, 1)),
     accept_subdomains INTEGER NOT NULL DEFAULT 1 CHECK (accept_subdomains IN (0, 1)),
-    public_web_enabled INTEGER NOT NULL DEFAULT 1 CHECK (public_web_enabled IN (0, 1)),
-    public_api_enabled INTEGER NOT NULL DEFAULT 1 CHECK (public_api_enabled IN (0, 1)),
+    public_web_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_web_enabled IN (0, 1)),
+    public_api_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_api_enabled IN (0, 1)),
     is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
     is_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_hidden IN (0, 1)),
     local_part_case_sensitive INTEGER NOT NULL DEFAULT 0 CHECK (local_part_case_sensitive IN (0, 1)),
@@ -72,12 +94,23 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     public_enabled INTEGER NOT NULL DEFAULT 1 CHECK (public_enabled IN (0, 1)),
     is_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_hidden IN (0, 1)),
     notes TEXT,
+    -- A mailbox clear increments this value before any page is processed.
+    -- Deliveries accepted afterwards inherit the new generation and therefore
+    -- cannot be consumed by the already-persisted clear job, even if SQLite
+    -- later reuses a deleted rowid.
+    bulk_delete_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (bulk_delete_generation >= 0),
     FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mailboxes_domain ON mailboxes(domain_id);
 CREATE INDEX IF NOT EXISTS idx_mailboxes_domain_local ON mailboxes(domain_id, rcpt_domain_ascii, local_part_canonical);
 CREATE INDEX IF NOT EXISTS idx_mailboxes_latest_message ON mailboxes(latest_message_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mailboxes_latest_sort
+ON mailboxes(COALESCE(latest_message_at, '') DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_mailboxes_stale_empty
+ON mailboxes(last_seen_at ASC, id ASC)
+WHERE message_count = 0 AND latest_message_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS smtp_sessions (
     id TEXT PRIMARY KEY,
@@ -106,8 +139,12 @@ CREATE TABLE IF NOT EXISTS smtp_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_smtp_sessions_connect_at ON smtp_sessions(connect_at DESC);
+CREATE INDEX IF NOT EXISTS idx_smtp_sessions_connect_id
+ON smtp_sessions(connect_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_smtp_sessions_remote_ip ON smtp_sessions(remote_ip, connect_at DESC);
 CREATE INDEX IF NOT EXISTS idx_smtp_sessions_status ON smtp_sessions(status, connect_at DESC);
+CREATE INDEX IF NOT EXISTS idx_smtp_sessions_retention_time
+ON smtp_sessions(COALESCE(disconnect_at, last_command_at, connect_at), id);
 
 CREATE TABLE IF NOT EXISTS smtp_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,11 +191,20 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_received_id ON messages(received_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_parse_status ON messages(parse_status, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_parse_received_id
+ON messages(parse_status, received_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_message_id_header ON messages(message_id_header);
 CREATE INDEX IF NOT EXISTS idx_messages_from_addr ON messages(from_addr, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_subject ON messages(subject);
 CREATE INDEX IF NOT EXISTS idx_messages_raw_sha256 ON messages(raw_sha256);
+CREATE INDEX IF NOT EXISTS idx_messages_text_body_path
+ON messages(text_body_path)
+WHERE text_body_path IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_html_body_path
+ON messages(html_body_path)
+WHERE html_body_path IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS message_deliveries (
     id TEXT PRIMARY KEY,
@@ -168,21 +214,47 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
     delivered_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted', 'hidden')),
     deleted_at TEXT,
+    expires_at TEXT,
     notes TEXT,
+    -- -1 is an insertion sentinel for compatibility with direct SQL writers;
+    -- the bootstrap trigger below replaces it with the mailbox's current
+    -- generation in the same statement transaction.
+    mailbox_generation INTEGER NOT NULL DEFAULT -1
+        CHECK (mailbox_generation >= -1),
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
     FOREIGN KEY (mailbox_id) REFERENCES mailboxes(id) ON DELETE RESTRICT,
     UNIQUE (message_id, mailbox_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_mailbox_time ON message_deliveries(mailbox_id, delivered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_message_deliveries_mailbox_status_time_id
+ON message_deliveries(mailbox_id, status, delivered_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_message ON message_deliveries(message_id);
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_status_time ON message_deliveries(status, delivered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_message_deliveries_rcpt_to ON message_deliveries(rcpt_to, delivered_at DESC);
+-- initialize_database installs the generation-aware partial paging index after
+-- applying lightweight column migrations. Keeping it out of this base script
+-- lets existing databases add mailbox_generation before SQLite parses it.
+
+CREATE TRIGGER IF NOT EXISTS message_deliveries_fill_mailbox_generation
+AFTER INSERT ON message_deliveries
+WHEN NEW.mailbox_generation = -1
+BEGIN
+    UPDATE message_deliveries
+    SET mailbox_generation = (
+        SELECT bulk_delete_generation
+        FROM mailboxes
+        WHERE id = NEW.mailbox_id
+    )
+    WHERE rowid = NEW.rowid;
+END;
 
 CREATE TABLE IF NOT EXISTS mail_metric_buckets (
     bucket_ts TEXT PRIMARY KEY,
+    received INTEGER NOT NULL DEFAULT 0,
     deliveries INTEGER NOT NULL DEFAULT 0,
-    parse_failures INTEGER NOT NULL DEFAULT 0
+    parse_failures INTEGER NOT NULL DEFAULT 0,
+    rejected INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS attachments (
@@ -205,6 +277,8 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_sha256 ON attachments(sha256);
+CREATE INDEX IF NOT EXISTS idx_attachments_storage_path
+ON attachments(storage_path);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +290,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     secret_hash TEXT NOT NULL UNIQUE,
     owner_admin_id INTEGER,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked', 'expired', 'disabled')),
+    domain_grant_mode TEXT NOT NULL DEFAULT 'none'
+        CHECK (domain_grant_mode IN ('none', 'selected', 'all')),
     allow_header INTEGER NOT NULL DEFAULT 1 CHECK (allow_header IN (0, 1)),
     allow_query INTEGER NOT NULL DEFAULT 0 CHECK (allow_query IN (0, 1)),
     rate_limit_per_min INTEGER NOT NULL DEFAULT 3600,
@@ -232,6 +308,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_api_keys_kind ON api_keys(kind, status);
+CREATE INDEX IF NOT EXISTS idx_api_keys_created_id
+ON api_keys(created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS api_key_scopes (
     api_key_id INTEGER NOT NULL,
@@ -270,6 +348,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_id
+ON audit_logs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_type, actor_ref, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, resource_ref, created_at DESC);
 
@@ -278,5 +358,207 @@ CREATE TABLE IF NOT EXISTS system_settings (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS file_gc_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    storage_path TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_gc_tasks_next_attempt
+ON file_gc_tasks(next_attempt_at, id);
+
+CREATE TABLE IF NOT EXISTS maintenance_runs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    details_json TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_runs_kind_started
+ON maintenance_runs(kind, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_runs_status_finished
+ON maintenance_runs(status, finished_at, id);
+
+CREATE TABLE IF NOT EXISTS domain_rehome_jobs (
+    id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    candidate_root_domain TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+    cursor_mailbox_id INTEGER NOT NULL DEFAULT 0,
+    max_mailbox_id INTEGER NOT NULL,
+    mailboxes_scanned INTEGER NOT NULL DEFAULT 0,
+    mailboxes_rehomed INTEGER NOT NULL DEFAULT 0,
+    deliveries_moved INTEGER NOT NULL DEFAULT 0,
+    deliveries_deduplicated INTEGER NOT NULL DEFAULT 0,
+    destination_domain_ids_json TEXT NOT NULL DEFAULT '[]',
+    marks_ownership_upgrade INTEGER NOT NULL DEFAULT 0
+        CHECK (marks_ownership_upgrade IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_rehome_jobs_status_created
+ON domain_rehome_jobs(status, created_at, id);
+
+CREATE TABLE IF NOT EXISTS mailbox_bulk_delete_jobs (
+    id TEXT PRIMARY KEY,
+    mailbox_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+    cursor_delivery_rowid INTEGER NOT NULL DEFAULT 0,
+    max_delivery_rowid INTEGER NOT NULL,
+    target_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (target_generation >= 0),
+    deleted_count INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    error TEXT,
+    FOREIGN KEY (mailbox_id) REFERENCES mailboxes(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mailbox_bulk_delete_jobs_incomplete_mailbox
+ON mailbox_bulk_delete_jobs(mailbox_id)
+WHERE status IN ('pending', 'running', 'failed');
+
+CREATE INDEX IF NOT EXISTS idx_mailbox_bulk_delete_jobs_status_created
+ON mailbox_bulk_delete_jobs(status, created_at, id);
+
+-- Dashboard totals live in one cache-hot row so a status refresh never scans
+-- an unbounded application table.  These counters are maintained by triggers
+-- because administrative and recovery writes can originate from either the
+-- Python process, the C++ ingest daemon, or an operator's migration script.
+CREATE TABLE IF NOT EXISTS dashboard_counters (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    domains INTEGER NOT NULL DEFAULT 0 CHECK (domains >= 0),
+    mailboxes INTEGER NOT NULL DEFAULT 0 CHECK (mailboxes >= 0),
+    messages INTEGER NOT NULL DEFAULT 0 CHECK (messages >= 0),
+    api_keys INTEGER NOT NULL DEFAULT 0 CHECK (api_keys >= 0),
+    audit_logs INTEGER NOT NULL DEFAULT 0 CHECK (audit_logs >= 0),
+    pending_messages INTEGER NOT NULL DEFAULT 0 CHECK (pending_messages >= 0),
+    failed_messages INTEGER NOT NULL DEFAULT 0 CHECK (failed_messages >= 0)
+) WITHOUT ROWID;
+
+INSERT OR IGNORE INTO dashboard_counters (
+    singleton_id,
+    domains,
+    mailboxes,
+    messages,
+    api_keys,
+    audit_logs,
+    pending_messages,
+    failed_messages
+)
+SELECT
+    1,
+    (SELECT COUNT(*) FROM domains),
+    (SELECT COUNT(*) FROM mailboxes),
+    (SELECT COUNT(*) FROM messages),
+    (SELECT COUNT(*) FROM api_keys),
+    (SELECT COUNT(*) FROM audit_logs),
+    (SELECT COUNT(*) FROM messages WHERE parse_status = 'pending'),
+    (SELECT COUNT(*) FROM messages WHERE parse_status = 'failed');
+
+CREATE TRIGGER IF NOT EXISTS dashboard_domains_insert
+AFTER INSERT ON domains
+BEGIN
+    UPDATE dashboard_counters SET domains = domains + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_domains_delete
+AFTER DELETE ON domains
+BEGIN
+    UPDATE dashboard_counters SET domains = MAX(domains - 1, 0) WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_mailboxes_insert
+AFTER INSERT ON mailboxes
+BEGIN
+    UPDATE dashboard_counters SET mailboxes = mailboxes + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_mailboxes_delete
+AFTER DELETE ON mailboxes
+BEGIN
+    UPDATE dashboard_counters SET mailboxes = MAX(mailboxes - 1, 0) WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_messages_insert
+AFTER INSERT ON messages
+BEGIN
+    UPDATE dashboard_counters
+    SET messages = messages + 1,
+        pending_messages = pending_messages + (NEW.parse_status = 'pending'),
+        failed_messages = failed_messages + (NEW.parse_status = 'failed')
+    WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_messages_delete
+AFTER DELETE ON messages
+BEGIN
+    UPDATE dashboard_counters
+    SET messages = MAX(messages - 1, 0),
+        pending_messages = MAX(pending_messages - (OLD.parse_status = 'pending'), 0),
+        failed_messages = MAX(failed_messages - (OLD.parse_status = 'failed'), 0)
+    WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_messages_parse_status_update
+AFTER UPDATE OF parse_status ON messages
+WHEN OLD.parse_status <> NEW.parse_status
+BEGIN
+    UPDATE dashboard_counters
+    SET pending_messages = MAX(
+            pending_messages
+            - (OLD.parse_status = 'pending')
+            + (NEW.parse_status = 'pending'),
+            0
+        ),
+        failed_messages = MAX(
+            failed_messages
+            - (OLD.parse_status = 'failed')
+            + (NEW.parse_status = 'failed'),
+            0
+        )
+    WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_api_keys_insert
+AFTER INSERT ON api_keys
+BEGIN
+    UPDATE dashboard_counters SET api_keys = api_keys + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_api_keys_delete
+AFTER DELETE ON api_keys
+BEGIN
+    UPDATE dashboard_counters SET api_keys = MAX(api_keys - 1, 0) WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_audit_logs_insert
+AFTER INSERT ON audit_logs
+BEGIN
+    UPDATE dashboard_counters SET audit_logs = audit_logs + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS dashboard_audit_logs_delete
+AFTER DELETE ON audit_logs
+BEGIN
+    UPDATE dashboard_counters SET audit_logs = MAX(audit_logs - 1, 0) WHERE singleton_id = 1;
+END;
 
 COMMIT;

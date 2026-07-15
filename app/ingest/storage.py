@@ -7,10 +7,27 @@ import re
 import shutil
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic, sleep, time
 
 from app.config import Settings
+
+
+INGEST_STATUS_FILENAME = ".ingestd.status.json"
+MAINTENANCE_LOCK_FILENAME = ".maintenance.lock"
+MAINTENANCE_DRAINED_FILENAME = ".maintenance.drained.json"
+INGEST_STATUS_FRESH_SECONDS = 3.0
+MAINTENANCE_DRAIN_TIMEOUT_SECONDS = 30.0
+MAINTENANCE_DRAIN_POLL_SECONDS = 0.05
+STALE_PART_MIN_AGE_SECONDS = 60 * 60
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceLease:
+    path: Path
+    token: str
 
 
 def utc_now() -> str:
@@ -25,7 +42,15 @@ def path_date_parts(timestamp: str) -> tuple[str, str, str]:
 def safe_filename(filename: str | None) -> str:
     base_name = filename or "attachment.bin"
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name).strip("._")
-    return cleaned or "attachment.bin"
+    cleaned = cleaned or "attachment.bin"
+    # Leave ample room for the attachment id and temporary-file prefix under
+    # common NAME_MAX=255 filesystems.
+    if len(cleaned.encode("utf-8")) <= 160:
+        return cleaned
+    stem, suffix = os.path.splitext(cleaned)
+    suffix = suffix[:20]
+    budget = max(1, 160 - len(suffix.encode("utf-8")))
+    return stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore") + suffix
 
 
 class FileStorage:
@@ -78,6 +103,36 @@ class FileStorage:
             return None
         return self.resolve(relative_path).read_text(encoding="utf-8")
 
+    def read_bytes_limited(
+        self,
+        relative_path: str,
+        max_bytes: int,
+    ) -> tuple[bytes, bool, int]:
+        """Read at most ``max_bytes`` and report truncation and source size."""
+
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        path = self.resolve(relative_path)
+        with path.open("rb") as handle:
+            content = handle.read(max_bytes + 1)
+            source_bytes = int(os.fstat(handle.fileno()).st_size)
+        truncated = source_bytes > max_bytes or len(content) > max_bytes
+        return content[:max_bytes], truncated, source_bytes
+
+    def read_text_preview(
+        self,
+        relative_path: str | None,
+        max_bytes: int,
+    ) -> tuple[str, bool, int, int]:
+        if not relative_path:
+            return "", False, 0, 0
+        content, truncated, source_bytes = self.read_bytes_limited(relative_path, max_bytes)
+        # A byte cap may split a UTF-8 code point. Dropping only that partial
+        # suffix keeps the preview valid without reading beyond the budget.
+        text = content.decode("utf-8", errors="ignore")
+        returned_bytes = len(text.encode("utf-8"))
+        return text, truncated, source_bytes, returned_bytes
+
     def resolve(self, relative_path: str) -> Path:
         path = Path(relative_path)
         if path.is_absolute():
@@ -91,18 +146,153 @@ class FileStorage:
         return candidate
 
     def cleanup_stale_parts(self) -> None:
-        # Legacy visible temp files are safe to clean in fixed-extension stores.
+        # HTTP and ingestd can restart independently. Never unlink a temp file
+        # merely because it is visible during startup: the other process may be
+        # writing it right now. Age-gating leaves crash debris for a later pass
+        # without corrupting an active durable publish.
         for category in (self._settings.raw_dir, self._settings.text_dir, self._settings.html_dir, self._settings.manifests_dir):
             for part_file in category.rglob("*.part"):
-                part_file.unlink(missing_ok=True)
+                self._unlink_stale_part(part_file)
 
         # Hidden temp files are the current write-ahead artifact naming scheme.
         for part_file in self.storage_root.rglob(".*.part"):
+            self._unlink_stale_part(part_file)
+
+        # C++ uses mkstemp names such as ``.msg.eml.tmp.A1B2C3``.
+        for part_file in self.storage_root.rglob(".*.tmp.*"):
+            self._unlink_stale_part(part_file)
+
+    def _unlink_stale_part(self, part_file: Path) -> None:
+        try:
+            age_seconds = max(time() - part_file.stat().st_mtime, 0.0)
+            if age_seconds < STALE_PART_MIN_AGE_SECONDS:
+                return
             part_file.unlink(missing_ok=True)
+        except OSError:
+            return
 
     def cleanup_abandoned_clear_trash(self) -> None:
         for trash_path in self.storage_root.glob(".clear-mail-trash-*"):
             self._delete_tree_in_background(trash_path)
+
+    def begin_maintenance(self, operation: str) -> MaintenanceLease:
+        lock_path = self.storage_root / MAINTENANCE_LOCK_FILENAME
+        token = uuid.uuid4().hex
+        payload = json.dumps(
+            {
+                "operation": operation,
+                "pid": os.getpid(),
+                "started_at": utc_now(),
+                "token": token,
+            },
+            sort_keys=True,
+        )
+        try:
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise RuntimeError("another storage maintenance operation is active") from exc
+        try:
+            # Acquire the unique lease before deleting a stale acknowledgement,
+            # but delete it before publishing this token. An ingest daemon may
+            # observe an empty lock as fail-closed; it cannot acknowledge the
+            # new token until the JSON payload is complete.
+            (self.storage_root / MAINTENANCE_DRAINED_FILENAME).unlink(missing_ok=True)
+            os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)
+        except BaseException:
+            lock_path.unlink(missing_ok=True)
+            raise
+        finally:
+            os.close(fd)
+        return MaintenanceLease(path=lock_path, token=token)
+
+    def wait_for_ingestd_drain(
+        self,
+        lease: MaintenanceLease,
+        *,
+        timeout_seconds: float | None = None,
+        heartbeat_fresh_seconds: float | None = None,
+        poll_seconds: float | None = None,
+    ) -> None:
+        timeout = MAINTENANCE_DRAIN_TIMEOUT_SECONDS if timeout_seconds is None else max(timeout_seconds, 0.0)
+        freshness = INGEST_STATUS_FRESH_SECONDS if heartbeat_fresh_seconds is None else max(
+            heartbeat_fresh_seconds,
+            0.0,
+        )
+        poll = MAINTENANCE_DRAIN_POLL_SECONDS if poll_seconds is None else max(poll_seconds, 0.001)
+        deadline = monotonic() + timeout
+        status_path = self.storage_root / INGEST_STATUS_FILENAME
+        drained_path = self.storage_root / MAINTENANCE_DRAINED_FILENAME
+
+        while True:
+            drained = self._read_json_object(drained_path)
+            if drained is not None and drained.get("token") == lease.token:
+                return
+
+            try:
+                status_stat = status_path.stat()
+            except OSError:
+                # ingestd publishes this file synchronously before opening the
+                # SMTP listener. No status therefore means no process capable
+                # of accepting a durable job under this storage root.
+                return
+
+            age_seconds = max(time() - status_stat.st_mtime, 0.0)
+            if age_seconds > freshness:
+                status = self._read_json_object(status_path)
+                process_alive = self._status_process_is_alive(status)
+                if process_alive is False:
+                    # A stale lease owned by a provably-dead PID is crash debris.
+                    # A replacement daemon must observe the already-published
+                    # maintenance lock before it can expose its SMTP listener.
+                    return
+                # Stale does not mean dead: a live process may be blocked in its
+                # status/logging thread while reservations, queued jobs, or a DB
+                # transaction still exist. Malformed/permission-denied leases
+                # are also fail-closed because their absence cannot be proven.
+
+            if monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for ingestd to drain for maintenance")
+            sleep(min(poll, max(deadline - monotonic(), 0.0)))
+
+    def _status_process_is_alive(self, status: dict[str, object] | None) -> bool | None:
+        if status is None:
+            return None
+        pid = status.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+        return True
+
+    def end_maintenance(self, lease: MaintenanceLease | Path) -> None:
+        lock_path = lease.path if isinstance(lease, MaintenanceLease) else lease
+        token = lease.token if isinstance(lease, MaintenanceLease) else None
+        try:
+            lock_path.unlink(missing_ok=True)
+            drained_path = self.storage_root / MAINTENANCE_DRAINED_FILENAME
+            if token is None:
+                drained_path.unlink(missing_ok=True)
+            else:
+                drained = self._read_json_object(drained_path)
+                if drained is not None and drained.get("token") == token:
+                    drained_path.unlink(missing_ok=True)
+        finally:
+            if self._settings.fsync_storage_writes:
+                self._fsync_directory(self.storage_root)
+
+    def _read_json_object(self, path: Path) -> dict[str, object] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def clear_mail_data(self) -> int:
         moved_directories = 0

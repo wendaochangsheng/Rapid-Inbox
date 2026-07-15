@@ -231,4 +231,18 @@ Statement SqliteDb::prepare(const std::string& sql) {
     return Statement(db_, statement, sql);
 }
 
+Statement SqliteDb::prepare_persistent(const std::string& sql) {
+    sqlite3_stmt* statement = nullptr;
+    const int rc = sqlite3_prepare_v3(
+        db_, sql.c_str(), -1, SQLITE_PREPARE_PERSISTENT, &statement, nullptr);
+    if (rc != SQLITE_OK) {
+        throw sqlite_error(db_, rc, "sqlite persistent prepare failed for SQL [" + sql + "]");
+    }
+    if (statement == nullptr) {
+        throw std::runtime_error("sqlite persistent prepare produced no statement for SQL [" +
+                                 sql + "]");
+    }
+    return Statement(db_, statement, sql);
+}
+
 }  // namespace rapid_inbox::ingestd

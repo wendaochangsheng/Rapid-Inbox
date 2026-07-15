@@ -250,6 +250,59 @@ void test_domain_matcher_plus_and_case_modes() {
     }
 }
 
+void test_domain_matcher_enforces_mailbox_syntax_and_length_limits() {
+    using rapid_inbox::ingestd::parse_mailbox_address;
+    const std::string local_64(64, 'a');
+    test::check(parse_mailbox_address(local_64 + "@example.com").has_value(),
+                "64-byte local part is accepted");
+    test::check(!parse_mailbox_address(std::string(65, 'a') + "@example.com").has_value(),
+                "65-byte local part is rejected");
+    test::check(!parse_mailbox_address(".user@example.com").has_value(),
+                "leading local dot is rejected");
+    test::check(!parse_mailbox_address("user.@example.com").has_value(),
+                "trailing local dot is rejected");
+    test::check(!parse_mailbox_address("user..tag@example.com").has_value(),
+                "consecutive local dots are rejected");
+    test::check(!parse_mailbox_address("user name@example.com").has_value(),
+                "local whitespace is rejected");
+    test::check(!parse_mailbox_address("user@@example.com").has_value(),
+                "multiple at signs are rejected");
+    test::check(!parse_mailbox_address("user@example.com.").has_value(),
+                "trailing mailbox domain dot is rejected");
+    test::check(!parse_mailbox_address("user@ example.com").has_value(),
+                "mailbox domain whitespace is rejected");
+    test::check(!parse_mailbox_address("user@bad_domain.example").has_value(),
+                "non-LDH mailbox domain is rejected");
+
+    const std::string utf8_address = "\xC3\x9C" "ser@example.com";
+    test::check(parse_mailbox_address(utf8_address, true).has_value(),
+                "SMTPUTF8 local part is accepted when enabled");
+    test::check(!parse_mailbox_address(utf8_address, false).has_value(),
+                "SMTPUTF8 local part is rejected when disabled");
+
+    const std::string domain_253 = std::string(63, 'a') + "." + std::string(63, 'b') +
+                                   "." + std::string(63, 'c') + "." + std::string(61, 'd');
+    test::check(domain_253.size() == 253, "test domain reaches DNS maximum");
+    test::check(rapid_inbox::ingestd::normalize_domain(domain_253) == domain_253,
+                "253-byte domain is accepted for domain configuration");
+    test::check(!parse_mailbox_address("a@" + domain_253).has_value(),
+                "mailbox path enforces the 254-byte total limit");
+    require_normalize_rejects(domain_253 + "e", "domain over 253 bytes is rejected");
+
+    DomainMatcher strip_matcher({
+        DomainRule{
+            .domain_id = 20,
+            .root_domain_ascii = "example.com",
+            .accept_exact = true,
+            .accept_subdomains = true,
+            .plus_addressing_mode = "strip",
+            .local_part_case_sensitive = false,
+        },
+    });
+    test::check(!strip_matcher.match_address("foo.+tag@example.com").has_value(),
+                "plus stripping cannot create an invalid trailing-dot local part");
+}
+
 void test_domain_matcher_normalizes_unicode_domain_to_idna() {
     test::check(rapid_inbox::ingestd::normalize_domain(
                     "\xC2\xA0" "example.com" "\xC2\xA0") == "example.com",
@@ -260,34 +313,9 @@ void test_domain_matcher_normalizes_unicode_domain_to_idna() {
     test::check(rapid_inbox::ingestd::normalize_domain(
                     "\xE2\x80\x83" "example.com" "\xE2\x80\x89") == "example.com",
                 "unicode em and thin spaces at domain edges are stripped");
-    test::check(rapid_inbox::ingestd::normalize_domain("-bad.com") == "-bad.com",
-                "python idna accepts leading hyphen ASCII labels");
-    test::check(rapid_inbox::ingestd::normalize_domain("bad-.com") == "bad-.com",
-                "python idna accepts trailing hyphen ASCII labels");
-    test::check(rapid_inbox::ingestd::normalize_domain("a_b.com") == "a_b.com",
-                "python idna accepts underscore ASCII labels");
-    test::check(rapid_inbox::ingestd::normalize_domain("bad com.com") == "bad com.com",
-                "python idna accepts ASCII space inside labels");
-    test::check(rapid_inbox::ingestd::normalize_domain("bad/com.com") == "bad/com.com",
-                "python idna accepts ASCII slash inside labels");
     test::check(rapid_inbox::ingestd::normalize_domain(std::string(63, 'a') + ".com") ==
                     std::string(63, 'a') + ".com",
                 "63-byte ASCII label is accepted");
-    test::check(rapid_inbox::ingestd::normalize_domain("\xEF\xBC\xA1-.com") == "a-.com",
-                "python idna maps fullwidth A before ASCII length checks");
-    test::check(rapid_inbox::ingestd::normalize_domain("\xE2\x91\xA0-.com") == "1-.com",
-                "python idna maps circled digit one before ASCII length checks");
-    test::check(rapid_inbox::ingestd::normalize_domain("a\xCC\x81-.com") ==
-                    "xn----tfa.com",
-                "python idna normalizes combining acute before punycode");
-    test::check(rapid_inbox::ingestd::normalize_domain("\xCF\x82-.com") ==
-                    "xn----zmb.com",
-                "python idna folds greek final sigma before punycode");
-    test::check(rapid_inbox::ingestd::normalize_domain("\xC3\x9F-.de") == "ss-.de",
-                "python idna maps sharp s to ss before ASCII length checks");
-    test::check(rapid_inbox::ingestd::normalize_domain("stra" "\xC3\x9F" "e-.de") ==
-                    "strasse-.de",
-                "python idna maps sharp s inside labels before ASCII length checks");
     test::check(rapid_inbox::ingestd::normalize_domain(
                     "\xE4\xBE\x8B\xE5\xAD\x90\xE3\x80\x82\xE6\xB5\x8B\xE8\xAF\x95") ==
                     "xn--fsqu00a.xn--0zwm56d",
@@ -307,6 +335,13 @@ void test_domain_matcher_normalizes_unicode_domain_to_idna() {
 
     require_normalize_rejects("bad..com", "empty interior ASCII label is rejected");
     require_normalize_rejects(".leading.com", "leading empty ASCII label is rejected");
+    require_normalize_rejects("-bad.com", "leading hyphen is rejected");
+    require_normalize_rejects("bad-.com", "trailing hyphen is rejected");
+    require_normalize_rejects("a_b.com", "underscore in domain is rejected");
+    require_normalize_rejects("bad com.com", "space in domain is rejected");
+    require_normalize_rejects("bad/com.com", "slash in domain is rejected");
+    require_normalize_rejects("\xEF\xBC\xA1-.com",
+                              "unicode label with trailing hyphen is rejected");
     require_normalize_rejects(std::string(64, 'a') + ".com",
                               "64-byte ASCII label is rejected");
     require_normalize_rejects("\xEE\x80\x80.com",
@@ -363,79 +398,6 @@ void test_domain_matcher_normalizes_unicode_domain_to_idna() {
     {
         DomainMatcher matcher({
             DomainRule{
-                .domain_id = 6,
-                .root_domain_ascii = "-bad.com",
-                .accept_exact = true,
-                .accept_subdomains = true,
-                .plus_addressing_mode = "keep",
-                .local_part_case_sensitive = false,
-            },
-        });
-
-        const DomainMatch match = require_match(matcher, "User@-bad.com");
-        test::check(match.domain_id == 6, "leading hyphen ASCII label domain id");
-        test::check(match.address_canonical == "user@-bad.com",
-                    "leading hyphen ASCII label canonical address");
-    }
-
-    {
-        DomainMatcher matcher({
-            DomainRule{
-                .domain_id = 7,
-                .root_domain_ascii = "bad-.com",
-                .accept_exact = true,
-                .accept_subdomains = true,
-                .plus_addressing_mode = "keep",
-                .local_part_case_sensitive = false,
-            },
-        });
-
-        const DomainMatch match = require_match(matcher, "User@bad-.com");
-        test::check(match.domain_id == 7, "trailing hyphen ASCII label domain id");
-        test::check(match.address_canonical == "user@bad-.com",
-                    "trailing hyphen ASCII label canonical address");
-    }
-
-    {
-        DomainMatcher matcher({
-            DomainRule{
-                .domain_id = 8,
-                .root_domain_ascii = "bad/com.com",
-                .accept_exact = true,
-                .accept_subdomains = true,
-                .plus_addressing_mode = "keep",
-                .local_part_case_sensitive = false,
-            },
-        });
-
-        const DomainMatch match = require_match(matcher, "User@bad/com.com");
-        test::check(match.domain_id == 8, "ASCII slash label domain id");
-        test::check(match.address_canonical == "user@bad/com.com",
-                    "ASCII slash label canonical address");
-    }
-
-    {
-        DomainMatcher matcher({
-            DomainRule{
-                .domain_id = 10,
-                .root_domain_ascii = "a-.com",
-                .accept_exact = true,
-                .accept_subdomains = true,
-                .plus_addressing_mode = "keep",
-                .local_part_case_sensitive = false,
-            },
-        });
-
-        const DomainMatch match = require_match(matcher, "User@\xEF\xBC\xA1-.com");
-        test::check(match.domain_id == 10, "fullwidth normalized domain id");
-        test::check(match.domain_ascii == "a-.com", "fullwidth normalized domain");
-        test::check(match.address_canonical == "user@a-.com",
-                    "fullwidth normalized canonical address");
-    }
-
-    {
-        DomainMatcher matcher({
-            DomainRule{
                 .domain_id = 11,
                 .root_domain_ascii = "xn--kz9a.com",
                 .accept_exact = true,
@@ -455,10 +417,9 @@ void test_domain_matcher_normalizes_unicode_domain_to_idna() {
     test::check(rapid_inbox::ingestd::normalize_domain("stra" "\xC3\x9F" "e.de") == "strasse.de",
                 "unicode domain normalizes to IDNA transitional form");
 
-    const std::string python_loose_domain = "ma" "\xC3\xB1" "ana-.com";
-    test::check(rapid_inbox::ingestd::normalize_domain(python_loose_domain) ==
-                    "xn--maana--xwa.com",
-                "python idna accepts trailing hyphen after unicode label conversion");
+    const std::string invalid_unicode_edge_domain = "ma" "\xC3\xB1" "ana-.com";
+    require_normalize_rejects(invalid_unicode_edge_domain,
+                              "unicode label with trailing hyphen is rejected");
 
     DomainMatcher matcher({
         DomainRule{
@@ -480,26 +441,6 @@ void test_domain_matcher_normalizes_unicode_domain_to_idna() {
     test::check(match.address_canonical == "user@strasse.de",
                 "idna canonical address");
 
-    DomainMatcher loose_idna_matcher({
-        DomainRule{
-            .domain_id = 9,
-            .root_domain_ascii = "xn--maana--xwa.com",
-            .accept_exact = true,
-            .accept_subdomains = true,
-            .plus_addressing_mode = "keep",
-            .local_part_case_sensitive = false,
-        },
-    });
-
-    const DomainMatch loose_idna_match = require_match(loose_idna_matcher,
-                                                       "User@" + python_loose_domain);
-
-    test::check(loose_idna_match.domain_id == 9, "python loose idna domain id");
-    test::check(loose_idna_match.domain_ascii == "xn--maana--xwa.com",
-                "python loose idna normalized domain");
-    test::check(loose_idna_match.address_canonical == "user@xn--maana--xwa.com",
-                "python loose idna canonical address");
-
     DomainMatcher idna_matcher({
         DomainRule{
             .domain_id = 4,
@@ -520,4 +461,23 @@ void test_domain_matcher_normalizes_unicode_domain_to_idna() {
                 "python idna example normalized domain");
     test::check(idna_match.address_canonical == "inbox@xn--fsqu00a.xn--0zwm56d",
                 "python idna example canonical address");
+}
+
+void test_domain_matcher_uses_explicit_catch_all_as_fallback() {
+    DomainMatcher matcher({
+        DomainRule{1, "managed.example", true, true, "keep", false},
+        DomainRule{9, "*", true, true, "strip", false},
+    });
+
+    const DomainMatch managed = require_match(matcher, "User@managed.example");
+    test::check(managed.domain_id == 1, "specific route wins before catch-all");
+
+    const DomainMatch fallback = require_match(matcher, "User+tag@Other.Example");
+    test::check(fallback.domain_id == 9, "catch-all domain id");
+    test::check(fallback.root_domain_ascii == "*", "catch-all root retained");
+    test::check(fallback.domain_ascii == "other.example", "actual recipient domain retained");
+    test::check(fallback.address_canonical == "user@other.example",
+                "catch-all policy canonicalizes local part");
+    test::check(!matcher.match_address("@other.example").has_value(),
+                "catch-all rejects empty local part");
 }

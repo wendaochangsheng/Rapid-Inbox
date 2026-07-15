@@ -369,6 +369,115 @@
     line-height: 1.2;
   }
 
+  /* === Operational health and data plane === */
+  .health-panel {
+    display: grid;
+    grid-template-columns: minmax(180px, 0.32fr) minmax(0, 1fr);
+    gap: 20px;
+    padding: 18px 20px;
+    margin-bottom: 24px;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--success);
+    border-radius: var(--radius-lg);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-xs);
+  }
+  .health-panel[data-state="warning"] { border-left-color: var(--warning); }
+  .health-panel[data-state="danger"] { border-left-color: var(--danger); }
+  .health-panel__summary { display: grid; align-content: start; gap: 6px; }
+  .health-panel__eyebrow {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+  }
+  .health-panel__state {
+    font-family: var(--font-serif);
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: var(--success-strong);
+  }
+  .health-panel[data-state="warning"] .health-panel__state { color: var(--warning-strong); }
+  .health-panel[data-state="danger"] .health-panel__state { color: var(--danger-strong); }
+  .health-panel__time { color: var(--text-faint); font-size: 0.78rem; }
+  .health-alerts { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+  .health-alert {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-subtle);
+  }
+  .health-alert__dot {
+    width: 8px;
+    height: 8px;
+    margin-top: 5px;
+    border-radius: 50%;
+    background: var(--text-faint);
+  }
+  .health-alert[data-severity="warning"] .health-alert__dot { background: var(--warning); }
+  .health-alert[data-severity="danger"] .health-alert__dot { background: var(--danger); }
+  .health-alert strong { display: block; color: var(--text); font-size: 0.84rem; }
+  .health-alert span { color: var(--text-muted); font-size: 0.8rem; line-height: 1.4; }
+  .health-empty { color: var(--text-muted); font-size: 0.86rem; align-self: center; }
+
+  .ops-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+  }
+  .ops-card {
+    display: grid;
+    align-content: start;
+    gap: 13px;
+    min-width: 0;
+    padding: 17px 18px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-xs);
+  }
+  .ops-card__head { display: flex; align-items: center; gap: 8px; }
+  .ops-card__head svg { width: 16px; height: 16px; color: var(--accent-strong); }
+  .ops-card__head h3 { margin: 0; font: 600 0.88rem/1.2 var(--font-sans); }
+  .ops-metrics { display: grid; gap: 8px; margin: 0; }
+  .ops-metric {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: baseline;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-faint);
+  }
+  .ops-metric dt { color: var(--text-muted); font-size: 0.78rem; }
+  .ops-metric dd { margin: 0; color: var(--text); font: 600 0.88rem/1.2 var(--font-mono); }
+  .ops-metric code { color: inherit; font-size: 0.78rem; overflow-wrap: anywhere; }
+
+  .task-card {
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-xs);
+  }
+  .task-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .task-table th, .task-table td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border-faint); }
+  .task-table tr:last-child td { border-bottom: 0; }
+  .task-table th {
+    color: var(--text-faint);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    background: var(--bg-subtle);
+  }
+  .task-table td { color: var(--text-muted); }
+  .task-table td:first-child { color: var(--text); font-weight: 600; }
+  .task-table code { color: inherit; font-size: 0.78rem; }
+
   @media (max-width: 1100px) {
     .stat-row, .totals-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .stat-tile, .totals-cell { border-right: 0; border-bottom: 1px solid var(--border-faint); }
@@ -376,12 +485,17 @@
     .stat-tile:nth-last-child(-n+2), .totals-cell:nth-last-child(-n+1) { border-bottom: 0; }
     .totals-strip .totals-cell:nth-child(odd) { border-right: 1px solid var(--border-faint); }
     .activity-grid { grid-template-columns: 1fr; gap: 18px; }
+    .ops-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 640px) {
     .dash-strip { flex-direction: column; align-items: flex-start; gap: 14px; }
     .stat-row, .totals-strip { grid-template-columns: 1fr; }
     .stat-tile, .totals-cell { border-right: 0; }
     .totals-strip .totals-cell:nth-child(odd) { border-right: 0; }
+    .health-panel { grid-template-columns: 1fr; }
+    .ops-grid { grid-template-columns: 1fr; }
+    .task-card { overflow-x: auto; }
+    .task-table { min-width: 680px; }
   }
 </style>
 {% endblock %}
@@ -402,6 +516,28 @@
   </div>
 </header>
 
+<section class="health-panel" data-state="{{ health.status }}" aria-labelledby="system-health-title">
+  <div class="health-panel__summary">
+    <span class="health-panel__eyebrow" id="system-health-title">系统健康</span>
+    <strong class="health-panel__state">
+      {% if health.status == "danger" %}需要立即处理{% elif health.status == "warning" %}存在风险{% else %}运行正常{% endif %}
+    </strong>
+    <span class="health-panel__time">快照 {{ cn_datetime(generated_at) }} · 缓存 {{ "%.1f" | format(cache.age_seconds) }} 秒</span>
+  </div>
+  {% if health.alerts %}
+    <ul class="health-alerts">
+      {% for alert in health.alerts %}
+        <li class="health-alert" data-severity="{{ alert.severity }}">
+          <span class="health-alert__dot" aria-hidden="true"></span>
+          <span><strong>{{ alert.title }}</strong><span>{{ alert.detail }}</span></span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <div class="health-empty">收件进程、数据库、磁盘、解析队列与后台维护任务均未发现异常。</div>
+  {% endif %}
+</section>
+
 <section class="dash-section" aria-labelledby="dash-live-title">
   <div class="dash-section__head">
     <h2 class="dash-section__title" id="dash-live-title">实时</h2>
@@ -415,6 +551,84 @@
         <span class="stat-tile__hint">{{ item.hint }}</span>
       </div>
     {% endfor %}
+  </div>
+</section>
+
+<section class="dash-section" aria-labelledby="dash-data-plane-title">
+  <div class="dash-section__head">
+    <h2 class="dash-section__title" id="dash-data-plane-title">数据面状态</h2>
+    <span class="dash-section__hint">收件、连接、API 延迟与存储容量</span>
+  </div>
+  <div class="ops-grid">
+    <article class="ops-card">
+      <header class="ops-card__head"><i data-lucide="mail-check"></i><h3>最近 24 小时</h3></header>
+      <dl class="ops-metrics">
+        <div class="ops-metric"><dt>独立邮件</dt><dd>{{ mail.received_last_day }}</dd></div>
+        <div class="ops-metric"><dt>收件人投递</dt><dd>{{ mail.deliveries_last_day }}</dd></div>
+        <div class="ops-metric"><dt>SMTP 拒绝</dt><dd>{{ mail.rejected_last_day }}</dd></div>
+        <div class="ops-metric"><dt>解析失败</dt><dd>{{ mail.parse_failures_last_day }}</dd></div>
+      </dl>
+    </article>
+    <article class="ops-card">
+      <header class="ops-card__head"><i data-lucide="server"></i><h3>C++ ingestd</h3></header>
+      <dl class="ops-metrics">
+        <div class="ops-metric">
+          <dt>进程状态</dt>
+          <dd>
+            {% if ingestd.state == "online" %}在线
+            {% elif ingestd.state == "stale" %}心跳过期
+            {% elif ingestd.state == "invalid" %}状态无效
+            {% else %}未发现{% endif %}
+          </dd>
+        </div>
+        <div class="ops-metric"><dt>实例</dt><dd><code>{{ ingestd.instance_id or "—" }}</code></dd></div>
+        <div class="ops-metric"><dt>PID</dt><dd>{{ ingestd.pid if ingestd.pid is not none else "—" }}</dd></div>
+        <div class="ops-metric">
+          <dt>心跳延迟</dt>
+          <dd>{% if ingestd.age_seconds is not none %}{{ "%.1f" | format(ingestd.age_seconds) }} s{% else %}—{% endif %}</dd>
+        </div>
+        <div class="ops-metric">
+          <dt>待写队列</dt>
+          <dd>
+            {% if ingestd.queue_messages is not none %}{{ ingestd.queue_messages }} / {{ cn_bytes(ingestd.queue_bytes) }}{% else %}—{% endif %}
+          </dd>
+        </div>
+        <div class="ops-metric">
+          <dt>实时连接</dt>
+          <dd>
+            {% if ingestd.active_connections is not none %}{{ ingestd.active_connections }}{% if ingestd.max_connections is not none %} / {{ ingestd.max_connections }}{% endif %}{% else %}—{% endif %}
+          </dd>
+        </div>
+      </dl>
+    </article>
+    <article class="ops-card">
+      <header class="ops-card__head"><i data-lucide="network"></i><h3>SMTP 与解析</h3></header>
+      <dl class="ops-metrics">
+        <div class="ops-metric"><dt>已知实时连接</dt><dd>{{ smtp.active_connections }}</dd></div>
+        <div class="ops-metric"><dt>Python 兼容监听器</dt><dd>{{ smtp.python_active_connections }}</dd></div>
+        <div class="ops-metric"><dt>数据库 open 会话</dt><dd>{{ smtp.open_sessions }}</dd></div>
+        <div class="ops-metric"><dt>内存队列</dt><dd>{{ parse_queue.queued }}</dd></div>
+        <div class="ops-metric"><dt>持久化待解析</dt><dd>{{ parse_queue.pending_messages }}</dd></div>
+      </dl>
+    </article>
+    <article class="ops-card">
+      <header class="ops-card__head"><i data-lucide="gauge"></i><h3>HTTP / API</h3></header>
+      <dl class="ops-metrics">
+        <div class="ops-metric"><dt>请求速率</dt><dd>{% if http.requests_per_second is not none %}{{ "%.2f" | format(http.requests_per_second) }}/s{% else %}—{% endif %}</dd></div>
+        <div class="ops-metric"><dt>P95 延迟</dt><dd>{% if http.p95_ms is not none %}{{ "%.1f" | format(http.p95_ms) }} ms{% else %}—{% endif %}</dd></div>
+        <div class="ops-metric"><dt>平均延迟</dt><dd>{% if http.average_ms is not none %}{{ "%.1f" | format(http.average_ms) }} ms{% else %}—{% endif %}</dd></div>
+        <div class="ops-metric"><dt>累计 / 处理中</dt><dd>{{ http.requests_total }} / {{ http.requests_in_flight }}</dd></div>
+      </dl>
+    </article>
+    <article class="ops-card">
+      <header class="ops-card__head"><i data-lucide="database"></i><h3>数据库与磁盘</h3></header>
+      <dl class="ops-metrics">
+        <div class="ops-metric"><dt>SQLite 主库</dt><dd>{{ cn_bytes(database.database_bytes) }}</dd></div>
+        <div class="ops-metric"><dt>WAL</dt><dd>{{ cn_bytes(database.wal_bytes) }}</dd></div>
+        <div class="ops-metric"><dt>磁盘占用</dt><dd>{% if disk.ok %}{{ "%.1f" | format(disk.used_percent) }}%{% else %}未知{% endif %}</dd></div>
+        <div class="ops-metric"><dt>可用空间</dt><dd>{{ cn_bytes(disk.free_bytes) }}</dd></div>
+      </dl>
+    </article>
   </div>
 </section>
 
@@ -570,6 +784,34 @@
         <div class="feed-empty">暂无域名记录。</div>
       {% endif %}
     </div>
+  </div>
+</section>
+
+<section class="dash-section" aria-labelledby="dash-maintenance-title">
+  <div class="dash-section__head">
+    <h2 class="dash-section__title" id="dash-maintenance-title">后台任务与清理</h2>
+    <span class="dash-section__hint">
+      最近清理：{% if cleanup.status == "success" %}成功{% elif cleanup.status == "failure" %}失败{% else %}尚无运行数据{% endif %}
+    </span>
+  </div>
+  <div class="task-card">
+    <table class="task-table">
+      <thead><tr><th>任务</th><th>状态</th><th>最近成功</th><th>最近错误</th><th>连续失败</th><th>累计成功 / 失败</th></tr></thead>
+      <tbody>
+        {% for task_name, task in background_tasks.items() %}
+          <tr>
+            <td>{% if task_name == "message_retention" %}过期邮件清理{% elif task_name == "pending_parse_scan" %}待解析恢复扫描{% else %}<code>{{ task_name }}</code>{% endif %}</td>
+            <td><span class="pill {% if task.status == 'ok' %}pill--success{% elif task.status == 'danger' %}pill--danger{% else %}pill--warning{% endif %}">{{ "运行中" if task.running else "已停止" }}</span></td>
+            <td>{{ cn_datetime(task.last_success_at) if task.last_success_at else "尚无" }}</td>
+            <td>{% if task.last_error_at %}{{ cn_datetime(task.last_error_at) }} · {{ task.last_error_type or "未知错误" }}{% else %}无{% endif %}</td>
+            <td>{{ task.consecutive_failures }}</td>
+            <td>{{ task.total_successes }} / {{ task.total_failures }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6">尚未注册后台任务。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
 </section>
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from app.http.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, build_pagination_context
 from app.services.attachments import AttachmentService
@@ -22,6 +22,37 @@ def _attachment_service(request: Request) -> AttachmentService:
     return AttachmentService(runtime, _message_service(request))
 
 
+def _render_template(
+    request: Request,
+    template_name: str,
+    context: dict,
+    *,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    return request.app.state.templates.TemplateResponse(
+        request,
+        template_name,
+        context,
+        headers=headers,
+    )
+
+
+async def _render_async(
+    request: Request,
+    template_name: str,
+    context: dict,
+    *,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    return await asyncio.to_thread(
+        _render_template,
+        request,
+        template_name,
+        context,
+        headers=headers,
+    )
+
+
 def _parse_live_cursor(cursor: str | None) -> tuple[str, int] | None:
     if cursor is None:
         return None
@@ -36,8 +67,8 @@ def _parse_live_cursor(cursor: str | None) -> tuple[str, int] | None:
 
 
 @router.get("/", response_class=HTMLResponse)
-async def home_page(request: Request) -> HTMLResponse:
-    return request.app.state.templates.TemplateResponse(
+async def home_page(request: Request) -> Response:
+    return await _render_async(
         request,
         "public/home.html",
         {
@@ -54,7 +85,7 @@ async def mailbox_page(
     request: Request,
     limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(default=0, ge=0, le=1_000_000),
-) -> HTMLResponse:
+) -> Response:
     service = _message_service(request)
     try:
         mailbox = await service.get_public_mailbox_view(
@@ -74,7 +105,7 @@ async def mailbox_page(
     )
     _, live_cursor = request.app.state.runtime.live_state.snapshot_state()
     mailbox_live_enabled = mailbox["offset"] == 0
-    return request.app.state.templates.TemplateResponse(
+    return await _render_async(
         request,
         "public/mailbox.html",
         {
@@ -153,14 +184,14 @@ async def mailbox_websocket(mailbox_address: str, websocket: WebSocket) -> None:
 
 
 @router.get("/mail/{mailbox_address}/{delivery_id}", response_class=HTMLResponse)
-async def message_page(mailbox_address: str, delivery_id: str, request: Request) -> HTMLResponse:
+async def message_page(mailbox_address: str, delivery_id: str, request: Request) -> Response:
     service = _message_service(request)
     try:
         detail = await service.get_public_delivery_detail(mailbox_address, delivery_id, surface="web")
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     detail["page_title"] = detail.get("subject") or "邮件详情"
-    return request.app.state.templates.TemplateResponse(
+    return await _render_async(
         request,
         "public/message.html",
         detail,
@@ -171,25 +202,28 @@ async def message_page(mailbox_address: str, delivery_id: str, request: Request)
 async def message_raw(mailbox_address: str, delivery_id: str, request: Request) -> Response:
     service = _message_service(request)
     try:
-        raw_bytes = await service.get_public_raw_message(mailbox_address, delivery_id, surface="web")
+        raw_file = await service.get_public_raw_file(mailbox_address, delivery_id, surface="web")
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return Response(raw_bytes, media_type="message/rfc822")
+    return FileResponse(raw_file["path"], media_type="message/rfc822", filename=f"{delivery_id}.eml")
 
 
 @router.get("/mail/{mailbox_address}/{delivery_id}/html", response_class=HTMLResponse)
-async def message_html_frame(mailbox_address: str, delivery_id: str, request: Request) -> HTMLResponse:
+async def message_html_frame(mailbox_address: str, delivery_id: str, request: Request) -> Response:
     service = _message_service(request)
     try:
-        srcdoc = await service.get_public_html_preview_srcdoc(mailbox_address, delivery_id, surface="web")
+        preview = await service.get_public_html_preview(mailbox_address, delivery_id, surface="web")
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return request.app.state.templates.TemplateResponse(
+    return await _render_async(
         request,
         "public/html_frame.html",
-        {"page_title": "网页预览", "srcdoc": srcdoc},
+        {"page_title": "网页预览", "srcdoc": preview["srcdoc"]},
         headers={
             "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+            "X-Preview-Body-Truncated": "1" if preview["html_body_truncated"] else "0",
+            "X-Preview-Inline-Embedded": str(preview["inline_preview_embedded_count"]),
+            "X-Preview-Inline-Skipped": str(preview["inline_preview_skipped_count"]),
         },
     )
 
@@ -203,7 +237,7 @@ async def message_attachment(
 ) -> Response:
     service = _attachment_service(request)
     try:
-        attachment = await service.get_delivery_attachment(
+        attachment = await service.get_delivery_attachment_file(
             mailbox_address,
             delivery_id,
             attachment_id,
@@ -211,8 +245,9 @@ async def message_attachment(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return Response(
-        attachment["content"],
+    return FileResponse(
+        attachment["path"],
         media_type=attachment.get("content_type") or "application/octet-stream",
+        filename=attachment.get("safe_filename") or "attachment.bin",
         headers=service.build_attachment_response_headers(attachment),
     )

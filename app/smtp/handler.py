@@ -129,6 +129,8 @@ class RapidInboxHandler:
         message_id = None
         if result.startswith("250 queued as "):
             message_id = result.removeprefix("250 queued as ").strip() or None
+        else:
+            return result
         await self._publish_session_event(
             session_id,
             {
@@ -215,15 +217,12 @@ class RapidInboxHandler:
         limit = int(self.runtime.get_settings()["max_message_size_bytes"])
         seen_domain_ids: set[int] = set()
         for rcpt_to in rcpt_tos:
-            match = self.runtime.domains.match_address(rcpt_to)
+            match, domain_limit = self.runtime.domains.match_address_with_size_limit(rcpt_to)
             if match is None or match.domain_id in seen_domain_ids:
                 continue
             seen_domain_ids.add(match.domain_id)
-            try:
-                domain = self.runtime.domains.get_domain(match.domain_id)
-            except LookupError:
-                continue
-            limit = min(limit, int(domain["max_message_size_bytes"]))
+            if domain_limit is not None:
+                limit = min(limit, domain_limit)
         return limit
 
     def _schedule_transport_close(self, server) -> None:

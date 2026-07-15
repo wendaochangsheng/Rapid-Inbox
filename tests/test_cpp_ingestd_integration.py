@@ -203,7 +203,7 @@ async def test_cpp_ingestd_attachment_visible_to_python_runtime(tmp_path: Path) 
     runtime = RapidInboxRuntime(settings)
     await runtime.start()
     try:
-        await runtime.create_domain("adb.com")
+        await runtime.create_domain("adb.com", public_web_enabled=True)
     finally:
         await runtime.stop()
 

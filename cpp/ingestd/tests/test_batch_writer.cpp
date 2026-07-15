@@ -5,9 +5,13 @@
 
 #include <sqlite3.h>
 
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace test {
@@ -56,6 +60,33 @@ rapid_inbox::ingestd::MailJob sample_job() {
     return job;
 }
 
+void initialize_schema(rapid_inbox::ingestd::SqliteDb& db) {
+    const fs::path schema_path = fs::path(RAPID_INBOX_REPO_ROOT) / "sqlite_schema.sql";
+    std::ifstream schema(schema_path);
+    std::string sql((std::istreambuf_iterator<char>(schema)),
+                    std::istreambuf_iterator<char>());
+    db.exec(sql);
+}
+
+rapid_inbox::ingestd::MailJob mailbox_job(
+    const std::string& message_id,
+    const std::string& delivery_id,
+    const std::string& session_id,
+    const std::string& received_at,
+    rapid_inbox::ingestd::DomainMatch match,
+    const std::string& rcpt_to) {
+    rapid_inbox::ingestd::MailJob job = sample_job();
+    job.message_id = message_id;
+    job.smtp_session_id = session_id;
+    job.received_at = received_at;
+    job.raw_path = rapid_inbox::ingestd::raw_message_path(message_id, received_at);
+    job.manifest_path = rapid_inbox::ingestd::manifest_path(message_id, received_at);
+    job.recipients.clear();
+    job.recipients.push_back(
+        {delivery_id, rcpt_to, std::move(match), sample_policy()});
+    return job;
+}
+
 std::string read_text_file(const fs::path& path) {
     std::ifstream input(path);
     return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
@@ -98,6 +129,23 @@ void test_batch_writer_writes_raw_and_manifest() {
                 "manifest message id");
     test::check(manifest_content.find("\"rcpt_to\":\"code@adb.com\"") != std::string::npos,
                 "manifest recipient");
+}
+
+void test_batch_writer_writes_quarantine_error_record() {
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-quarantine";
+    fs::remove_all(root);
+    rapid_inbox::ingestd::BatchWriter writer(root, root / "unused.db", 5000, false);
+    const rapid_inbox::ingestd::MailJob job = sample_job();
+
+    writer.write_quarantine_record(job, "permanent failure", 3);
+
+    const fs::path record = root / "quarantine/2026/05/12/msg_1.error.json";
+    test::check(fs::is_regular_file(record), "quarantine record exists");
+    const std::string content = read_text_file(record);
+    test::check(content.find("\"attempts\":3") != std::string::npos,
+                "quarantine record includes attempts");
+    test::check(content.find("permanent failure") != std::string::npos,
+                "quarantine record includes error");
 }
 
 void test_batch_writer_writes_private_storage_permissions() {
@@ -261,6 +309,7 @@ void test_batch_writer_writes_sqlite_parsed_records() {
     rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
     const rapid_inbox::ingestd::MailJob job = sample_job();
     writer.write_batch({job});
+    writer.write_batch({job});
 
     rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
     auto message = db.prepare(
@@ -310,8 +359,8 @@ void test_batch_writer_writes_sqlite_parsed_records() {
     test::check(mailbox.step_row(), "mailbox row exists");
     test::check(sqlite3_column_int(mailbox.get(), 0) == 1, "mailbox count");
 
-    auto delivery =
-        db.prepare("SELECT id, rcpt_to FROM message_deliveries WHERE message_id = 'msg_1'");
+    auto delivery = db.prepare(
+        "SELECT id, rcpt_to, expires_at FROM message_deliveries WHERE message_id = 'msg_1'");
     test::check(delivery.step_row(), "delivery exists");
     test::check(std::string(reinterpret_cast<const char*>(sqlite3_column_text(delivery.get(), 0))) ==
                     "dlv_1",
@@ -319,6 +368,9 @@ void test_batch_writer_writes_sqlite_parsed_records() {
     test::check(std::string(reinterpret_cast<const char*>(sqlite3_column_text(delivery.get(), 1))) ==
                     "code@adb.com",
                 "delivery rcpt");
+    test::check(std::string(reinterpret_cast<const char*>(sqlite3_column_text(delivery.get(), 2))) ==
+                    "2026-05-19T03:04:05Z",
+                "delivery expiry follows domain retention snapshot");
 
     auto session = db.prepare("SELECT remote_ip, status, message_count, bytes_received, "
                               "last_command_at FROM smtp_sessions WHERE id = 'smtp_1'");
@@ -338,7 +390,7 @@ void test_batch_writer_writes_sqlite_parsed_records() {
                 "smtp last command at");
 
     auto metric = db.prepare("SELECT deliveries FROM mail_metric_buckets WHERE bucket_ts = "
-                             "'2026-05-12T03:04:05Z'");
+                             "'2026-05-12T03:04:00Z'");
     test::check(metric.step_row(), "metric bucket exists");
     test::check(sqlite3_column_int(metric.get(), 0) == 1, "metric deliveries");
 }
@@ -389,6 +441,139 @@ void test_batch_writer_marks_parse_failure_without_rejecting_raw() {
     test::check(manifest_content.find("\"parse_error\":\"invalid multipart boundary\"") !=
                     std::string::npos,
                 "failed manifest parse error");
+}
+
+void test_batch_writer_aggregates_minute_metrics_idempotently() {
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-minute-metrics";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        initialize_schema(db);
+        db.exec("INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, created_at, "
+                "updated_at) VALUES (1, 'adb.com', 'adb.com', '2026-05-12T03:04:00Z', "
+                "'2026-05-12T03:04:00Z')");
+        db.exec("INSERT INTO mail_metric_buckets "
+                "(bucket_ts, received, deliveries, parse_failures, rejected) "
+                "VALUES ('2026-05-12T03:04:00Z', 0, 0, 0, 7)");
+        db.exec("CREATE TABLE metric_write_observer (writes INTEGER NOT NULL)");
+        db.exec("INSERT INTO metric_write_observer (writes) VALUES (0)");
+        db.exec("CREATE TRIGGER observe_metric_update "
+                "AFTER UPDATE ON mail_metric_buckets BEGIN "
+                "UPDATE metric_write_observer SET writes = writes + 1; END");
+    }
+
+    rapid_inbox::ingestd::MailJob parsed_job = sample_job();
+    rapid_inbox::ingestd::DomainMatch other_match{
+        1, "adb.com", "adb.com", "other", "other", "other@adb.com"};
+    parsed_job.recipients.push_back(
+        {"dlv_2", "other@adb.com", std::move(other_match), sample_policy()});
+
+    rapid_inbox::ingestd::MailJob failed_job = sample_job();
+    failed_job.smtp_session_id = "smtp_2";
+    failed_job.message_id = "msg_2";
+    failed_job.received_at = "2026-05-12T03:04:59Z";
+    failed_job.raw_path =
+        rapid_inbox::ingestd::raw_message_path(failed_job.message_id, failed_job.received_at);
+    failed_job.manifest_path =
+        rapid_inbox::ingestd::manifest_path(failed_job.message_id, failed_job.received_at);
+    failed_job.recipients[0].delivery_id = "dlv_3";
+    failed_job.raw_content =
+        "Subject: Broken\r\n"
+        "Content-Type: multipart/mixed; boundary=\"missing\"\r\n"
+        "\r\n"
+        "body without boundary\r\n";
+
+    rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
+    writer.write_batch({parsed_job, failed_job, failed_job});
+
+    rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+    auto metric = db.prepare(
+        "SELECT bucket_ts, received, deliveries, parse_failures, rejected "
+        "FROM mail_metric_buckets");
+    test::check(metric.step_row(), "minute metric bucket exists");
+    test::check(std::string(reinterpret_cast<const char*>(sqlite3_column_text(metric.get(), 0))) ==
+                    "2026-05-12T03:04:00Z",
+                "metric timestamp is truncated to the minute");
+    test::check(sqlite3_column_int(metric.get(), 1) == 2,
+                "metric received counts only new messages");
+    test::check(sqlite3_column_int(metric.get(), 2) == 3,
+                "metric deliveries count persisted deliveries");
+    test::check(sqlite3_column_int(metric.get(), 3) == 1,
+                "metric parse failures count only new failed messages");
+    test::check(sqlite3_column_int(metric.get(), 4) == 7,
+                "metric upsert preserves rejected count");
+    test::check(!metric.step_row(), "same-minute messages share one metric bucket");
+
+    auto writes = db.prepare("SELECT writes FROM metric_write_observer");
+    test::check(writes.step_row(), "metric write observer exists");
+    test::check(sqlite3_column_int(writes.get(), 0) == 1,
+                "batch writes each minute metric once");
+
+    writer.write_batch({parsed_job, failed_job});
+
+    auto repeated_metric = db.prepare(
+        "SELECT received, deliveries, parse_failures, rejected FROM mail_metric_buckets");
+    test::check(repeated_metric.step_row(), "metric bucket remains after duplicate replay");
+    test::check(sqlite3_column_int(repeated_metric.get(), 0) == 2,
+                "duplicate replay does not increment received");
+    test::check(sqlite3_column_int(repeated_metric.get(), 1) == 3,
+                "duplicate replay does not increment deliveries");
+    test::check(sqlite3_column_int(repeated_metric.get(), 2) == 1,
+                "duplicate replay does not increment parse failures");
+    test::check(sqlite3_column_int(repeated_metric.get(), 3) == 7,
+                "duplicate replay preserves rejected count");
+
+    auto repeated_writes = db.prepare("SELECT writes FROM metric_write_observer");
+    test::check(repeated_writes.step_row(), "metric observer remains after duplicate replay");
+    test::check(sqlite3_column_int(repeated_writes.get(), 0) == 1,
+                "duplicate-only batch does not write metrics");
+}
+
+void test_batch_writer_accumulates_rejected_metrics() {
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-rejected-metrics";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        initialize_schema(db);
+        db.exec("INSERT INTO mail_metric_buckets "
+                "(bucket_ts, received, deliveries, parse_failures, rejected) "
+                "VALUES ('2026-05-12T03:04:00Z', 2, 3, 1, 7)");
+    }
+
+    rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
+    writer.write_rejected_metric("2026-05-12T03:04:01Z", 0);
+    test::check(writer.sqlite_stats().connections_opened == 0,
+                "zero rejected count is a connection-free no-op");
+
+    writer.write_rejected_metric("2026-05-12T03:04:05Z", 2);
+    writer.write_rejected_metric("2026-05-12T03:04:59Z", 3);
+    const auto stats = writer.sqlite_stats();
+    test::check(stats.connections_opened == 1,
+                "rejected metric writes reuse the persistent sqlite session");
+    test::check(stats.statement_sets_prepared == 1,
+                "rejected metric writes reuse prepared statements");
+
+    rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+    auto metric = db.prepare(
+        "SELECT bucket_ts, received, deliveries, parse_failures, rejected "
+        "FROM mail_metric_buckets");
+    test::check(metric.step_row(), "rejected metric bucket exists");
+    test::check(std::string(reinterpret_cast<const char*>(sqlite3_column_text(metric.get(), 0))) ==
+                    "2026-05-12T03:04:00Z",
+                "rejected metric uses minute granularity");
+    test::check(sqlite3_column_int(metric.get(), 1) == 2,
+                "rejected metric preserves received count");
+    test::check(sqlite3_column_int(metric.get(), 2) == 3,
+                "rejected metric preserves delivery count");
+    test::check(sqlite3_column_int(metric.get(), 3) == 1,
+                "rejected metric preserves parse failure count");
+    test::check(sqlite3_column_int(metric.get(), 4) == 12,
+                "rejected metric accumulates counts");
+    test::check(!metric.step_row(), "same-minute rejected writes share one bucket");
 }
 
 void test_batch_writer_writes_parsed_attachment_records() {
@@ -459,4 +644,649 @@ void test_batch_writer_writes_parsed_attachment_records() {
     test::check(fs::exists(root / storage_path), "attachment file exists");
     test::check(read_text_file(root / storage_path) == "Quarterly report\n",
                 "attachment file content");
+}
+
+void test_batch_writer_upgrades_catch_all_mailbox_without_downgrade() {
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-mailbox-upgrade";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        initialize_schema(db);
+        db.exec(
+            "INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, "
+            "plus_addressing_mode, local_part_case_sensitive, created_at, updated_at) VALUES "
+            "(1, '*', '任意域名', 'keep', 0, '2026-01-01T00:00:00Z', "
+            "'2026-01-01T00:00:00Z'), "
+            "(2, 'managed.example', 'managed.example', 'keep', 0, "
+            "'2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'), "
+            "(3, 'deep.managed.example', 'deep.managed.example', 'keep', 0, "
+            "'2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z');"
+            "INSERT INTO mailboxes (id, domain_id, local_part_canonical, rcpt_domain_ascii, "
+            "address_canonical, address_display, first_seen_at, last_seen_at, "
+            "latest_message_at, message_count) VALUES "
+            "(10, 1, 'code', 'managed.example', 'code@managed.example', "
+            "'code@managed.example', '2026-01-03T00:00:00Z', '2026-01-04T00:00:00Z', "
+            "'2026-01-04T00:00:00Z', 2), "
+            "(11, 2, 'other', 'deep.managed.example', 'other@deep.managed.example', "
+            "'other@deep.managed.example', '2026-01-05T00:00:00Z', "
+            "'2026-01-05T00:00:00Z', NULL, 0);"
+            "INSERT INTO messages (id, raw_path, raw_sha256, raw_size_bytes, received_at) VALUES "
+            "('hist_upgrade_1', 'raw/hist_upgrade_1.eml', 'one', 1, "
+            "'2026-01-03T00:00:00Z'), "
+            "('hist_upgrade_2', 'raw/hist_upgrade_2.eml', 'two', 1, "
+            "'2026-01-04T00:00:00Z');"
+            "INSERT INTO message_deliveries (id, message_id, mailbox_id, rcpt_to, delivered_at) "
+            "VALUES ('hist_upgrade_d1', 'hist_upgrade_1', 10, 'code@managed.example', "
+            "'2026-01-03T00:00:00Z'), "
+            "('hist_upgrade_d2', 'hist_upgrade_2', 10, 'code@managed.example', "
+            "'2026-01-04T00:00:00Z');");
+    }
+
+    rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
+    writer.write_batch({mailbox_job(
+        "managed_upgrade_new",
+        "managed_upgrade_delivery",
+        "managed_upgrade_session",
+        "2026-05-12T03:04:05Z",
+        rapid_inbox::ingestd::DomainMatch{
+            2, "managed.example", "managed.example", "Code", "code", "code@managed.example"},
+        "Code@managed.example")});
+
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        auto mailbox = db.prepare(
+            "SELECT id, domain_id, local_part_canonical, rcpt_domain_ascii, message_count "
+            "FROM mailboxes WHERE address_canonical = 'code@managed.example'");
+        test::check(mailbox.step_row(), "upgraded mailbox exists");
+        test::check(sqlite3_column_int64(mailbox.get(), 0) == 10,
+                    "catch-all mailbox upgraded in place");
+        test::check(sqlite3_column_int(mailbox.get(), 1) == 2,
+                    "catch-all mailbox assigned to managed domain");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(mailbox.get(), 2))) == "code",
+                    "upgraded mailbox local part follows managed match");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(mailbox.get(), 3))) == "managed.example",
+                    "upgraded mailbox domain part follows managed match");
+        test::check(sqlite3_column_int(mailbox.get(), 4) == 3,
+                    "upgraded mailbox preserves historical count");
+        auto audit = db.prepare(
+            "SELECT actor_ref, action, resource_ref, details_json FROM audit_logs "
+            "WHERE action = 'mailboxes.rehome' ORDER BY id DESC LIMIT 1");
+        test::check(audit.step_row(), "mailbox upgrade emits an audit row");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(audit.get(), 0))) == "smtp-ingest",
+                    "mailbox upgrade audit identifies ingest actor");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(audit.get(), 1))) == "mailboxes.rehome",
+                    "mailbox upgrade audit action");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(audit.get(), 2))) == "10",
+                    "mailbox upgrade audit targets surviving mailbox");
+        const std::string audit_details = reinterpret_cast<const char*>(
+            sqlite3_column_text(audit.get(), 3));
+        test::check(audit_details.find("\"destination_domain_id\":2") != std::string::npos,
+                    "mailbox upgrade audit records destination domain");
+        db.exec("UPDATE domains SET is_active = 0 WHERE id = 2");
+    }
+
+    writer.write_batch({mailbox_job(
+        "managed_suffix_promotion",
+        "managed_suffix_promotion_delivery",
+        "managed_suffix_promotion_session",
+        "2026-05-12T04:04:05Z",
+        rapid_inbox::ingestd::DomainMatch{3,
+                                         "deep.managed.example",
+                                         "deep.managed.example",
+                                         "other",
+                                         "other",
+                                         "other@deep.managed.example"},
+        "other@deep.managed.example")});
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        auto promoted = db.prepare(
+            "SELECT domain_id, message_count FROM mailboxes WHERE id = 11");
+        test::check(promoted.step_row(), "managed suffix promotion mailbox remains");
+        test::check(sqlite3_column_int(promoted.get(), 0) == 3,
+                    "current more-specific managed winner replaces shorter suffix owner");
+        test::check(sqlite3_column_int(promoted.get(), 1) == 1,
+                    "managed suffix promotion keeps new delivery");
+    }
+
+    writer.write_batch({mailbox_job(
+        "catch_all_after_managed",
+        "catch_all_after_managed_delivery",
+        "catch_all_after_managed_session",
+        "2026-05-13T03:04:05Z",
+        rapid_inbox::ingestd::DomainMatch{
+            1, "managed.example", "*", "code", "code", "code@managed.example"},
+        "code@managed.example")});
+
+    rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+    auto mailbox = db.prepare(
+        "SELECT domain_id, message_count FROM mailboxes "
+        "WHERE address_canonical = 'code@managed.example'");
+    test::check(mailbox.step_row(), "managed mailbox remains after stale catch-all write");
+    test::check(sqlite3_column_int(mailbox.get(), 0) == 2,
+                "managed mailbox is never downgraded to catch-all");
+    test::check(sqlite3_column_int(mailbox.get(), 1) == 4,
+                "stale catch-all delivery is retained on managed mailbox");
+    auto delivery_count = db.prepare(
+        "SELECT COUNT(*) FROM message_deliveries WHERE mailbox_id = 10");
+    test::check(delivery_count.step_row(), "upgraded mailbox delivery count row");
+    test::check(sqlite3_column_int(delivery_count.get(), 0) == 4,
+                "upgraded mailbox keeps all historical deliveries");
+}
+
+void test_batch_writer_merges_catch_all_canonical_collision() {
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-mailbox-merge";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        initialize_schema(db);
+        db.exec(
+            "INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, "
+            "plus_addressing_mode, local_part_case_sensitive, retention_days, "
+            "created_at, updated_at) VALUES "
+            "(1, '*', '任意域名', 'keep', 0, 7, '2026-01-01T00:00:00Z', "
+            "'2026-01-01T00:00:00Z'), "
+            "(2, 'managed.example', 'managed.example', 'strip', 0, 30, "
+            "'2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z');"
+            "INSERT INTO mailboxes (id, domain_id, local_part_canonical, rcpt_domain_ascii, "
+            "address_canonical, address_display, first_seen_at, last_seen_at, "
+            "latest_message_at, message_count, public_enabled, is_hidden, notes) VALUES "
+            "(10, 1, 'foo+tag', 'managed.example', 'foo+tag@managed.example', "
+            "'foo+tag@managed.example', '2026-01-01T00:00:00Z', "
+            "'2026-01-05T00:00:00Z', '2026-01-05T00:00:00Z', 3, 0, 1, "
+            "'source mailbox'), "
+            "(20, 2, 'foo', 'managed.example', 'foo@managed.example', "
+            "'foo@managed.example', '2026-01-02T00:00:00Z', "
+            "'2026-01-04T00:00:00Z', '2026-01-02T00:00:00Z', 1, 1, 0, NULL);"
+            "INSERT INTO messages (id, raw_path, raw_sha256, raw_size_bytes, received_at) VALUES "
+            "('merge_source_only', 'raw/merge_source_only.eml', 'a', 1, "
+            "'2026-01-01T00:00:00Z'), "
+            "('merge_target_only', 'raw/merge_target_only.eml', 'b', 1, "
+            "'2026-01-02T00:00:00Z'), "
+            "('merge_overlap_later', 'raw/merge_overlap_later.eml', 'c', 1, "
+            "'2026-01-03T00:00:00Z'), "
+            "('merge_overlap_null', 'raw/merge_overlap_null.eml', 'd', 1, "
+            "'2026-01-04T00:00:00Z');"
+            "INSERT INTO message_deliveries "
+            "(id, message_id, mailbox_id, rcpt_to, delivered_at, status, deleted_at, "
+            "expires_at, notes) VALUES "
+            "('source_only_delivery', 'merge_source_only', 10, "
+            "'Foo+tag@managed.example', '2026-01-01T00:00:00Z', 'active', NULL, NULL, "
+            "'source only'), "
+            "('source_overlap_later', 'merge_overlap_later', 10, "
+            "'Foo+tag@managed.example', '2026-01-03T00:00:00Z', 'active', NULL, "
+            "'2026-04-01T00:00:00Z', 'source later note'), "
+            "('source_overlap_null', 'merge_overlap_null', 10, "
+            "'Foo+tag@managed.example', '2026-01-04T00:00:00Z', 'active', NULL, "
+            "'2026-05-01T00:00:00Z', 'source null note'), "
+            "('target_only_delivery', 'merge_target_only', 20, 'foo@managed.example', "
+            "'2026-01-02T00:00:00Z', 'active', NULL, NULL, 'target only'), "
+            "('target_overlap_later', 'merge_overlap_later', 20, 'foo@managed.example', "
+            "'2026-01-04T00:00:00Z', 'hidden', NULL, '2026-03-01T00:00:00Z', "
+            "'target later note'), "
+            "('target_overlap_null', 'merge_overlap_null', 20, 'foo@managed.example', "
+            "'2026-01-05T00:00:00Z', 'deleted', '2026-01-06T00:00:00Z', NULL, "
+            "'target null note');"
+            "UPDATE mailboxes SET bulk_delete_generation = 5 WHERE id = 20;");
+    }
+
+    rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
+    writer.write_batch({mailbox_job(
+        "merge_new_message",
+        "merge_new_delivery",
+        "merge_new_session",
+        "2026-05-12T03:04:05Z",
+        rapid_inbox::ingestd::DomainMatch{2,
+                                         "managed.example",
+                                         "managed.example",
+                                         "Foo+tag",
+                                         "foo",
+                                         "foo@managed.example"},
+        "Foo+tag@managed.example")});
+
+    rapid_inbox::ingestd::MailJob collapsed_job = mailbox_job(
+        "collapsed_stale_message",
+        "collapsed_stale_first",
+        "collapsed_stale_session",
+        "2026-05-12T04:04:05Z",
+        rapid_inbox::ingestd::DomainMatch{1,
+                                         "managed.example",
+                                         "*",
+                                         "Foo+next",
+                                         "foo+next",
+                                         "foo+next@managed.example"},
+        "Foo+next@managed.example");
+    collapsed_job.recipients.push_back(
+        {"collapsed_stale_second",
+         "foo@managed.example",
+         rapid_inbox::ingestd::DomainMatch{
+             1, "managed.example", "*", "foo", "foo", "foo@managed.example"},
+         sample_policy()});
+    writer.write_batch({collapsed_job});
+
+    rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+    auto source_mailbox = db.prepare("SELECT 1 FROM mailboxes WHERE id = 10");
+    test::check(!source_mailbox.step_row(), "merged catch-all source mailbox is removed");
+    auto target_mailbox = db.prepare(
+        "SELECT domain_id, local_part_canonical, rcpt_domain_ascii, first_seen_at, "
+        "last_seen_at, latest_message_at, message_count, public_enabled, is_hidden, notes "
+        "FROM mailboxes WHERE id = 20");
+    test::check(target_mailbox.step_row(), "canonical target mailbox remains");
+    test::check(sqlite3_column_int(target_mailbox.get(), 0) == 2,
+                "merged mailbox remains managed");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(target_mailbox.get(), 1))) == "foo",
+                "merged mailbox uses managed canonical local part");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(target_mailbox.get(), 2))) == "managed.example",
+                "merged mailbox uses managed domain part");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(target_mailbox.get(), 3))) ==
+                    "2026-01-01T00:00:00Z",
+                "merged mailbox preserves earliest first seen time");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(target_mailbox.get(), 4))) ==
+                    "2026-05-12T04:04:05Z",
+                "merged mailbox advances last seen time");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(target_mailbox.get(), 5))) ==
+                    "2026-05-12T04:04:05Z",
+                "merged mailbox latest message follows active deliveries");
+    test::check(sqlite3_column_int(target_mailbox.get(), 6) == 6,
+                "merged mailbox recomputes distinct active delivery count");
+    test::check(sqlite3_column_int(target_mailbox.get(), 7) == 0,
+                "mailbox merge keeps the stricter public flag");
+    test::check(sqlite3_column_int(target_mailbox.get(), 8) == 1,
+                "mailbox merge keeps hidden state");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(target_mailbox.get(), 9))) == "source mailbox",
+                "mailbox merge preserves source notes when target is empty");
+
+    auto delivery_count = db.prepare(
+        "SELECT COUNT(*) FROM message_deliveries WHERE mailbox_id = 20");
+    test::check(delivery_count.step_row(), "merged delivery count row");
+    test::check(sqlite3_column_int(delivery_count.get(), 0) == 6,
+                "duplicate message deliveries are collapsed before migration");
+    auto collapsed_deliveries = db.prepare(
+        "SELECT COUNT(*), MIN(id), MAX(id), MIN(expires_at) FROM message_deliveries "
+        "WHERE message_id = 'collapsed_stale_message'");
+    test::check(collapsed_deliveries.step_row(), "collapsed delivery count row");
+    test::check(sqlite3_column_int(collapsed_deliveries.get(), 0) == 1,
+                "stale catch-all recipients collapsing to one managed mailbox are deduplicated");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(collapsed_deliveries.get(), 1))) ==
+                    "collapsed_stale_first",
+                "collapsed delivery deterministically keeps first recipient id");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(collapsed_deliveries.get(), 3))) ==
+                    "2026-06-11T04:04:05Z",
+                "refreshed managed match uses current domain retention policy");
+    auto collapsed_metric = db.prepare(
+        "SELECT deliveries FROM mail_metric_buckets "
+        "WHERE bucket_ts = '2026-05-12T04:04:00Z'");
+    test::check(collapsed_metric.step_row(), "collapsed delivery metric row");
+    test::check(sqlite3_column_int(collapsed_metric.get(), 0) == 1,
+                "delivery metric counts persisted canonical deliveries");
+    auto moved_delivery = db.prepare(
+        "SELECT mailbox_id, mailbox_generation FROM message_deliveries "
+        "WHERE id = 'source_only_delivery'");
+    test::check(moved_delivery.step_row(), "non-conflicting source delivery is retained");
+    test::check(sqlite3_column_int64(moved_delivery.get(), 0) == 20,
+                "non-conflicting source delivery moves to target mailbox");
+    test::check(sqlite3_column_int64(moved_delivery.get(), 1) == 5,
+                "moved delivery inherits target mailbox generation");
+    auto new_delivery_generation = db.prepare(
+        "SELECT mailbox_generation FROM message_deliveries "
+        "WHERE id = 'merge_new_delivery'");
+    test::check(new_delivery_generation.step_row(), "new managed delivery remains");
+    test::check(sqlite3_column_int64(new_delivery_generation.get(), 0) == 5,
+                "new delivery binds the current mailbox generation");
+    auto source_duplicate = db.prepare(
+        "SELECT 1 FROM message_deliveries WHERE id IN "
+        "('source_overlap_later', 'source_overlap_null')");
+    test::check(!source_duplicate.step_row(), "source duplicate delivery ids are removed");
+
+    auto later_overlap = db.prepare(
+        "SELECT id, status, delivered_at, expires_at, deleted_at, notes, mailbox_generation "
+        "FROM message_deliveries WHERE message_id = 'merge_overlap_later'");
+    test::check(later_overlap.step_row(), "later-expiry overlap remains");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(later_overlap.get(), 0))) == "target_overlap_later",
+                "overlap retains target delivery id");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(later_overlap.get(), 1))) == "active",
+                "overlap promotes status to active");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(later_overlap.get(), 2))) ==
+                    "2026-01-03T00:00:00Z",
+                "overlap keeps earliest delivery time");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(later_overlap.get(), 3))) ==
+                    "2026-04-01T00:00:00Z",
+                "overlap keeps later non-null expiry");
+    test::check(sqlite3_column_type(later_overlap.get(), 4) == SQLITE_NULL,
+                "active overlap clears deletion time");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(later_overlap.get(), 5))) == "target later note",
+                "overlap prefers target notes");
+    test::check(sqlite3_column_int64(later_overlap.get(), 6) == 5,
+                "merged duplicate inherits target mailbox generation");
+
+    auto null_overlap = db.prepare(
+        "SELECT id, status, expires_at, notes, mailbox_generation FROM message_deliveries "
+        "WHERE message_id = 'merge_overlap_null'");
+    test::check(null_overlap.step_row(), "null-expiry overlap remains");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(null_overlap.get(), 0))) == "target_overlap_null",
+                "null-expiry overlap retains target delivery id");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(null_overlap.get(), 1))) == "active",
+                "null-expiry overlap promotes deleted target to active");
+    test::check(sqlite3_column_type(null_overlap.get(), 2) == SQLITE_NULL,
+                "any null expiry keeps merged delivery unbounded");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(null_overlap.get(), 3))) == "target null note",
+                "null-expiry overlap still prefers target notes");
+    test::check(sqlite3_column_int64(null_overlap.get(), 4) == 5,
+                "reactivated duplicate enters the current mailbox generation");
+
+    auto audit = db.prepare(
+        "SELECT resource_ref, details_json FROM audit_logs "
+        "WHERE action = 'mailboxes.rehome' ORDER BY id DESC LIMIT 1");
+    test::check(audit.step_row(), "mailbox merge emits an audit row");
+    test::check(std::string(reinterpret_cast<const char*>(
+                    sqlite3_column_text(audit.get(), 0))) == "20",
+                "mailbox merge audit targets survivor");
+    const std::string audit_details =
+        reinterpret_cast<const char*>(sqlite3_column_text(audit.get(), 1));
+    test::check(audit_details.find("\"deliveries_moved\":1") != std::string::npos,
+                "mailbox merge audit counts moved deliveries");
+    test::check(audit_details.find("\"deliveries_deduplicated\":2") != std::string::npos,
+                "mailbox merge audit counts deduplicated deliveries");
+}
+
+void test_batch_writer_reuses_sqlite_session_and_recovers_after_failure() {
+    using namespace rapid_inbox::ingestd;
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-session-reuse";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    {
+        SqliteDb db(db_path, 5000);
+        initialize_schema(db);
+        db.exec("INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, created_at, "
+                "updated_at) VALUES (1, 'adb.com', 'adb.com', '2026-05-12T03:04:05Z', "
+                "'2026-05-12T03:04:05Z')");
+    }
+
+    BatchWriter writer(root, db_path, 5000, false);
+    constexpr int thread_count = 4;
+    constexpr int batches_per_thread = 8;
+    std::exception_ptr thread_error;
+    std::mutex thread_error_mutex;
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (int thread_index = 0; thread_index < thread_count; ++thread_index) {
+        threads.emplace_back([&, thread_index] {
+            try {
+                for (int batch_index = 0; batch_index < batches_per_thread; ++batch_index) {
+                    const std::string suffix = std::to_string(thread_index) + "_" +
+                                               std::to_string(batch_index);
+                    writer.write_batch({mailbox_job(
+                        "reuse_message_" + suffix,
+                        "reuse_delivery_" + suffix,
+                        "reuse_session_" + suffix,
+                        "2026-05-12T03:04:05Z",
+                        DomainMatch{1, "adb.com", "adb.com", "code", "code", "code@adb.com"},
+                        "code@adb.com")});
+                }
+            } catch (...) {
+                const std::lock_guard guard(thread_error_mutex);
+                if (thread_error == nullptr) {
+                    thread_error = std::current_exception();
+                }
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    if (thread_error != nullptr) {
+        std::rethrow_exception(thread_error);
+    }
+
+    BatchWriterSqliteStats stats = writer.sqlite_stats();
+    test::check(stats.connections_opened == 1,
+                "concurrent serialized batches share one SQLite connection");
+    test::check(stats.statement_sets_prepared == 1,
+                "hot batches prepare the write statement set only once");
+    test::check(stats.connection_active, "successful hot writer keeps SQLite session active");
+
+    {
+        SqliteDb db(db_path, 5000);
+        db.exec("ALTER TABLE messages ADD COLUMN session_reuse_probe INTEGER");
+    }
+    writer.write_batch({mailbox_job(
+        "schema_reprepare_message",
+        "schema_reprepare_delivery",
+        "schema_reprepare_session",
+        "2026-05-12T03:04:05Z",
+        DomainMatch{1, "adb.com", "adb.com", "code", "code", "code@adb.com"},
+        "code@adb.com")});
+    stats = writer.sqlite_stats();
+    test::check(stats.connections_opened == 1 && stats.statement_sets_prepared == 1,
+                "persistent v3 statements survive compatible schema changes without reconnecting");
+
+    MailJob failed = mailbox_job(
+        "rollback_probe_message",
+        "reuse_delivery_0_0",
+        "rollback_probe_session",
+        "2026-05-12T03:04:05Z",
+        DomainMatch{1, "adb.com", "adb.com", "code", "code", "code@adb.com"},
+        "code@adb.com");
+    bool failed_as_expected = false;
+    try {
+        writer.write_batch({failed});
+    } catch (const std::exception&) {
+        failed_as_expected = true;
+    }
+    test::check(failed_as_expected, "constraint failure escapes the batch transaction");
+    stats = writer.sqlite_stats();
+    test::check(!stats.connection_active,
+                "failed statement discards the complete connection and statement cache");
+
+    failed.recipients.front().delivery_id = "rollback_probe_delivery";
+    writer.write_batch({failed});
+    stats = writer.sqlite_stats();
+    test::check(stats.connections_opened == 2 && stats.statement_sets_prepared == 2,
+                "retry opens one fresh session after rollback failure isolation");
+    test::check(stats.connection_active, "successful retry retains the replacement session");
+
+    SqliteDb db(db_path, 5000);
+    auto counts = db.prepare(
+        "SELECT (SELECT COUNT(*) FROM messages), "
+        "(SELECT COUNT(*) FROM message_deliveries), "
+        "(SELECT message_count FROM mailboxes WHERE address_canonical = 'code@adb.com')");
+    test::check(counts.step_row(), "session reuse aggregate row exists");
+    constexpr int expected_messages = thread_count * batches_per_thread + 2;
+    test::check(sqlite3_column_int(counts.get(), 0) == expected_messages,
+                "rollback removes failed message while retry and schema-reprepare writes persist");
+    test::check(sqlite3_column_int(counts.get(), 1) == expected_messages,
+                "rollback removes failed delivery without losing valid concurrent writes");
+    test::check(sqlite3_column_int(counts.get(), 2) == expected_messages,
+                "mailbox summary remains exact across reuse, schema reprepare, and retry");
+}
+
+void test_batch_writer_reconnects_after_database_file_replacement() {
+    using namespace rapid_inbox::ingestd;
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-db-replacement";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    const fs::path replacement_path = root / "replacement.db";
+    const auto initialize = [](const fs::path& path) {
+        SqliteDb db(path, 5000);
+        initialize_schema(db);
+        db.exec("INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, created_at, "
+                "updated_at) VALUES (1, 'adb.com', 'adb.com', '2026-05-12T03:04:05Z', "
+                "'2026-05-12T03:04:05Z')");
+    };
+    initialize(db_path);
+
+    BatchWriter writer(root, db_path, 5000, false);
+    writer.write_batch({mailbox_job(
+        "old_database_message",
+        "old_database_delivery",
+        "old_database_session",
+        "2026-05-12T03:04:05Z",
+        DomainMatch{1, "adb.com", "adb.com", "code", "code", "code@adb.com"},
+        "code@adb.com")});
+    initialize(replacement_path);
+
+    const fs::path old_path = root / "old.db";
+    const auto move_if_present = [](const fs::path& from, const fs::path& to) {
+        if (fs::exists(from)) {
+            fs::rename(from, to);
+        }
+    };
+    move_if_present(fs::path(db_path.string() + "-wal"),
+                    fs::path(old_path.string() + "-wal"));
+    move_if_present(fs::path(db_path.string() + "-shm"),
+                    fs::path(old_path.string() + "-shm"));
+    fs::rename(db_path, old_path);
+    fs::rename(replacement_path, db_path);
+    move_if_present(fs::path(replacement_path.string() + "-wal"),
+                    fs::path(db_path.string() + "-wal"));
+    move_if_present(fs::path(replacement_path.string() + "-shm"),
+                    fs::path(db_path.string() + "-shm"));
+
+    writer.write_batch({mailbox_job(
+        "replacement_database_message",
+        "replacement_database_delivery",
+        "replacement_database_session",
+        "2026-05-12T03:04:05Z",
+        DomainMatch{1, "adb.com", "adb.com", "code", "code", "code@adb.com"},
+        "code@adb.com")});
+    const BatchWriterSqliteStats stats = writer.sqlite_stats();
+    test::check(stats.connections_opened == 2 && stats.statement_sets_prepared == 2,
+                "database inode replacement forces connection and statement-cache refresh");
+
+    {
+        SqliteDb db(db_path, 5000);
+        auto new_messages = db.prepare("SELECT id FROM messages");
+        test::check(new_messages.step_row(), "replacement database receives next batch");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(new_messages.get(), 0))) ==
+                        "replacement_database_message",
+                    "new batch never writes through stale database inode");
+        test::check(!new_messages.step_row(), "replacement database contains only its own batch");
+    }
+    {
+        SqliteDb db(old_path, 5000);
+        auto old_messages = db.prepare("SELECT id FROM messages");
+        test::check(old_messages.step_row(), "old database retains pre-replacement batch");
+        test::check(std::string(reinterpret_cast<const char*>(
+                        sqlite3_column_text(old_messages.get(), 0))) ==
+                        "old_database_message",
+                    "persistent writer closed stale inode before next transaction");
+        test::check(!old_messages.step_row(), "old database receives no post-replacement batch");
+    }
+}
+
+void test_batch_writer_revalidates_domain_identity_before_commit() {
+    using namespace rapid_inbox::ingestd;
+    const auto run_case = [](const std::string& policy_change, bool expect_success) {
+        const fs::path root = fs::temp_directory_path() /
+                              ("rapid-inbox-writer-domain-race-" + policy_change);
+        fs::remove_all(root);
+        fs::create_directories(root);
+        const fs::path db_path = root / "app.db";
+        {
+            SqliteDb db(db_path, 5000);
+            initialize_schema(db);
+            db.exec("INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'adb.com', 'adb.com', '2026-05-12T03:04:05Z', "
+                    "'2026-05-12T03:04:05Z')");
+        }
+
+        MailJob job = sample_job();
+        job.message_id = "msg_domain_race_" + policy_change;
+        job.smtp_session_id = "smtp_domain_race_" + policy_change;
+        job.recipients.front().delivery_id = "dlv_domain_race_" + policy_change;
+        job.raw_path = raw_message_path(job.message_id, job.received_at);
+        job.manifest_path = manifest_path(job.message_id, job.received_at);
+
+        BatchWriter writer(root, db_path, 5000, false);
+        {
+            SqliteDb db(db_path, 5000);
+            if (policy_change == "rename") {
+                db.exec("UPDATE domains SET root_domain_ascii = 'renamed.example', "
+                        "root_domain_unicode = 'renamed.example' WHERE id = 1");
+            } else if (policy_change == "delete") {
+                db.exec("DELETE FROM domains WHERE id = 1");
+            } else if (policy_change == "flags") {
+                db.exec("UPDATE domains SET accept_exact = 0, accept_subdomains = 0, "
+                        "max_message_size_bytes = 1 WHERE id = 1");
+            } else {
+                db.exec("UPDATE domains SET is_active = 0 WHERE id = 1");
+            }
+        }
+
+        bool succeeded = false;
+        std::string error;
+        try {
+            writer.write_batch({job});
+            succeeded = true;
+        } catch (const std::exception& exc) {
+            error = exc.what();
+        }
+        test::check(succeeded == expect_success,
+                    policy_change + " commit follows fail-closed routing semantics");
+
+        SqliteDb db(db_path, 5000);
+        auto counts = db.prepare(
+            "SELECT (SELECT COUNT(*) FROM messages), "
+            "(SELECT COUNT(*) FROM message_deliveries), "
+            "(SELECT COUNT(*) FROM mailboxes)");
+        test::check(counts.step_row(), policy_change + " aggregate row exists");
+        const int expected_rows = expect_success ? 1 : 0;
+        test::check(sqlite3_column_int(counts.get(), 0) == expected_rows,
+                    policy_change + " message transaction is atomic");
+        test::check(sqlite3_column_int(counts.get(), 1) == expected_rows,
+                    policy_change + " delivery transaction is atomic");
+        test::check(sqlite3_column_int(counts.get(), 2) == expected_rows,
+                    policy_change + " mailbox transaction is atomic");
+
+        if (!expect_success) {
+            test::check(error.find("recipient policy conflict") != std::string::npos,
+                        policy_change + " reports an explicit policy conflict");
+            test::check(fs::exists(root / job.raw_path),
+                        policy_change + " preserves durable raw for quarantine");
+            test::check(fs::exists(root / job.manifest_path),
+                        policy_change + " preserves durable manifest for quarantine");
+            writer.write_quarantine_record(job, error, 1);
+            const fs::path quarantine_path =
+                root / fs::path(job.manifest_path).replace_extension(".error.json");
+            const std::string quarantine_content = read_text_file(
+                root / "quarantine" /
+                fs::relative(quarantine_path, root / "manifests"));
+            test::check(
+                quarantine_content.find("recipient policy conflict") != std::string::npos,
+                policy_change + " quarantine record retains the policy conflict reason");
+        }
+    };
+
+    run_case("rename", false);
+    run_case("delete", false);
+    run_case("disable", true);
+    run_case("flags", true);
 }

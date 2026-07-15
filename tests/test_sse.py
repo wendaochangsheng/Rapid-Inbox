@@ -14,8 +14,8 @@ class _QuietLiveState:
     def snapshot_state(self):
         return [], "test-generation:0"
 
-    def snapshot_since(self, _last_seq: int):
-        return []
+    def snapshot_stream_window(self, _generation: str, _last_seq: int):
+        return self.generation, [], None, 1, 0
 
 
 @pytest.mark.asyncio

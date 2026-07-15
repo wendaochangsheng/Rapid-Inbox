@@ -35,12 +35,37 @@ def test_cleanup_stale_parts_removes_legacy_visible_temp_files_without_touching_
 
     stale_hidden_part_path = storage.resolve("attachments/msg_1/.att_1-report.part.part")
     stale_hidden_part_path.write_bytes(b"stale temp data")
+    stale_cpp_temp_path = storage.resolve("manifests/2026/04/18/.msg_1.json.tmp.A1B2C3")
+    stale_cpp_temp_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_cpp_temp_path.write_bytes(b"stale C++ temp data")
+    os.utime(legacy_raw_temp_path, (0, 0))
+    os.utime(stale_hidden_part_path, (0, 0))
+    os.utime(stale_cpp_temp_path, (0, 0))
 
     storage.cleanup_stale_parts()
 
     assert not legacy_raw_temp_path.exists()
     assert final_attachment_path.exists()
     assert not stale_hidden_part_path.exists()
+    assert not stale_cpp_temp_path.exists()
+
+
+def test_cleanup_stale_parts_preserves_recent_cross_process_temp_file(tmp_path) -> None:
+    settings = Settings(
+        storage_root=tmp_path / "storage",
+        database_path=tmp_path / "storage" / "app.db",
+    )
+    storage = FileStorage(settings)
+    active_part_path = storage.resolve("raw/2026/04/18/.msg_active.eml.part")
+    active_part_path.parent.mkdir(parents=True, exist_ok=True)
+    active_part_path.write_bytes(b"still being written by ingestd")
+    active_cpp_temp_path = storage.resolve("raw/2026/04/18/.msg_active.eml.tmp.A1B2C3")
+    active_cpp_temp_path.write_bytes(b"still being written by C++ ingestd")
+
+    storage.cleanup_stale_parts()
+
+    assert active_part_path.read_bytes() == b"still being written by ingestd"
+    assert active_cpp_temp_path.read_bytes() == b"still being written by C++ ingestd"
 
 
 def test_write_raw_message_fsyncs_created_directory_chain(tmp_path, monkeypatch) -> None:
@@ -143,7 +168,7 @@ async def test_accept_message_writes_manifest_for_recovery(tmp_path, sample_emai
 
 
 @pytest.mark.asyncio
-async def test_accept_message_writes_manifest_before_raw_file_creation(
+async def test_accept_message_does_not_publish_manifest_when_raw_write_fails(
     tmp_path,
     sample_email_bytes: bytes,
     monkeypatch,
@@ -171,18 +196,55 @@ async def test_accept_message_writes_manifest_before_raw_file_creation(
             )
 
         manifest_paths = list(settings.manifests_dir.rglob("*.json"))
-        assert len(manifest_paths) == 1
-
-        manifest = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
-        assert manifest["rcpt_tos"] == ["foo@adb.com"]
-        assert manifest["raw_path"].endswith(".eml")
-        assert manifest["raw_sha256"] == hashlib.sha256(sample_email_bytes).hexdigest()
+        assert manifest_paths == []
         assert not list(settings.raw_dir.rglob("*.eml"))
 
         with connect_database(settings.database_path) as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM messages").fetchone()
 
         assert row["count"] == 0
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_accept_message_publishes_raw_before_manifest(
+    tmp_path,
+    sample_email_bytes: bytes,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        storage_root=tmp_path / "storage",
+        database_path=tmp_path / "storage" / "app.db",
+    )
+    runtime = RapidInboxRuntime(settings)
+    await runtime.start()
+    try:
+        await runtime.create_domain("adb.com")
+        calls: list[str] = []
+        real_write_raw = runtime.storage.write_raw_message
+        real_write_manifest = runtime.storage.write_manifest
+
+        def tracked_write_raw(*args, **kwargs):
+            calls.append("raw")
+            return real_write_raw(*args, **kwargs)
+
+        def tracked_write_manifest(message_id, received_at, payload):
+            calls.append("manifest")
+            assert runtime.storage.resolve(str(payload["raw_path"])).is_file()
+            return real_write_manifest(message_id, received_at, payload)
+
+        monkeypatch.setattr(runtime.storage, "write_raw_message", tracked_write_raw)
+        monkeypatch.setattr(runtime.storage, "write_manifest", tracked_write_manifest)
+
+        response = await runtime.accept_message(
+            rcpt_tos=["foo@adb.com"],
+            envelope_from="sender@example.com",
+            content=sample_email_bytes,
+        )
+
+        assert response.startswith("250 queued as ")
+        assert calls == ["raw", "manifest"]
     finally:
         await runtime.stop()
 

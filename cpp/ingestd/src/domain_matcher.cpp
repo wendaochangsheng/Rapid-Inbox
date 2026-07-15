@@ -12,7 +12,9 @@
 #include <vector>
 
 #include <unicode/uidna.h>
+#include <unicode/uchar.h>
 #include <unicode/ustring.h>
+#include <unicode/utf16.h>
 
 extern "C" {
 // Small hand-declared libunistring ABI surface; this target links the shared library directly.
@@ -127,15 +129,48 @@ std::string utf8_lower(std::string value) {
     return std::string(reinterpret_cast<const char*>(lowered.get()), length);
 }
 
-bool ends_with(const std::string& value, const std::string& suffix) {
-    return value.size() >= suffix.size() &&
-           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
 bool is_ascii_domain(std::string_view value) {
     return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
         return ch < 0x80;
     });
+}
+
+std::string map_idna_dot_separators(std::string domain) {
+    constexpr std::string_view separators[] = {"\xE3\x80\x82", "\xEF\xBC\x8E", "\xEF\xBD\xA1"};
+    std::string mapped;
+    mapped.reserve(domain.size());
+    for (std::size_t position = 0; position < domain.size();) {
+        bool replaced = false;
+        for (std::string_view separator : separators) {
+            if (equals_at(domain, position, separator)) {
+                mapped.push_back('.');
+                position += separator.size();
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            mapped.push_back(domain[position++]);
+        }
+    }
+    return mapped;
+}
+
+void validate_raw_domain_label_edges(const std::string& domain) {
+    const std::string mapped = map_idna_dot_separators(domain);
+    std::size_t label_start = 0;
+    while (label_start < mapped.size()) {
+        const std::size_t dot = mapped.find('.', label_start);
+        const std::size_t label_end = dot == std::string::npos ? mapped.size() : dot;
+        if (label_end == label_start || mapped[label_start] == '-' || mapped[label_end - 1] == '-') {
+            throw std::invalid_argument("domain label cannot start or end with hyphen");
+        }
+        if (dot == std::string::npos) {
+            return;
+        }
+        label_start = dot + 1;
+    }
+    throw std::invalid_argument("empty domain label");
 }
 
 void ascii_lower_in_place(std::string& value) {
@@ -147,6 +182,12 @@ void ascii_lower_in_place(std::string& value) {
 }
 
 void validate_ascii_domain_labels(const std::string& domain) {
+    if (domain.empty() || domain.front() == '.' || domain.back() == '.') {
+        throw std::invalid_argument("empty domain label");
+    }
+    if (domain.size() > kMaximumDomainBytes) {
+        throw std::invalid_argument("domain is too long");
+    }
     std::size_t label_start = 0;
     while (label_start < domain.size()) {
         const std::size_t dot = domain.find('.', label_start);
@@ -157,6 +198,17 @@ void validate_ascii_domain_labels(const std::string& domain) {
         }
         if (label_length > 63) {
             throw std::invalid_argument("domain label too long");
+        }
+        if (domain[label_start] == '-' || domain[label_end - 1] == '-') {
+            throw std::invalid_argument("domain label cannot start or end with hyphen");
+        }
+        for (std::size_t index = label_start; index < label_end; ++index) {
+            const unsigned char ch = static_cast<unsigned char>(domain[index]);
+            const bool is_letter = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+            const bool is_digit = ch >= '0' && ch <= '9';
+            if (!is_letter && !is_digit && ch != '-') {
+                throw std::invalid_argument("invalid domain label character");
+            }
         }
         if (dot == std::string::npos) {
             return;
@@ -271,15 +323,67 @@ std::string normalize_domain_icu_idna(std::string_view domain) {
     return uchars_to_utf8(idna_to_ascii_uchars(utf8_to_uchars(domain)));
 }
 
-void validate_utf8_text(std::string_view value) {
-    (void)utf8_to_uchars(value);
+bool is_ascii_atext(unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           (ch >= '0' && ch <= '9') || std::string_view("!#$%&'*+-/=?^_`{|}~").find(ch) !=
+                                                std::string_view::npos;
+}
+
+bool valid_local_part(std::string_view local_part, bool allow_smtputf8) {
+    if (local_part.empty() || local_part.size() > kMaximumLocalPartBytes ||
+        local_part.front() == '.' || local_part.back() == '.') {
+        return false;
+    }
+    const bool ascii_only = is_ascii_domain(local_part);
+    if (!ascii_only) {
+        if (!allow_smtputf8) {
+            return false;
+        }
+        std::vector<UChar> unicode;
+        try {
+            unicode = utf8_to_uchars(local_part);
+        } catch (const std::exception&) {
+            return false;
+        }
+        for (std::int32_t offset = 0; offset < static_cast<std::int32_t>(unicode.size());) {
+            UChar32 code_point = 0;
+            U16_NEXT(unicode.data(), offset, static_cast<std::int32_t>(unicode.size()), code_point);
+            const UCharCategory category =
+                code_point < 0 ? U_UNASSIGNED
+                               : static_cast<UCharCategory>(u_charType(code_point));
+            if (code_point < 0 || u_isUWhiteSpace(code_point) || category == U_CONTROL_CHAR ||
+                category == U_FORMAT_CHAR || category == U_SURROGATE ||
+                category == U_PRIVATE_USE_CHAR || category == U_UNASSIGNED) {
+                return false;
+            }
+        }
+    }
+
+    bool previous_dot = false;
+    for (unsigned char ch : local_part) {
+        if (ch >= 0x80) {
+            if (!allow_smtputf8) {
+                return false;
+            }
+            previous_dot = false;
+            continue;
+        }
+        if (ch == '.') {
+            if (previous_dot) {
+                return false;
+            }
+            previous_dot = true;
+            continue;
+        }
+        if (!is_ascii_atext(ch)) {
+            return false;
+        }
+        previous_dot = false;
+    }
+    return true;
 }
 
 std::string canonicalize_local_part(const std::string& local_part, const DomainRule& rule) {
-    if (!rule.local_part_case_sensitive) {
-        validate_utf8_text(local_part);
-    }
-
     std::string canonical = local_part;
     if (rule.plus_addressing_mode == "strip") {
         const std::string::size_type plus = canonical.find('+');
@@ -288,7 +392,14 @@ std::string canonicalize_local_part(const std::string& local_part, const DomainR
         }
     }
     if (!rule.local_part_case_sensitive) {
-        canonical = utf8_lower(std::move(canonical));
+        if (is_ascii_domain(canonical)) {
+            ascii_lower_in_place(canonical);
+        } else {
+            canonical = utf8_lower(std::move(canonical));
+        }
+    }
+    if (!valid_local_part(canonical, true)) {
+        throw std::invalid_argument("invalid canonical local part");
     }
     return canonical;
 }
@@ -302,11 +413,15 @@ std::string normalize_domain(std::string domain) {
     }
 
     if (domain.empty()) {
+        throw std::invalid_argument("empty domain");
+    }
+    if (domain == "*") {
         return domain;
     }
     if (domain.find('\0') != std::string::npos) {
         throw std::invalid_argument("embedded NUL in domain");
     }
+    validate_raw_domain_label_edges(domain);
     if (is_ascii_domain(domain)) {
         ascii_lower_in_place(domain);
         validate_ascii_domain_labels(domain);
@@ -314,42 +429,100 @@ std::string normalize_domain(std::string domain) {
     }
 
     domain = utf8_lower(std::move(domain));
-    return normalize_domain_icu_idna(domain);
-}
-
-DomainMatcher::DomainMatcher(std::vector<DomainRule> rules) : rules_(std::move(rules)) {
-    for (DomainRule& rule : rules_) {
-        rule.root_domain_ascii = normalize_domain(rule.root_domain_ascii);
+    domain = normalize_domain_icu_idna(domain);
+    if (!is_ascii_domain(domain)) {
+        throw std::invalid_argument("IDNA normalization returned non-ASCII domain");
     }
-    std::stable_sort(rules_.begin(), rules_.end(), [](const DomainRule& lhs, const DomainRule& rhs) {
-        return lhs.root_domain_ascii.size() > rhs.root_domain_ascii.size();
-    });
+    ascii_lower_in_place(domain);
+    validate_ascii_domain_labels(domain);
+    return domain;
 }
 
-std::optional<DomainMatch> DomainMatcher::match_address(const std::string& address) const {
-    const std::string::size_type at = address.rfind('@');
-    if (at == std::string::npos) {
+std::optional<ParsedMailboxAddress> parse_mailbox_address(const std::string& address,
+                                                          bool allow_smtputf8) {
+    if (address.empty() || address.size() > kMaximumMailboxBytes) {
+        return std::nullopt;
+    }
+    const std::string::size_type at = address.find('@');
+    if (at == std::string::npos || at != address.rfind('@')) {
+        return std::nullopt;
+    }
+    const std::string local_part = address.substr(0, at);
+    const std::string raw_domain = address.substr(at + 1);
+    if (!valid_local_part(local_part, allow_smtputf8) || raw_domain.empty() ||
+        raw_domain.back() == '.' || strip_unicode_whitespace(raw_domain) != raw_domain) {
+        return std::nullopt;
+    }
+    if (!allow_smtputf8 && !is_ascii_domain(raw_domain)) {
         return std::nullopt;
     }
 
-    const std::string local_part = address.substr(0, at);
     std::string domain_ascii;
     try {
-        domain_ascii = normalize_domain(address.substr(at + 1));
+        domain_ascii = normalize_domain(raw_domain);
     } catch (const std::exception&) {
         return std::nullopt;
     }
+    if (domain_ascii == "*" || domain_ascii.size() > kMaximumDomainBytes ||
+        local_part.size() + 1 + domain_ascii.size() > kMaximumMailboxBytes) {
+        return std::nullopt;
+    }
+    return ParsedMailboxAddress{local_part, domain_ascii};
+}
 
-    for (const DomainRule& rule : rules_) {
-        const bool is_exact = domain_ascii == rule.root_domain_ascii;
-        const bool is_subdomain = ends_with(domain_ascii, "." + rule.root_domain_ascii);
-        if (!is_exact && !is_subdomain) {
+DomainMatcher::DomainMatcher(std::vector<DomainRule> rules) {
+    rules_by_root_.reserve(rules.size());
+    for (DomainRule& rule : rules) {
+        rule.root_domain_ascii = normalize_domain(rule.root_domain_ascii);
+        if (rule.root_domain_ascii == "*") {
+            if (!catch_all_rule_.has_value()) {
+                catch_all_rule_ = std::move(rule);
+            }
             continue;
         }
+        // Preserve the previous stable-sort semantics for duplicate roots: the
+        // first configured rule wins. DomainCache loads rules by ascending id.
+        std::string root = rule.root_domain_ascii;
+        rules_by_root_.try_emplace(std::move(root), std::move(rule));
+    }
+}
+
+std::optional<DomainMatch> DomainMatcher::match_address(const std::string& address) const {
+    const auto parsed = parse_mailbox_address(address, true);
+    if (!parsed.has_value()) {
+        return std::nullopt;
+    }
+    const std::string& local_part = parsed->local_part;
+    const std::string& domain_ascii = parsed->domain_ascii;
+
+    const DomainRule* matched_rule = nullptr;
+    bool is_exact = false;
+
+    const auto exact = rules_by_root_.find(std::string_view(domain_ascii));
+    if (exact != rules_by_root_.end()) {
+        matched_rule = &exact->second;
+        is_exact = true;
+    } else {
+        // Candidate suffixes are visited from longest to shortest. Heterogeneous
+        // string_view lookup avoids allocating a temporary string per DNS label.
+        for (std::size_t dot = domain_ascii.find('.'); dot != std::string::npos;
+             dot = domain_ascii.find('.', dot + 1)) {
+            const std::string_view suffix(domain_ascii.data() + dot + 1,
+                                          domain_ascii.size() - dot - 1);
+            const auto candidate = rules_by_root_.find(suffix);
+            if (candidate != rules_by_root_.end()) {
+                matched_rule = &candidate->second;
+                break;
+            }
+        }
+    }
+
+    if (matched_rule != nullptr) {
+        const DomainRule& rule = *matched_rule;
         if (is_exact && !rule.accept_exact) {
             return std::nullopt;
         }
-        if (is_subdomain && !rule.accept_subdomains) {
+        if (!is_exact && !rule.accept_subdomains) {
             return std::nullopt;
         }
 
@@ -359,10 +532,36 @@ std::optional<DomainMatch> DomainMatcher::match_address(const std::string& addre
         } catch (const std::exception&) {
             return std::nullopt;
         }
+        if (local_part_canonical.empty() ||
+            local_part_canonical.size() + 1 + domain_ascii.size() > kMaximumMailboxBytes) {
+            return std::nullopt;
+        }
         return DomainMatch{
             .domain_id = rule.domain_id,
             .domain_ascii = domain_ascii,
             .root_domain_ascii = rule.root_domain_ascii,
+            .local_part = local_part,
+            .local_part_canonical = local_part_canonical,
+            .address_canonical = local_part_canonical + "@" + domain_ascii,
+        };
+    }
+
+    if (catch_all_rule_.has_value()) {
+        const DomainRule& catch_all_rule = *catch_all_rule_;
+        std::string local_part_canonical;
+        try {
+            local_part_canonical = canonicalize_local_part(local_part, catch_all_rule);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+        if (local_part_canonical.empty() ||
+            local_part_canonical.size() + 1 + domain_ascii.size() > kMaximumMailboxBytes) {
+            return std::nullopt;
+        }
+        return DomainMatch{
+            .domain_id = catch_all_rule.domain_id,
+            .domain_ascii = domain_ascii,
+            .root_domain_ascii = "*",
             .local_part = local_part,
             .local_part_canonical = local_part_canonical,
             .address_canonical = local_part_canonical + "@" + domain_ascii,

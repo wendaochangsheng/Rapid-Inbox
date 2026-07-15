@@ -160,6 +160,30 @@
       <form method="post" action="/admin/settings">
         <div class="horiz-row">
           <div>
+            <span class="horiz-row__label">域名收件模式</span>
+            <p class="horiz-row__hint">任意域名模式会把未知域收入私有隔离策略，不会默认公开。</p>
+          </div>
+          <select name="ingress_mode">
+            <option value="managed_only"{% if settings_form.ingress_mode == 'managed_only' %} selected{% endif %}>仅已管理域名</option>
+            <option value="managed_plus_catchall"{% if settings_form.ingress_mode == 'managed_plus_catchall' %} selected{% endif %}>已管理域名 + 任意域名</option>
+          </select>
+        </div>
+        <div class="horiz-row">
+          <div>
+            <span class="horiz-row__label">任意域名访问策略</span>
+            <p class="horiz-row__hint">默认完全私有。只有明确勾选后，未知域邮箱才可从对应公共入口查阅。</p>
+          </div>
+          <div>
+            <label><input type="checkbox" name="catch_all_public_web_enabled" value="1"{% if settings_form.catch_all_public_web_enabled %} checked{% endif %} /> 允许公共网页</label>
+            <label style="margin-left:16px"><input type="checkbox" name="catch_all_public_api_enabled" value="1"{% if settings_form.catch_all_public_api_enabled %} checked{% endif %} /> 允许公共 API</label>
+          </div>
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">任意域名保留天数</span><p class="horiz-row__hint">0 表示永久；大于 0 时，每条投递独立计算到期时间。</p></div>
+          <input type="number" min="0" step="1" name="catch_all_retention_days" value="{{ settings_form.catch_all_retention_days }}" required />
+        </div>
+        <div class="horiz-row">
+          <div>
             <span class="horiz-row__label">最大邮件大小</span>
             <p class="horiz-row__hint">单位为字节。超过此值的邮件会被拒收。</p>
           </div>
@@ -206,6 +230,34 @@
             <p class="horiz-row__hint">磁盘占用超过此百分比时会触发告警。</p>
           </div>
           <input type="number" min="1" max="100" step="1" name="disk_warning_threshold_percent" value="{{ settings_form.disk_warning_threshold_percent }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">清理间隔（秒）</span><p class="horiz-row__hint">后台扫描到期投递与待删除文件的周期。</p></div>
+          <input type="number" min="1" step="1" name="retention_cleanup_interval_seconds" value="{{ settings_form.retention_cleanup_interval_seconds }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">SMTP 会话保留（秒）</span><p class="horiz-row__hint">已结束的网络会话超过该时间后分批清理。</p></div>
+          <input type="number" min="1" step="1" name="smtp_session_retention_seconds" value="{{ settings_form.smtp_session_retention_seconds }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">空邮箱保留（秒）</span><p class="horiz-row__hint">最后一条投递删除后，空邮箱元数据继续保留的时间。</p></div>
+          <input type="number" min="1" step="1" name="empty_mailbox_retention_seconds" value="{{ settings_form.empty_mailbox_retention_seconds }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">指标保留（秒）</span><p class="horiz-row__hint">预聚合邮件指标的保留时间。</p></div>
+          <input type="number" min="1" step="1" name="metric_retention_seconds" value="{{ settings_form.metric_retention_seconds }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">审计日志保留（天）</span><p class="horiz-row__hint">安全审计日志分批清理前的最短保留期。</p></div>
+          <input type="number" min="1" step="1" name="audit_retention_days" value="{{ settings_form.audit_retention_days }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">清理批次大小</span><p class="horiz-row__hint">限制单次事务规模，降低高吞吐收件期间的写锁停顿。</p></div>
+          <input type="number" min="1" step="1" name="cleanup_batch_size" value="{{ settings_form.cleanup_batch_size }}" required />
+        </div>
+        <div class="horiz-row">
+          <div><span class="horiz-row__label">文件 GC 批次大小</span><p class="horiz-row__hint">每轮处理的持久化文件删除任务数，失败会指数退避重试。</p></div>
+          <input type="number" min="1" step="1" name="file_gc_batch_size" value="{{ settings_form.file_gc_batch_size }}" required />
         </div>
 
         {% if settings_items %}
@@ -256,21 +308,21 @@
             <span class="horiz-row__label">当前密码</span>
             <p class="horiz-row__hint">用于校验身份。</p>
           </div>
-          <input type="password" name="current_password" autocomplete="current-password" required />
+          <input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required />
         </div>
         <div class="horiz-row">
           <div>
             <span class="horiz-row__label">新密码</span>
-            <p class="horiz-row__hint">至少 8 位，建议混合字母、数字与符号。</p>
+            <p class="horiz-row__hint">至少 12 位，建议混合字母、数字与符号。</p>
           </div>
-          <input type="password" name="new_password" autocomplete="new-password" minlength="8" required />
+          <input type="password" name="new_password" autocomplete="new-password" minlength="12" maxlength="1024" required />
         </div>
         <div class="horiz-row">
           <div>
             <span class="horiz-row__label">确认新密码</span>
             <p class="horiz-row__hint">必须与上方新密码完全一致。</p>
           </div>
-          <input type="password" name="confirm_password" autocomplete="new-password" minlength="8" required />
+          <input type="password" name="confirm_password" autocomplete="new-password" minlength="12" maxlength="1024" required />
         </div>
         <div class="action-bar">
           <span class="action-bar__hint">密码更新后会保留当前会话，下次登录时使用新密码。</span>

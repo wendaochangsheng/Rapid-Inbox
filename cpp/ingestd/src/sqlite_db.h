@@ -47,6 +47,7 @@ public:
     sqlite3* handle() const noexcept;
     void exec(const std::string& sql);
     Statement prepare(const std::string& sql);
+    Statement prepare_persistent(const std::string& sql);
 
 private:
     sqlite3* db_;
