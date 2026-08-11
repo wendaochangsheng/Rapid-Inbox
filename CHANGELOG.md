@@ -66,7 +66,7 @@
 - 系统设置、clear-all、邮箱公开/隐藏与删除、邮件删除/重解析均在最终 `BEGIN IMMEDIATE` 事务中
   重新加载会话或 API Key；等待 writer、maintenance drain 或预检之后撤权会 fail-closed 且原子回滚。
 - `HOST` 配为非回环地址时拒绝使用默认 bootstrap/兼容凭据；首次管理员必须修改密码。
-- 已认证的管理写表单启用同源校验，会话 Cookie 使用 HttpOnly/SameSite，HTTPS 下启用 Secure/HSTS。
+- 管理会话 Cookie 使用 HttpOnly/SameSite，HTTPS 下启用 Secure/HSTS。
 - ASGI 请求体同时限制声明长度和 streamed/chunked 实际字节，默认 1 MiB、最大可配 64 MiB，超限返回 413 并关闭连接。
 - 访问日志不记录查询串；Metrics 支持独立令牌，非回环绑定启用指标但未配置令牌时拒绝启动；HTML 邮件使用 sandbox iframe 和严格 CSP。
 - quickstart 下载预编译 ingestd 时校验发布的 SHA-256，不执行校验不匹配的归档。
@@ -90,7 +90,7 @@
 - Python SMTP per-IP 限流状态改用访问 LRU 与 accepted-time 过期索引，摊销 O(1) 清理并按并发上限的四倍分配、硬封顶 65,536 个来源，避免 IPv6 地址轮换造成 O(N²) 扫描和无界增长。
 - 缺失持久 `domain_policy` 的 structured recovery manifest 现在严格 fail-closed 并进入 quarantine，不再用公开默认值复活历史私密域和邮箱。
 - API Key 缓存增加提交后失效 epoch；与 rotate/revoke/delete 并发的冷读取不能在失效之后重新填入旧密钥或旧 usage policy。
-- 修复代理/预览环境下管理员登录被 Origin 校验误拦的问题。
+- 移除管理员表单的 Origin/Referer 强制校验，避免 HTTPS 终止代理改写协议或 Host 后误拦登录及后台操作。
 - 修复重复 canonical 收件人产生重复投递、超长附件文件名、存储路径越界和维护期间收件竞态。
 - 新建更具体托管域或修改 canonical 策略时，历史 catch-all/父域邮箱会在事务内单向提升并安全
   合并重复投递；旧域 Key 不再继续读取已经归入子域的邮箱。

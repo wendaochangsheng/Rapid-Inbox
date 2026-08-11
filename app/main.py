@@ -5,7 +5,6 @@ import ipaddress
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -27,9 +26,6 @@ from app.http.public_views import router as public_views_router
 from app.observability import HTTPObservabilityMiddleware, configure_logging, shutdown_logging
 from app.runtime import RapidInboxRuntime
 from app.smtp.server import SMTPServer
-
-
-UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class HttpConcurrencyLimitMiddleware:
@@ -315,62 +311,13 @@ class RequestSecurityMiddleware:
                 )
                 await response(scope, receive, send_with_security_headers)
                 return
-        if _admin_form_csrf_required(request) and not _is_same_origin_admin_request(request):
-            response = JSONResponse({"detail": "invalid origin"}, status_code=403)
-            await response(scope, receive, send_with_security_headers)
-            return
         await self.app(scope, receive, send_with_security_headers)
-
-
-def _default_port_for_scheme(scheme: str) -> int | None:
-    return {"http": 80, "https": 443}.get(scheme.lower())
-
-
-def _parse_host_port(host_header: str | None) -> tuple[str, int | None] | None:
-    if not host_header:
-        return None
-    parsed = urlparse(f"//{host_header.strip()}")
-    if not parsed.hostname:
-        return None
-    return parsed.hostname.lower(), parsed.port
 
 
 def _request_scheme(request: Request) -> str:
     # Trust only the ASGI scope. Uvicorn updates it after validating the
     # connecting proxy against forwarded_allow_ips; a raw header is spoofable.
     return request.url.scheme.lower()
-
-
-def _origin_matches_request_host(request: Request, value: str | None) -> bool:
-    if not value or value == "null":
-        return False
-    parsed = urlparse(value)
-    if not parsed.scheme or not parsed.hostname:
-        return False
-    request_scheme = _request_scheme(request)
-    origin_scheme = parsed.scheme.lower()
-    if origin_scheme != request_scheme:
-        return False
-    request_host = _parse_host_port(request.headers.get("host"))
-    if request_host is None:
-        return False
-    origin_host = parsed.hostname.lower()
-    origin_port = parsed.port or _default_port_for_scheme(origin_scheme)
-    expected_host, expected_port = request_host
-    expected_port = expected_port or _default_port_for_scheme(request_scheme)
-    if origin_host != expected_host:
-        return False
-    return origin_port == expected_port
-
-
-def _is_same_origin_admin_request(request: Request) -> bool:
-    origin = request.headers.get("origin")
-    if origin:
-        return _origin_matches_request_host(request, origin)
-    referer = request.headers.get("referer")
-    if referer:
-        return _origin_matches_request_host(request, referer)
-    return False
 
 
 def _apply_security_headers(request: Request, headers: MutableHeaders) -> None:
@@ -388,10 +335,6 @@ def _apply_security_headers(request: Request, headers: MutableHeaders) -> None:
         headers["Cache-Control"] = "private, no-store"
     if _request_scheme(request) == "https":
         headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-
-
-def _admin_form_csrf_required(request: Request) -> bool:
-    return request.method.upper() in UNSAFE_METHODS and request.url.path.startswith("/admin")
 
 
 def _is_remote_client(request: Request) -> bool:

@@ -58,7 +58,7 @@ async def test_admin_login_and_dashboard_page_flow(app_client, runtime) -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_login_rejects_missing_origin_header(app_fixture, runtime) -> None:
+async def test_admin_login_accepts_missing_origin_header(app_fixture, runtime) -> None:
     app, _ = app_fixture
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -67,14 +67,14 @@ async def test_admin_login_rejects_missing_origin_header(app_fixture, runtime) -
             data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
         )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "invalid origin"
-    assert response.cookies.get(runtime.settings.session_cookie_name) is None
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/settings?force_password_change=1"
+    assert response.cookies.get(runtime.settings.session_cookie_name) is not None
     assert response.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.asyncio
-async def test_admin_login_rejects_proxy_origin_mismatch(app_fixture, runtime) -> None:
+async def test_admin_login_accepts_reverse_proxy_origin_mismatch(app_fixture, runtime) -> None:
     app, _ = app_fixture
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -84,9 +84,9 @@ async def test_admin_login_rejects_proxy_origin_mismatch(app_fixture, runtime) -
             data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
         )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "invalid origin"
-    assert response.cookies.get(runtime.settings.session_cookie_name) is None
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/settings?force_password_change=1"
+    assert response.cookies.get(runtime.settings.session_cookie_name) is not None
     assert response.headers["cache-control"] == "private, no-store"
 
 
@@ -172,7 +172,7 @@ async def test_admin_logout_revokes_session_and_clears_cookie(app_client, runtim
 
 
 @pytest.mark.asyncio
-async def test_admin_form_posts_reject_cross_origin_requests(app_client, runtime) -> None:
+async def test_admin_form_posts_do_not_enforce_origin(app_client, runtime) -> None:
     await _login_and_change_initial_password(app_client, runtime)
 
     response = await app_client.post(
@@ -180,24 +180,8 @@ async def test_admin_form_posts_reject_cross_origin_requests(app_client, runtime
         headers={"Origin": "https://evil.example"},
     )
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "invalid origin"
-
-
-@pytest.mark.asyncio
-async def test_admin_form_origin_check_ignores_spoofed_forwarded_host(app_client, runtime) -> None:
-    await _login_and_change_initial_password(app_client, runtime)
-
-    response = await app_client.post(
-        "/admin/logout",
-        headers={
-            "Origin": "http://evil.example",
-            "X-Forwarded-Host": "evil.example",
-        },
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"] == "invalid origin"
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/login"
 
 
 @pytest.mark.asyncio
@@ -210,27 +194,15 @@ async def test_admin_security_does_not_trust_direct_forwarded_proto(app_client, 
     assert login.status_code == 303
     assert "secure" not in login.headers["set-cookie"].lower()
 
-    rejected = await app_client.post(
+    logout = await app_client.post(
         "/admin/logout",
         headers={
             "Origin": "https://testserver",
             "X-Forwarded-Proto": "https",
         },
     )
-    assert rejected.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_admin_form_origin_check_rejects_same_host_different_port(app_client, runtime) -> None:
-    await _login_and_change_initial_password(app_client, runtime)
-
-    response = await app_client.post(
-        "/admin/logout",
-        headers={"Origin": "http://testserver:8081"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"] == "invalid origin"
+    assert logout.status_code == 303
+    assert logout.headers["location"] == "/admin/login"
 
 
 @pytest.mark.asyncio
