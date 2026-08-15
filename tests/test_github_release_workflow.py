@@ -10,10 +10,11 @@ WORKFLOW = ROOT / ".github" / "workflows" / "release-ingestd.yml"
 def test_release_workflow_builds_and_publishes_ingestd_binary() -> None:
     content = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "actions/checkout@v4" in content
+    assert "actions/checkout@v7" in content
     assert "cmake -S cpp/ingestd -B cpp/ingestd/build" in content
     assert "ctest --test-dir cpp/ingestd/build --output-on-failure" in content
     assert "rapid-inbox-ingestd-linux-x86_64.tar.gz" in content
-    assert "actions/upload-artifact@v4" in content
-    assert "softprops/action-gh-release@v2" in content
+    assert "actions/upload-artifact@v7" in content
+    assert "actions/download-artifact@v8" in content
+    assert "softprops/action-gh-release@v3" in content
     assert "startsWith(github.ref, 'refs/tags/')" in content
