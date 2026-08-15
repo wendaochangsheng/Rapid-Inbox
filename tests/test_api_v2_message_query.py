@@ -328,6 +328,9 @@ def _query_vm_steps(
     query: str,
     params: tuple[Any, ...],
 ) -> tuple[int, list[sqlite3.Row]]:
+    # SQLite 3.41+ may invoke the progress handler while preparing a statement.
+    # Warm the read-only query so comparisons measure execution work only.
+    connection.execute(query, params).fetchall()
     steps = 0
 
     def count_step() -> int:
