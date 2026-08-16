@@ -14,7 +14,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](CHANGELOG.md)
 
-[快速开始](#快速开始) · [特性](#特性) · [配置](#配置) · [使用](#基本使用) · [贡献](CONTRIBUTING.md) · [安全](SECURITY.md)
+[快速开始](#快速开始) · [Demo](#demo) · [特性](#特性) · [配置](#配置) · [使用](#基本使用) · [贡献](CONTRIBUTING.md) · [安全](SECURITY.md)
 
 </div>
 
@@ -27,6 +27,19 @@ Rapid Inbox 是一个本地优先的临时收件服务，面向 **验证码收�
 核心目标是把 **收得到、看得清、管得住、容易恢复** 做好，不依赖外部邮件服务或云端数据库。
 
 > 项目目前处于早期版本（Alpha），接口和数据结构可能继续调整。
+
+## Demo
+
+![Rapid Inbox 从公开收件箱到邮件详情的演示](docs/assets/rapid-inbox-demo.gif)
+
+<details>
+<summary>查看静态截图</summary>
+
+![Rapid Inbox 邮件详情静态截图](docs/assets/rapid-inbox-demo.png)
+
+</details>
+
+> 演示使用隔离环境中的脱敏测试数据，不包含真实邮箱、邮件或凭据。
 
 ## 特性
 
