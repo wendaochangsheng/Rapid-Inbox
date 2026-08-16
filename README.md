@@ -14,7 +14,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](CHANGELOG.md)
 
-[快速开始](#快速开始) · [Demo](#demo) · [特性](#特性) · [配置](#配置) · [使用](#基本使用) · [贡献](CONTRIBUTING.md) · [安全](SECURITY.md)
+[快速开始](#快速开始) · [Demo](#demo) · [路线图](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5) · [特性](#特性) · [配置](#配置) · [使用](#基本使用) · [贡献](CONTRIBUTING.md) · [安全](SECURITY.md)
 
 </div>
 
