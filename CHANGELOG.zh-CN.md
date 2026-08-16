@@ -6,8 +6,18 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 新增主要的一键 Docker Compose 部署：多阶段源码构建、非 root 只读应用容器、私密随机凭据、
+  持久 named volume、迁移/readiness 门禁、HTTP/SMTP 联合健康检查，以及在同一 PID namespace
+  内对 Python/C++ 进程的优雅监督。
+- 新增次要的 Debian/Ubuntu 原生 systemd 安装器：专用服务账户、版本化 release、加固后的
+  HTTP/SMTP unit、停服前完成构建、一致 SQLite 备份、失败回滚、协议验收及保留数据的卸载边界。
+
 ### 变更
 
+- Docker Compose 成为推荐部署方式，原生 systemd 作为次要方式；`quickstart.sh` 明确降为本地
+  试用/开发用前台启动器。
 - 项目对外 Markdown 改为中英双语：标准文件名使用英文，完整简体中文版本使用 `.zh-CN.md`
   后缀，GitHub Issue/PR 模板在同一文件中同时展示两种语言。
 - 明确项目的适用场景、单机部署、数据保留、授权使用、公开查阅、平台兼容和 Alpha 成熟度边界；

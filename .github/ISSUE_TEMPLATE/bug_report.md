@@ -35,7 +35,7 @@ Describe what actually happened. Include logs or screenshots when useful.
 - Rapid Inbox commit or version / 提交哈希或版本：
 - Python version / Python 版本：
 - Operating system / 操作系统：
-- Start command / 启动方式：`rapid-inbox-http` / `rapid-inbox-smtp` / `uvicorn`
+- Deployment or start command / 部署或启动方式：`docker-deploy.sh` / systemd installer / `quickstart.sh` / manual entry point
 
 ## Additional context / 补充信息
 

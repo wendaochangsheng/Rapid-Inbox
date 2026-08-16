@@ -17,6 +17,7 @@
 - [ ] Admin UI / 管理后台页面
 - [ ] Public inbox UI / 公开收件箱页面
 - [ ] SMTP ingest path / SMTP 接收流程
+- [ ] Docker or systemd deployment / Docker 或 systemd 部署
 - [ ] Documentation / 文档
 
 ## Notes / 备注

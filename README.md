@@ -48,7 +48,7 @@ the public Internet still requires your own domain, DNS/MX records, and a reacha
 | Dimension | Current boundary |
 | --- | --- |
 | **Intended use** | Self-hosted inbound test mail, verification-code extraction, CI/E2E email capture, and internal-tool integration |
-| **Deployment model** | A single host using local disk and SQLite; run one C++ ingestd per data directory, preferably with one Python HTTP process |
+| **Deployment model** | Single-host local disk and SQLite. Docker Compose is the primary deployment path; the native systemd installer is secondary. Both run exactly one C++ ingestd and one Python HTTP process for one data directory |
 | **HTTP paths** | The UI and API currently support deployment only at the site root `/`; reverse-proxy subpaths and ASGI `root_path` are not supported |
 | **Explicit non-goals** | Outbound SMTP, IMAP/POP3, a full public MTA, hosted mailbox SaaS, advanced anti-spam or malicious-attachment sandboxing, and enterprise multi-node HA |
 | **Operator responsibilities** | The project does not host or automatically configure DNS/MX, SMTP TLS termination, firewalls, backups, or global rate limiting across instances |
@@ -94,114 +94,115 @@ See [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)
 
 ## Technology Stack
 
-`C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket` · `SSE`
+`Docker Compose` · `C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket` · `SSE`
 
 ## Quick Start
 
+### Docker Compose (primary)
+
+Docker Compose is the recommended deployment method. From a reviewed checkout, with Docker Engine
+and Compose v2 installed, run:
+
 ```bash
-bash quickstart.sh
+./docker-deploy.sh
 ```
 
-The script creates `.venv`, installs dependencies, and copies `.env.example`. Python initializes
-the SQLite schema and applies lightweight migrations before C++ ingestd starts, preventing ingestd
-from reading tables that do not yet exist on the first launch. By default, the script downloads a
-prebuilt ingestd from GitHub Releases, verifies its SHA-256 checksum, and uses these bindings:
+This one command builds the image, creates a mode-`0600` private configuration with random bootstrap,
+cursor-signing, and metrics secrets, starts the Python control plane, waits for schema migration and
+`/health/ready`, then starts the C++ SMTP ingress. The image runs as a non-root user. Both processes
+are supervised in one container and one PID namespace because the cross-process maintenance protocol
+records and verifies operating-system PIDs.
+
+Default host bindings:
 
 ```text
 HTTP: 127.0.0.1:8000
 SMTP: 0.0.0.0:25
 ```
 
-The default quickstart launches C++ SMTP ingestd on `0.0.0.0:25`. Ingestd writes mail metadata,
-text/HTML bodies, attachments, and verification codes directly into the existing SQLite database
-and `storage/` directory. The Python service handles only HTTP, the admin console, and the public
-API. If database initialization or migration fails, the script exits without starting HTTP or
-ingestd.
-
-Open the admin console:
+The first successful deployment prints the initial administrator password once. Open:
 
 ```text
 http://127.0.0.1:8000/admin/login
 ```
 
-The first run creates a bootstrap administrator. When `quickstart.sh` copies `.env.example` for
-the first time, it generates a random password and prints it to the terminal once:
-
-```text
-Username: admin
-Password: <random password printed by quickstart>
-```
-
 > After the first bootstrap administrator login, the admin console **forces** a change of the
-> initial password on the system settings page. No other admin page is accessible until the
-> password is changed. If you bypass quickstart and manually use `change-me-now`, the service
-> refuses to start with unsafe default credentials when `HOST` is configured as a non-loopback
-> address.
+> initial password. The generated value remains in `.rapid-inbox-docker/rapid-inbox.env`; protect
+> this file as a secret and replace the password in the administration UI immediately.
 
-The default launcher uses the current working directory as the project runtime directory. When
-started from the repository root, data is written to:
+Mail, SQLite, manifests, and attachments are persisted in the Compose named volume
+`rapid-inbox_rapid-inbox-data` by default. The deployment script never removes this volume.
+Use the wrapper for lifecycle operations:
 
-```text
-./storage/
-./storage/app.db
+```bash
+./docker-deploy.sh status
+./docker-deploy.sh logs
+./docker-deploy.sh credentials
+./docker-deploy.sh update   # rebuild the current checkout with fresh base images
+./docker-deploy.sh down     # retain configuration and the named data volume
 ```
+
+Edit `.rapid-inbox-docker/rapid-inbox.env` to change published addresses, ports, or application
+settings, then run `./docker-deploy.sh` again. For reproducible updates, check out a reviewed tag or
+commit first; `update` does not fetch source code.
+
+> [!CAUTION]
+> Do not run `docker compose down -v` unless permanent deletion of the named volume is intended.
+> Stop the deployment before making a consistent backup, and back up both the named volume and the
+> private configuration. Do not place the SQLite volume on NFS or another filesystem without reliable
+> local POSIX locking, and do not scale the Compose service beyond one replica.
 
 > [!WARNING]
 > Before the first Internet-facing deployment, confirm that the bootstrap password has been
-> changed and that a Metrics Token was generated by quickstart or configured manually. Compatibility
+> changed and keep the generated Metrics Token private. Compatibility
 > `ADMIN_TOKEN` / `PUBLIC_API_KEY` credentials are disabled by default; new integrations should use
-> API Keys issued from the admin console. HTTP listens only on `127.0.0.1` by default. If explicitly
-> changed to a non-loopback address, quickstart prints a prominent warning. The admin plane must sit
-> behind a trusted HTTPS reverse proxy; do not expose Uvicorn without TLS directly to an untrusted
-> network.
+> API Keys issued from the admin console. HTTP is published only on host loopback by default. Put the
+> admin plane behind a trusted HTTPS reverse proxy before changing that binding. The deployment does
+> not configure DNS/MX, TLS termination, firewall rules, backups, or upstream anti-abuse controls.
 
-To force a local build of C++ ingestd instead of downloading the GitHub Release binary:
+See the [Docker deployment guide](deploy/docker/README.md) for backup, restore, rollback, port, and
+troubleshooting procedures.
 
-```bash
-bash quickstart.sh --build-local
-```
+### Native systemd (secondary)
 
-To download a reviewed version or use a specific binary URL:
+For Debian 12+ or Ubuntu 24.04+ hosts that require native services instead of Docker:
 
 ```bash
-bash quickstart.sh --ingestd-version "$REVIEWED_INGESTD_TAG"
-bash quickstart.sh --binary-url https://example.com/rapid-inbox-ingestd-linux-x86_64.tar.gz
+sudo bash deploy/system/install.sh install
 ```
 
-The deployer should set `REVIEWED_INGESTD_TAG` to a reviewed tag that actually exists in this
-repository. A custom binary URL should provide a sibling `.sha256` file; alternatively, pass a
-trusted checksum explicitly as `INGESTD_SHA256=<64-hex-character-value>`. A downloaded file is not
-executed when verification fails.
-
-When no version is specified, the script still uses GitHub's mutable `latest` pointer and prints a
-drift warning. A sibling `.sha256` proves only that the download matches that release asset; it does
-not pin a version. Reproducible deployments should use a reviewed release tag that actually exists
-in this repository, or use `--build-local` from a fixed, reviewed source commit. See
-[GitHub Releases](https://github.com/wendaochangsheng/Rapid-Inbox/releases) for current releases,
-such as `v0.1.0`.
-
-> Current CI and prebuilt assets are verified only on Ubuntu 24.04 / Linux x86_64, and the binary
-> is dynamically linked. There is no compatibility matrix for other distributions or platforms.
-> On non-Linux-x86_64 systems, after a download failure, or when `--build-local` is specified,
-> quickstart attempts a local build.
-
-Install the following packages first if a local build is required:
+The installer creates a dedicated `rapid-inbox` account, installs dependencies, stages a versioned
+release under `/opt/rapid-inbox`, generates `/etc/rapid-inbox/rapid-inbox.env`, keeps data under
+`/var/lib/rapid-inbox`, initializes and backs up SQLite at the write boundary, installs hardened
+HTTP/SMTP units, and verifies HTTP plus SMTP protocol readiness.
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip cmake g++ libsqlite3-dev libssl-dev libunistring-dev libicu-dev
+sudo bash deploy/system/install.sh status
+sudo bash deploy/system/install.sh update
+sudo bash deploy/system/install.sh uninstall  # preserves configuration and data
 ```
 
-To use only the embedded Python SMTP compatibility mode:
+See the [native systemd deployment guide](deploy/system/README.md) for the exact support boundary,
+managed paths, update rollback, and uninstall behavior.
+
+### Local source launcher
+
+`quickstart.sh` is retained for local evaluation and development. It is a foreground launcher, not
+a long-running production process manager:
 
 ```bash
-bash quickstart.sh --python-smtp
+bash quickstart.sh
 ```
 
-## Startup Modes
+It creates `.venv` and `.env`, initializes SQLite, and runs Python HTTP with C++ ingestd. By default,
+it downloads the mutable `latest` ingestd release after SHA-256 verification; pin a reviewed release
+with `--ingestd-version`, or build the current checkout with `--build-local`. Run
+`bash quickstart.sh --help` for all options, including the Python SMTP compatibility mode.
+
+## Local Development and Manual Startup
 
 <details>
-<summary><b>C++ SMTP ingestd + Python HTTP</b> (recommended deployment topology)</summary>
+<summary><b>C++ SMTP ingestd + Python HTTP</b> (manual development topology)</summary>
 
 ```bash
 # 1. Build the C++ SMTP ingress
@@ -264,11 +265,12 @@ run `rapid-inbox-ingestd` in another process. For development, use `rapid-inbox-
 
 </details>
 
-## Release Binaries
+## CI and Release Binaries
 
 The repository includes the GitHub Actions workflow `.github/workflows/release-ingestd.yml`:
 
-- Regular pushes and pull requests run Python tests and build and test C++ ingestd.
+- Regular pushes and pull requests run Python tests, validate both deployment paths, execute a real
+  one-command Docker smoke deployment, and build/test C++ ingestd.
 - Pushing a `v*` tag builds a Linux x86_64 release archive and publishes these files to a GitHub Release:
   - `rapid-inbox-ingestd-linux-x86_64.tar.gz`
   - `rapid-inbox-ingestd-linux-x86_64.tar.gz.sha256`
@@ -284,17 +286,22 @@ The publisher should set `NEW_RELEASE_TAG` explicitly according to the actual ve
 Published versions are listed under
 [GitHub Releases](https://github.com/wendaochangsheng/Rapid-Inbox/releases).
 
-After a Release is published, `bash quickstart.sh` downloads prebuilt ingestd from the mutable latest
+The Docker path builds a local image from the reviewed checkout; this workflow does not currently
+publish a container image. After a Release is published, local-development `bash quickstart.sh`
+downloads prebuilt ingestd from the mutable latest
 release by default and prints a drift warning. Reproducible deployments should explicitly pass a
 reviewed tag; use `--build-local` when a local build is required.
 
 ## Configuration
 
-The launcher resolves variables in this order:
+The application resolves variables in this order:
 
 ```text
 Process environment  >  .env in the current working directory  >  defaults in app/config.py
 ```
+
+Docker passes `.rapid-inbox-docker/rapid-inbox.env` as process environment; systemd uses
+`/etc/rapid-inbox/rapid-inbox.env`. The repository `.env.example` is the local-source template.
 
 <details>
 <summary><b>Complete environment variable table</b></summary>
@@ -306,13 +313,13 @@ Python HTTP, compatibility SMTP, and shared configuration:
 | `STORAGE_ROOT` | `./storage` | Root directory for message files, attachments, manifests, and temporary files |
 | `DATABASE_PATH` | `./storage/app.db` | SQLite database path; Python and ingestd must point to the same file |
 | `BOOTSTRAP_ADMIN_USERNAME` | `admin` | Administrator username created automatically on the first start |
-| `BOOTSTRAP_ADMIN_PASSWORD` | `change-me-now` (randomized by quickstart) | The code fallback for manual startup is also `change-me-now` and must not be used with an Internet-facing bind |
+| `BOOTSTRAP_ADMIN_PASSWORD` | `change-me-now` (randomized by deployment scripts and quickstart) | The code fallback for manual startup is also `change-me-now` and must not be used with an Internet-facing bind |
 | `SESSION_COOKIE_NAME` | `rapid_inbox_session` | Name of the HttpOnly administrator session cookie |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | HTTP listen address and port; a non-loopback bind must be placed behind a trusted HTTPS reverse proxy |
 | `HTTP_MAX_REQUEST_BODY_BYTES` | `1048576` | ASGI request-body limit for both `Content-Length` and streamed/chunked bodies; configurable up to 64 MiB |
 | `HTTP_REQUEST_BODY_TIMEOUT_SECONDS` | `15` | Total time allowed to receive one complete HTTP request body, mitigating slow chunked uploads |
 | `HTTP_BODY_MEMORY_BUDGET_BYTES` | `268435456` | Shared per-process byte budget for all buffered HTTP request bodies; must be at least the per-request limit |
-| `HTTP_CONCURRENCY_LIMIT` | `1000` | Per-process admission limit across HTTP and WebSocket traffic; quickstart also passes it to Uvicorn as `--limit-concurrency`, and application middleware enforces it |
+| `HTTP_CONCURRENCY_LIMIT` | `1000` | Per-process admission limit across HTTP and WebSocket traffic; supported launchers also pass it to Uvicorn as `--limit-concurrency`, and application middleware enforces it |
 | `HTTP_LIVE_CONNECTION_LIMIT` | `256` | Shared per-HTTP-process limit for admin SSE and public-mailbox WebSocket long-lived connections; excess connections receive 503/1013 |
 | `DATABASE_WRITE_QUEUE_CAPACITY` / `DATABASE_WRITE_MAX_WAITERS` | `256` / `1024` | Dual limits for requests accepted by the single SQLite write actor and requests waiting for it; excess load fails fast with 503 |
 | `DATABASE_READ_POOL_SIZE` / `DATABASE_READ_QUEUE_CAPACITY` / `DATABASE_READ_MAX_WAITERS` / `DATABASE_READ_TIMEOUT_SECONDS` | `1` / `256` / `1024` / `5` | API v2 dedicated read-only actors, admitted-request and waiting-request limits, and end-to-end read timeout. A single actor is the conservative default; benchmark the actual workload before increasing connections. Maintenance first drains requests, then the owner thread closes connections. All values are calculated independently per HTTP process |
@@ -350,7 +357,7 @@ Python HTTP, compatibility SMTP, and shared configuration:
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | Log level and `json` / `text` format |
 | `REQUEST_LOG_ENABLED` | `true` | Whether to record structured HTTP access logs without query strings |
 | `METRICS_ENABLED` / `METRICS_TOKEN` | `true` / empty | Prometheus endpoint toggle and token; when metrics are enabled on a non-loopback bind, a token is required or startup is refused |
-| `API_CURSOR_SECRET` | empty (randomized by quickstart) | HMAC secret for API v2 cursors; manual Internet-facing deployments must configure at least 32 characters |
+| `API_CURSOR_SECRET` | empty (randomized by deployment scripts and quickstart) | HMAC secret for API v2 cursors; manual Internet-facing deployments must configure at least 32 characters |
 | `READINESS_MIN_FREE_DISK_BYTES` | `67108864` | Minimum free disk space required for readiness |
 | `ADMIN_TOKEN` / `PUBLIC_API_KEY` | disabled | v1 compatibility tokens; enabled only when explicitly configured with non-default random values |
 
@@ -520,7 +527,10 @@ scaling promise or an unmeasured throughput guarantee:
 - The `/api/v2` SQLite hot path is offloaded to dedicated actors and raw/attachment responses remain streamed. The dashboard uses a roughly 1.5-second shared cache and a stampede-prevention lock. New high-concurrency integrations should prefer v2; retained v1 routes remain compatibility surface. These optimizations do not remove disk IOPS or the SQLite single-writer ceiling.
 - API-Key authentication uses a bounded approximately two-second in-process cache. Cache hits do not switch to the default thread pool; misses perform an asynchronous database read. Key changes in this process actively invalidate the cache after commit; selected-domain authorization is not cached to preserve FK-level fail-closed behavior. `last_used_at` is written at most about every 30 seconds, so it is an operations signal rather than a per-request audit trail.
 - API-Key rate limiting uses a fixed-memory token bucket per Key. Bucket capacity equals the per-minute quota and refills evenly over 60 seconds, allowing short bursts up to the bucket capacity. State remains per HTTP process; with N workers, total available quota is roughly N times the per-process quota. Enforce a strict global quota at a reverse proxy/gateway.
-- Run one ingestd and one HTTP process per data directory. Do not place SQLite WAL on a network filesystem without guaranteed POSIX lock semantics, and do not let multiple hosts share the same `app.db`.
+- Run exactly one ingestd and one HTTP process for a data directory. Do not scale the Compose `app`
+  service, deploy multiple Swarm/Kubernetes replicas, or point independently managed containers at
+  the same volume. Do not place SQLite WAL on a network filesystem without reliable POSIX locking,
+  and do not let multiple hosts share one `app.db`.
 - C++ and Python SMTP currently do not implement or advertise STARTTLS. For encrypted public transport, terminate TLS at a verified SMTP proxy or expose the receipt port only to a trusted network; place the HTTP admin plane behind an HTTPS reverse proxy as well.
 
 Before tuning workers, batches, queues, fsync, or HTTP concurrency, use the repository stress scripts on
@@ -620,10 +630,15 @@ semantics:
 - Mail expiry is delivery-level `expires_at`; `retention_days=NULL/0` means no automatic expiry and no longer inherits the old global 10-minute rule.
 - C++ ingestd enables durable ACK by default. If an earlier deployment depended on the very low latency of "in-memory enqueue means 250," it can be disabled explicitly, with the risk of losing mail on an abnormal exit.
 
-Before upgrading, back up `storage/`, stop the old HTTP/SMTP processes during a maintenance window,
-and start only one new instance to complete lightweight SQLite migrations before starting ingestd.
-Do not let old and new binaries write the same database concurrently. Afterward, recheck domain public
-switches, Key `domain_grant_mode`, retention, Metrics Token, and fsync choices.
+Before every upgrade, retain a restorable copy of configuration, mail artifacts, and SQLite. For
+Docker, stop the deployment, back up `.rapid-inbox-docker/rapid-inbox.env` and the named volume, check
+out the reviewed target commit, then run `./docker-deploy.sh`; the wrapper starts SMTP only after HTTP
+migration and readiness succeed. For systemd, `sudo bash deploy/system/install.sh update` stages and
+builds first, then stops both writers, creates a consistent SQLite backup, migrates, switches the
+release, and performs HTTP/SMTP acceptance. Manual deployments must stop all old HTTP/SMTP processes
+and allow exactly one migrator before ingestd starts. Never let old and new binaries write the same
+database concurrently. Afterward, recheck domain public switches, Key `domain_grant_mode`, retention,
+Metrics Token, and fsync choices.
 
 ## Development
 
@@ -687,7 +702,7 @@ virtual environment, rerun the installation command so entry points and dependen
 - Catch-all mode accepts deliveries that have reached this SMTP service and whose RCPT domain syntax is valid, but it does not replace DNS/MX configuration. Read access is private by default; do not enable public Web/API globally for convenience.
 - When `/metrics` is enabled on a non-loopback bind, `METRICS_TOKEN` is mandatory or startup is refused; the metrics endpoint can also be disabled.
 - API-Key token buckets are local to one HTTP process. Multi-process deployments must also enforce global rate limits at a trusted reverse proxy.
-- SMTP port `25` requires administrative privileges on some systems. Production deployments should use port mapping or a dedicated service account.
+- Docker maps host port `25` to non-privileged container port `2525`; the systemd unit grants only `CAP_NET_BIND_SERVICE` to its dedicated account. Manual deployments still need an equivalent privilege boundary.
 - Public inboxes are intended for testing and temporary workflows, not sensitive long-term mail.
 - Do not commit `.env`, `storage/`, databases, or persisted mail files to Git.
 

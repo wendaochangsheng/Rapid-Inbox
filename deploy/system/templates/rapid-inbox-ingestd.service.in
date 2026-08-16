@@ -1,0 +1,37 @@
+[Unit]
+Description=Rapid Inbox C++ SMTP ingestion plane
+Requires=rapid-inbox-http.service
+After=network-online.target rapid-inbox-http.service
+PartOf=rapid-inbox.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@CURRENT_DIR@
+Environment=HOME=@DATA_ROOT@
+EnvironmentFile=@CONFIG_FILE@
+ExecStart=@CURRENT_DIR@/bin/rapid-inbox-ingestd --base-dir @CURRENT_DIR@
+ExecStartPost=@CURRENT_DIR@/.venv/bin/python @CURRENT_DIR@/deploy/system/verify_deployment.py --base-dir @CURRENT_DIR@ --smtp-only --timeout 30 --quiet
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=60s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+UMask=0077
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=@CONFIG_DIR@
+ReadWritePaths=@DATA_ROOT@
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

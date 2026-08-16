@@ -1,0 +1,62 @@
+x-rapid-inbox-runtime: &rapid-inbox-runtime
+  image: rapid-inbox:${RAPID_INBOX_IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - ${RAPID_INBOX_CONFIG_FILE:-./.rapid-inbox-docker/rapid-inbox.env}
+  environment:
+    DATABASE_PATH: /var/lib/rapid-inbox/app.db
+    HOST: 0.0.0.0
+    PORT: "8000"
+    SMTP_HOST: 0.0.0.0
+    SMTP_PORT: "2525"
+    STORAGE_ROOT: /var/lib/rapid-inbox
+  volumes:
+    - rapid-inbox-data:/var/lib/rapid-inbox
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  app:
+    <<: *rapid-inbox-runtime
+    command:
+      - run
+    restart: unless-stopped
+    stop_grace_period: 2m
+    ports:
+      - target: 8000
+        published: ${HTTP_PUBLISHED_PORT:-8000}
+        host_ip: ${HTTP_PUBLISHED_ADDRESS:-127.0.0.1}
+        protocol: tcp
+      - target: 2525
+        published: ${SMTP_PUBLISHED_PORT:-25}
+        host_ip: ${SMTP_PUBLISHED_ADDRESS:-0.0.0.0}
+        protocol: tcp
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - /usr/local/lib/rapid-inbox/healthcheck.py
+        - all
+        - --http-host
+        - 127.0.0.1
+        - --http-port
+        - "8000"
+        - --smtp-host
+        - 127.0.0.1
+        - --smtp-port
+        - "2525"
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  rapid-inbox-data:

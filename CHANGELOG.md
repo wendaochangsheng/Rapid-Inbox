@@ -6,8 +6,20 @@ This project records notable changes in the spirit of [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+### Added
+
+- Added the primary one-command Docker Compose deployment: a multi-stage source build, non-root and
+  read-only application container, private generated credentials, a persistent named volume,
+  migration/readiness gating, combined HTTP/SMTP health checks, and graceful supervision of the
+  Python and C++ processes in one PID namespace.
+- Added the secondary native Debian/Ubuntu systemd installer with a dedicated service account,
+  versioned releases, hardened HTTP/SMTP units, build-before-downtime updates, consistent SQLite
+  backups, rollback handling, protocol acceptance, and data-preserving uninstall behavior.
+
 ### Changed
 
+- Docker Compose is now the recommended deployment path, native systemd is the secondary path, and
+  `quickstart.sh` is documented as a local evaluation/development foreground launcher.
 - Made project-facing Markdown bilingual: standard filenames now contain English, complete
   Simplified Chinese versions use the `.zh-CN.md` suffix, and GitHub Issue/PR templates present
   both languages in one file.

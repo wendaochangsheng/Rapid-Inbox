@@ -33,6 +33,68 @@ jobs:
       - name: Run Python tests
         run: python -m pytest -q
 
+  deployment-tests:
+    name: Docker and systemd deployment tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints-dev.txt -e ".[dev]"
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Validate deployment scripts and helpers
+        run: |
+          shellcheck quickstart.sh docker-deploy.sh deploy/docker/entrypoint.sh deploy/system/install.sh
+          python -m pytest -q tests/test_docker_healthcheck.py tests/test_system_deployment.py
+
+      - name: Run the one-command Docker deployment smoke test
+        env:
+          RAPID_INBOX_COMPOSE_PROJECT: rapid-inbox-ci
+          RAPID_INBOX_CONFIG_FILE: ${{ runner.temp }}/rapid-inbox-ci.env
+        run: |
+          cleanup() {
+            ./docker-deploy.sh down >/dev/null 2>&1 || true
+            docker volume rm rapid-inbox-ci_rapid-inbox-data >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          umask 077
+          {
+            printf 'BOOTSTRAP_ADMIN_USERNAME=admin\n'
+            printf 'BOOTSTRAP_ADMIN_PASSWORD=ci-only-bootstrap-password-123456\n'
+            printf 'API_CURSOR_SECRET=ci-only-cursor-secret-1234567890123456789012345678901234567890\n'
+            printf 'METRICS_ENABLED=true\n'
+            printf 'METRICS_TOKEN=ci-only-metrics-token-1234567890\n'
+            printf 'HTTP_CONCURRENCY_LIMIT=1000\n'
+            printf 'HTTP_PUBLISHED_ADDRESS=127.0.0.1\n'
+            printf 'HTTP_PUBLISHED_PORT=18080\n'
+            printf 'SMTP_PUBLISHED_ADDRESS=127.0.0.1\n'
+            printf 'SMTP_PUBLISHED_PORT=12525\n'
+          } > "$RAPID_INBOX_CONFIG_FILE"
+
+          ./docker-deploy.sh
+          python deploy/docker/healthcheck.py all \
+            --http-host 127.0.0.1 --http-port 18080 \
+            --smtp-host 127.0.0.1 --smtp-port 12525
+
+          container_id="$(docker ps -q \
+            --filter label=com.docker.compose.project=rapid-inbox-ci \
+            --filter label=com.docker.compose.service=app)"
+          test -n "$container_id"
+          test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = \
+            'rapid-inbox:rapid-inbox'
+
   build-ingestd-linux-x86_64:
     name: Build ingestd Linux x86_64
     runs-on: ubuntu-24.04
@@ -97,6 +159,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - python-tests
+      - deployment-tests
       - build-ingestd-linux-x86_64
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

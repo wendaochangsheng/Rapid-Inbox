@@ -52,12 +52,22 @@ ctest --test-dir cpp/ingestd/build --output-on-failure
 ```bash
 .venv/bin/pytest
 python3 -m compileall -q app tests
+shellcheck quickstart.sh docker-deploy.sh deploy/docker/entrypoint.sh deploy/system/install.sh
 ```
 
 这组命令不会构建 ingestd，也不会执行 CTest；若 `cpp/ingestd/build/rapid-inbox-ingestd` 尚不存在，
 根 `pytest` 收集到的 3 个跨语言集成测试会显示为 skipped。涉及 C++ 或共享收件链路时，应先执行
 上方构建/CTest，再重新运行 `tests/test_cpp_ingestd_integration.py`。
 如果改动只涉及文档，请确保链接、命令、版本和文件名仍然准确。
+涉及 Docker 部署时还必须在 fresh checkout 通过配置渲染和全新 `docker build`：
+
+```bash
+RAPID_INBOX_CONFIG_FILE=/dev/null \
+  docker compose --env-file /dev/null -f compose.yaml config --quiet
+```
+
+涉及原生安装器时必须通过 `bash -n`、ShellCheck、渲染后 unit 校验及隔离的静态/helper 测试，
+不能在开发主机安装 unit。
 
 ## 分支与提交
 
@@ -77,7 +87,8 @@ python3 -m compileall -q app tests
 | `chore:` | 构建、依赖、工具链等杂项 |
 
 > [!IMPORTANT]
-> 不要提交 `.env`、`storage/`、数据库文件、邮件样本中的真实密钥或个人数据。
+> 不要提交 `.env`、`.rapid-inbox-docker/`、`storage/`、数据库文件、部署凭据、邮件样本中的真实密钥
+> 或个人数据。
 
 ## Pull Request
 
@@ -105,7 +116,7 @@ PR 描述建议包含：
 - 版本或提交哈希
 - Python 版本
 - 操作系统
-- 启动方式（`rapid-inbox-http` / `rapid-inbox-smtp` / `uvicorn`）
+- 启动方式（`docker-deploy.sh` / systemd 安装器 / `quickstart.sh` / 手工入口）
 - 复现步骤
 - 期望结果和实际结果
 - 相关日志或截图

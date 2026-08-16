@@ -1,0 +1,38 @@
+[Unit]
+Description=Rapid Inbox HTTP control plane
+Wants=network-online.target
+After=network-online.target
+Before=rapid-inbox-ingestd.service
+PartOf=rapid-inbox.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@CURRENT_DIR@
+Environment=HOME=@DATA_ROOT@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=@CONFIG_FILE@
+ExecStart=@CURRENT_DIR@/.venv/bin/python @CURRENT_DIR@/deploy/system/run_http.py --base-dir @CURRENT_DIR@
+ExecStartPost=@CURRENT_DIR@/.venv/bin/python @CURRENT_DIR@/deploy/system/verify_deployment.py --base-dir @CURRENT_DIR@ --http-only --timeout 30 --quiet
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=90s
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=@CONFIG_DIR@
+ReadWritePaths=@DATA_ROOT@
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

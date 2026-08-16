@@ -5,6 +5,8 @@
 .vscode/
 .worktrees/
 .rapid-inbox-run/
+.rapid-inbox-docker/
+.rapid-inbox-backups/
 cpp/ingestd/build*/
 storage/
 __pycache__/

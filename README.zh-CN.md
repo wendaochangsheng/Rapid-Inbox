@@ -43,7 +43,7 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 | 维度 | 当前边界 |
 | --- | --- |
 | **适用场景** | 自托管的入站测试收件、验证码提取、CI/E2E 邮件捕获和内部工具联调 |
-| **部署模型** | 单机、本地磁盘与 SQLite；一个数据目录运行一个 C++ ingestd，并建议配一个 Python HTTP 进程 |
+| **部署模型** | 单机、本地磁盘与 SQLite；Docker Compose 是主要部署方式，原生 systemd 安装器是次要方式；两者都只为一个数据目录运行一个 C++ ingestd 和一个 Python HTTP 进程 |
 | **HTTP 路径** | 当前 UI/API 只支持发布在站点根路径 `/`；反向代理子路径和 ASGI `root_path` 尚不属于支持范围 |
 | **明确非目标** | 发信 SMTP、IMAP/POP3、完整公网 MTA、托管邮箱 SaaS、复杂反垃圾/恶意附件沙箱和企业级多节点 HA |
 | **部署者/外部运维职责** | 本项目不代管或自动配置 DNS/MX、SMTP TLS 终止、防火墙、备份及多实例全局限流 |
@@ -87,98 +87,102 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 
 ## 技术栈
 
-`C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket` · `SSE`
+`Docker Compose` · `C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket` · `SSE`
 
 ## 快速开始
 
+### Docker Compose 一键部署（主要方式）
+
+Docker Compose 是推荐部署方式。在已经审核的源码检出中安装好 Docker Engine 与 Compose v2 后执行：
+
 ```bash
-bash quickstart.sh
+./docker-deploy.sh
 ```
 
-脚本会自动创建 `.venv`、安装依赖、复制 `.env.example`，先由 Python 完成 SQLite schema 初始化和
-轻量迁移，成功后才会启动 C++ ingestd，从而避免首次启动时 ingestd 抢先读取尚不存在的表。默认从
-GitHub Releases 下载并校验 SHA-256 后使用预编译 ingestd。默认绑定：
+这一条命令会构建镜像、生成权限为 `0600` 的私密配置和随机 bootstrap/cursor/metrics 密钥，先启动
+Python 控制面并等待 schema 迁移与 `/health/ready`，再启动 C++ SMTP 入口。镜像使用非 root 用户；
+两个进程由同一个容器监督并共享 PID namespace，因为跨进程维护协议会记录并校验操作系统 PID。
+
+宿主机默认绑定：
 
 ```text
 HTTP: 127.0.0.1:8000
 SMTP: 0.0.0.0:25
 ```
 
-默认 quickstart 会在 `0.0.0.0:25` 启动 C++ SMTP ingestd。邮件元数据、text/html 正文、附件和验证码会由 ingestd 直接写入现有 SQLite 数据库和 `storage/` 目录；Python 服务只负责 HTTP、管理后台和公开 API。
-数据库初始化或迁移失败时，脚本会整体退出，不会启动 HTTP 或 ingestd。
-
-打开管理后台：
+首次成功部署会只显示一次初始管理员密码。管理后台地址：
 
 ```text
 http://127.0.0.1:8000/admin/login
 ```
 
-首次运行会创建 bootstrap 管理员。`quickstart.sh` 在第一次复制 `.env.example`
-时生成随机密码，并在终端中只显示一次：
-
-```text
-用户名：admin
-密码：<quickstart 输出的随机密码>
-```
-
 > 首次 bootstrap 管理员登录后，后台会**强制**进入系统设置页修改初始密码；完成改密前不能访问其他后台页面。
-> 如果绕过 quickstart 手工使用 `change-me-now`，将 `HOST` 配为非回环地址时服务会拒绝以不安全默认凭据启动。
+> 生成值保存在 `.rapid-inbox-docker/rapid-inbox.env`；应把它按密钥保护，并在后台立即修改初始密码。
 
-默认启动器使用当前工作目录作为项目运行目录。从仓库根目录启动时，数据会写入：
+邮件、SQLite、manifest 与附件默认持久化到 Compose named volume
+`rapid-inbox_rapid-inbox-data`。部署脚本不会删除这个卷。日常操作统一使用：
 
-```text
-./storage/
-./storage/app.db
+```bash
+./docker-deploy.sh status
+./docker-deploy.sh logs
+./docker-deploy.sh credentials
+./docker-deploy.sh update   # 使用新基础镜像重新构建当前源码检出
+./docker-deploy.sh down     # 保留私密配置与 named volume
 ```
+
+修改 `.rapid-inbox-docker/rapid-inbox.env` 可以调整发布地址、端口或应用配置，随后重新执行
+`./docker-deploy.sh`。可重复升级应先切换到已审核 tag 或 commit；`update` 不会替你拉取源码。
+
+> [!CAUTION]
+> 除非明确要永久删除数据，不要执行 `docker compose down -v`。一致备份前先停服务，同时备份 named
+> volume 与私密配置。不要把 SQLite 卷放在不保证本地 POSIX 锁语义的 NFS 等网络文件系统，也不要把
+> Compose 服务扩容到一个以上副本。
 
 > [!WARNING]
-> 首次对外部署前，请确认 bootstrap 密码已更换，并确认 Metrics Token 已由 quickstart 生成或手工配置。兼容用
+> 首次对外部署前，请确认 bootstrap 密码已更换，并妥善保管生成的 Metrics Token。兼容用
 > `ADMIN_TOKEN` / `PUBLIC_API_KEY` 默认不启用；新接入应使用后台签发的 API Key。HTTP 默认只监听
-> `127.0.0.1`；显式改为非回环地址时 quickstart 会输出醒目警告，管理面必须放在可信 HTTPS 反向代理后，
-> 不应把无 TLS 的 Uvicorn 直接暴露到不可信网络。
+> 宿主机 `127.0.0.1`。改为非回环地址前必须配置可信 HTTPS 反向代理，不能把无 TLS 的 Uvicorn 直接
+> 暴露到不可信网络。部署脚本不会配置 DNS/MX、TLS 终止、防火墙、备份或上游反滥用能力。
 
-如果希望强制本地编译 C++ ingestd，而不是下载 GitHub Release 二进制：
+备份、恢复、回滚、端口和排障的完整步骤见 [Docker 部署说明](deploy/docker/README.zh-CN.md)。
 
-```bash
-bash quickstart.sh --build-local
-```
+### 原生 systemd 一键部署（次要方式）
 
-如果要下载已审核的指定版本或指定二进制地址：
+Debian 12+ 或 Ubuntu 24.04+ 主机如果明确需要原生服务而不使用 Docker，可执行：
 
 ```bash
-bash quickstart.sh --ingestd-version "$REVIEWED_INGESTD_TAG"
-bash quickstart.sh --binary-url https://example.com/rapid-inbox-ingestd-linux-x86_64.tar.gz
+sudo bash deploy/system/install.sh install
 ```
 
-其中 `REVIEWED_INGESTD_TAG` 应由部署方设置为仓库中实际存在且已审核的标签。
-自定义二进制地址应提供同路径 `.sha256` 文件；也可通过 `INGESTD_SHA256=<64-hex-character-value>`
-显式传入可信校验和。校验失败时不会执行下载的文件。
-
-未指定版本时脚本仍使用 GitHub 的可变 `latest` 指针，并明确输出漂移警告。相邻 `.sha256` 只能证明
-下载内容与该次发布资产一致，不能固定版本；可重复部署应使用仓库中实际存在且已经审核的 release tag，
-或从固定、已审核的源码提交使用 `--build-local`。当前发布版本见
-[GitHub Releases](https://github.com/wendaochangsheng/Rapid-Inbox/releases)，例如 `v0.1.0`。
-
-> 当前 CI 和预编译资产只验证 Ubuntu 24.04 / Linux x86_64，且二进制为动态链接构建；其它发行版和
-> 平台尚无兼容矩阵。非 Linux x86_64、下载失败或指定 `--build-local` 时，quickstart 会尝试本地编译。
-
-如果本机需要本地编译，可先安装：
+安装器会创建专用 `rapid-inbox` 用户，在 `/opt/rapid-inbox` 构建版本化 release，生成
+`/etc/rapid-inbox/rapid-inbox.env`，将数据保存在 `/var/lib/rapid-inbox`，在写入边界初始化并备份
+SQLite，安装加固后的 HTTP/SMTP unit，并同时验收 HTTP 与 SMTP 协议。
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip cmake g++ libsqlite3-dev libssl-dev libunistring-dev libicu-dev
+sudo bash deploy/system/install.sh status
+sudo bash deploy/system/install.sh update
+sudo bash deploy/system/install.sh uninstall  # 保留配置与数据
 ```
 
-只想使用 Python 内嵌 SMTP 兼容模式时：
+支持范围、受管路径、更新回滚和卸载边界见 [原生 systemd 部署说明](deploy/system/README.zh-CN.md)。
+
+### 本地源码启动器
+
+`quickstart.sh` 继续用于本地试用和开发。它是前台启动器，不是长期生产进程管理器：
 
 ```bash
-bash quickstart.sh --python-smtp
+bash quickstart.sh
 ```
 
-## 启动方式
+它会创建 `.venv` 与 `.env`、初始化 SQLite，并运行 Python HTTP 与 C++ ingestd。默认在 SHA-256
+校验后下载可变的 `latest` ingestd release；可用 `--ingestd-version` 固定已审核版本，或用
+`--build-local` 构建当前源码。包括 Python SMTP 兼容模式在内的完整参数见
+`bash quickstart.sh --help`。
+
+## 本地开发与手工启动
 
 <details>
-<summary><b>C++ SMTP ingestd + Python HTTP</b>（推荐部署形态）</summary>
+<summary><b>C++ SMTP ingestd + Python HTTP</b>（手工开发形态）</summary>
 
 ```bash
 # 1. 构建 C++ SMTP 收件入口
@@ -234,11 +238,12 @@ quarantine 取证路径，恢复器依据持久 tombstone 禁止用陈旧 manife
 
 </details>
 
-## 发布二进制
+## CI 与发布二进制
 
 仓库包含 GitHub Actions 工作流 `.github/workflows/release-ingestd.yml`：
 
-- 普通 push / pull request：运行 Python 测试并构建、测试 C++ ingestd。
+- 普通 push / pull request：运行 Python 测试、校验两条部署路径、执行真实的一键 Docker smoke 部署，
+  并构建/测试 C++ ingestd。
 - 推送 `v*` tag：构建 Linux x86_64 release 包，并把以下文件发布到 GitHub Release：
   - `rapid-inbox-ingestd-linux-x86_64.tar.gz`
   - `rapid-inbox-ingestd-linux-x86_64.tar.gz.sha256`
@@ -253,16 +258,20 @@ git push origin "$NEW_RELEASE_TAG"
 `NEW_RELEASE_TAG` 应由发布者按实际版本策略显式设置；已发布版本以
 [GitHub Releases](https://github.com/wendaochangsheng/Rapid-Inbox/releases) 为准。
 
-Release 发布完成后，`bash quickstart.sh` 默认从可变的 latest release 下载预编译 ingestd 并输出漂移警告。
+Docker 路径从已审核源码检出构建本地镜像；当前工作流不发布容器镜像。Release 发布完成后，本地开发用
+`bash quickstart.sh` 默认从可变的 latest release 下载预编译 ingestd 并输出漂移警告。
 可重复部署应显式传入已审核 tag；需要本地编译时使用 `--build-local`。
 
 ## 配置
 
-启动器读取变量的优先级：
+应用读取变量的优先级：
 
 ```text
 真实环境变量  >  当前工作目录下的 .env  >  app/config.py 默认值
 ```
+
+Docker 将 `.rapid-inbox-docker/rapid-inbox.env` 注入进程环境；systemd 使用
+`/etc/rapid-inbox/rapid-inbox.env`。仓库中的 `.env.example` 只作为本地源码启动模板。
 
 <details>
 <summary><b>完整环境变量表</b></summary>
@@ -274,13 +283,13 @@ Python HTTP、兼容 SMTP 与共享配置：
 | `STORAGE_ROOT` | `./storage` | 邮件文件、附件、manifest 和临时文件根目录 |
 | `DATABASE_PATH` | `./storage/app.db` | SQLite 数据库路径；Python 与 ingestd 必须指向同一文件 |
 | `BOOTSTRAP_ADMIN_USERNAME` | `admin` | 首次启动自动创建的管理员用户名 |
-| `BOOTSTRAP_ADMIN_PASSWORD` | `change-me-now`（quickstart 随机替换） | 手工启动的代码回退值也是 `change-me-now`，不可用于外网绑定 |
+| `BOOTSTRAP_ADMIN_PASSWORD` | `change-me-now`（部署脚本与 quickstart 随机替换） | 手工启动的代码回退值也是 `change-me-now`，不可用于外网绑定 |
 | `SESSION_COOKIE_NAME` | `rapid_inbox_session` | HttpOnly 管理员会话 Cookie 名称 |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | HTTP 监听地址与端口；非回环绑定必须置于可信 HTTPS 反向代理后 |
 | `HTTP_MAX_REQUEST_BODY_BYTES` | `1048576` | ASGI 请求体上限，同时约束 `Content-Length` 与 streamed/chunked body；最大可配 64 MiB |
 | `HTTP_REQUEST_BODY_TIMEOUT_SECONDS` | `15` | 完整接收单个 HTTP 请求体的总时限，抵御慢速分块上传 |
 | `HTTP_BODY_MEMORY_BUDGET_BYTES` | `268435456` | 每进程所有已缓冲 HTTP 请求体的共享字节预算，必须不小于单请求上限 |
-| `HTTP_CONCURRENCY_LIMIT` | `1000` | 每进程 HTTP/WebSocket 总准入上限；quickstart 同时传给 Uvicorn `--limit-concurrency`，应用中间件也执行 |
+| `HTTP_CONCURRENCY_LIMIT` | `1000` | 每进程 HTTP/WebSocket 总准入上限；受支持启动器同时传给 Uvicorn `--limit-concurrency`，应用中间件也执行 |
 | `HTTP_LIVE_CONNECTION_LIMIT` | `256` | 每个 HTTP 进程共享的管理 SSE 与公共邮箱 WebSocket 长连接上限，超限返回 503/1013 |
 | `DATABASE_WRITE_QUEUE_CAPACITY` / `DATABASE_WRITE_MAX_WAITERS` | `256` / `1024` | SQLite 单写 actor 已接管请求与等待请求的双重上限，超限快速返回 503 |
 | `DATABASE_READ_POOL_SIZE` / `DATABASE_READ_QUEUE_CAPACITY` / `DATABASE_READ_MAX_WAITERS` / `DATABASE_READ_TIMEOUT_SECONDS` | `1` / `256` / `1024` / `5` | API v2 专用只读 actor、已接管请求与等待请求上限和端到端读时限。默认单 actor 是保守的设计选择；增加连接数前应按实际 workload 压测。维护会先排空请求并由 owner 线程关闭连接；这些数值均按 HTTP 进程分别计算 |
@@ -318,7 +327,7 @@ Python HTTP、兼容 SMTP 与共享配置：
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` | 日志级别和 `json` / `text` 格式 |
 | `REQUEST_LOG_ENABLED` | `true` | 是否记录不含查询串的结构化 HTTP 访问日志 |
 | `METRICS_ENABLED` / `METRICS_TOKEN` | `true` / 空 | Prometheus 指标开关与令牌；非回环绑定启用指标时令牌必填，否则拒绝启动 |
-| `API_CURSOR_SECRET` | 空（quickstart 随机填充） | API v2 cursor HMAC 密钥；手工外网部署必须配置至少 32 个字符 |
+| `API_CURSOR_SECRET` | 空（部署脚本与 quickstart 随机填充） | API v2 cursor HMAC 密钥；手工外网部署必须配置至少 32 个字符 |
 | `READINESS_MIN_FREE_DISK_BYTES` | `67108864` | readiness 所需最小可用磁盘空间 |
 | `ADMIN_TOKEN` / `PUBLIC_API_KEY` | 未启用 | v1 兼容令牌；仅显式配置非默认随机值时启用 |
 
@@ -500,7 +509,8 @@ Rapid Inbox 的性能设计面向单机本地磁盘架构，不是无限横向�
 - API Key 速率限制使用每 Key 固定内存 token bucket：桶容量等于每分钟额度，并在 60 秒内
   均匀补充，因此允许不超过桶容量的短时突发。状态仍属于单 HTTP 进程；运行 N 个 worker 时
   总可用额度大约变为单进程额度的 N 倍，需要严格全局额度时必须由反向代理/网关执行。
-- 一个数据目录建议只运行一个 ingestd 和一个 HTTP 进程。不要把 SQLite WAL 放在不保证 POSIX
+- 一个数据目录只运行一个 ingestd 和一个 HTTP 进程。不要扩容 Compose `app` 服务，不要部署多个
+  Swarm/Kubernetes 副本，也不要让独立容器指向同一个卷。不要把 SQLite WAL 放在不保证可靠 POSIX
   锁语义的网络文件系统，也不要让多个主机直接共享同一个 `app.db`。
 - C++/Python SMTP 当前都不实现或宣告 STARTTLS。公网需要传输加密时，应在经过验证的 SMTP
   代理终止 TLS，或仅在可信网络中暴露收件端口；HTTP 管理端同样应置于 HTTPS 反向代理后。
@@ -588,8 +598,12 @@ sidecar，完成完整性检查后再整体启动。
 - C++ ingestd 默认 durable ACK。若曾依赖“内存入队即 250”的极低延迟，可显式关闭，但需要
   接受异常退出丢信风险。
 
-升级前应备份 `storage/`，在维护窗口停止旧 HTTP/SMTP 进程，仅启动一个新实例完成 SQLite
-轻量迁移，再启动 ingestd。不要让新旧二进制同时写同一数据库；升级后重新检查域公开开关、
+每次升级前都应保留可恢复的配置、邮件文件与 SQLite 副本。Docker 应先停服务，备份
+`.rapid-inbox-docker/rapid-inbox.env` 与 named volume，切换到已审核目标 commit 后执行
+`./docker-deploy.sh`；wrapper 只有在 HTTP 迁移和 readiness 成功后才开放 SMTP。systemd 使用
+`sudo bash deploy/system/install.sh update`：先 staging/build，再停止两个 writer、建立一致 SQLite
+备份、迁移、切换 release，并验收 HTTP/SMTP。手工部署必须停止全部旧 HTTP/SMTP 进程，只允许一个
+migrator 完成后再启动 ingestd。不要让新旧二进制同时写同一数据库；升级后重新检查域公开开关、
 Key 的 `domain_grant_mode`、保留期、Metrics Token 和 fsync 选择。
 
 ## 开发
@@ -650,7 +664,7 @@ RAPID_INBOX_API_TOKEN='<ri_service_...>' \
 - 任意域模式会接受已到达本 SMTP 服务且 RCPT 域语法合法的投递，但不会替代 DNS/MX 配置；查阅默认私有，不要为方便而全局打开公共 Web/API
 - 非回环绑定启用 `/metrics` 时必须设置 `METRICS_TOKEN`，否则服务会拒绝启动；也可关闭指标端点
 - API Key token bucket 是单 HTTP 进程内状态；多进程部署还应在可信反向代理执行全局限流
-- SMTP 端口 `25` 在部分系统中需要管理员权限，生产部署建议通过端口映射或专用服务账户处理
+- Docker 将宿主机 `25` 映射到容器内非特权端口 `2525`；systemd unit 只向专用账户授予 `CAP_NET_BIND_SERVICE`。手工部署也应建立等价权限边界
 - 公开收件箱适合测试和临时场景，不建议用于接收敏感长期邮件
 - `.env`、`storage/`、数据库和邮件落盘文件不应提交到 Git
 

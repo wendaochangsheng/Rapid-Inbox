@@ -52,10 +52,21 @@ Before opening a PR, run at least:
 ```bash
 .venv/bin/pytest
 python3 -m compileall -q app tests
+shellcheck quickstart.sh docker-deploy.sh deploy/docker/entrypoint.sh deploy/system/install.sh
 ```
 
 These commands do not build ingestd or run CTest. If `cpp/ingestd/build/rapid-inbox-ingestd` does not yet exist, the 3 cross-language integration tests collected by the root `pytest` run will be reported as skipped. For changes to C++ or the shared ingestion path, first run the build and CTest commands above, then rerun `tests/test_cpp_ingestd_integration.py`.
 If your changes only affect documentation, make sure that links, commands, versions, and filenames remain accurate.
+Changes to Docker deployment must also pass a fresh-checkout configuration render and a clean
+`docker build`:
+
+```bash
+RAPID_INBOX_CONFIG_FILE=/dev/null \
+  docker compose --env-file /dev/null -f compose.yaml config --quiet
+```
+
+Changes to the native installer must pass `bash -n`, ShellCheck, rendered unit verification, and its
+isolated static/helper tests without installing units on the development host.
 
 ## Branches and commits
 
@@ -75,7 +86,8 @@ Common commit prefixes:
 | `chore:` | Build, dependency, tooling, and other maintenance work |
 
 > [!IMPORTANT]
-> Do not commit `.env`, `storage/`, database files, real secrets from email samples, or personal data.
+> Do not commit `.env`, `.rapid-inbox-docker/`, `storage/`, database files, deployment credentials,
+> real secrets from email samples, or personal data.
 
 ## Pull requests
 
@@ -103,7 +115,7 @@ When opening an Issue, please provide as much of the following as possible:
 - Version or commit hash
 - Python version
 - Operating system
-- Startup method (`rapid-inbox-http` / `rapid-inbox-smtp` / `uvicorn`)
+- Startup method (`docker-deploy.sh` / systemd installer / `quickstart.sh` / manual entry point)
 - Steps to reproduce
 - Expected and actual results
 - Relevant logs or screenshots

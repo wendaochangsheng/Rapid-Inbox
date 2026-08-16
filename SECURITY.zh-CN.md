@@ -63,13 +63,19 @@ wendao@ofoco.cn
 
 ## 部署检查清单
 
-- 首次启动后立即修改 bootstrap 密码。`HOST` 配为非回环地址时会拒绝已知默认密码/兼容令牌，但这不能替代
-  独立高熵凭据和定期轮换。quickstart 默认绑定 `127.0.0.1`，显式外网绑定会输出 TLS 反代警告；
-  不要在 `HOST` 仍为回环值时用 Uvicorn `--host` 单独覆盖为外网地址。
-- quickstart 会先由 Python 完成 SQLite schema 和轻量迁移，成功后才启动 ingestd；初始化失败时不得
-  绕过脚本手工抢先启动写入进程。升级期间也应停止旧进程，只允许一个迁移者操作数据库。
-- 默认 `INGESTD_VERSION=latest` 是可变指针。发布资产旁的 SHA-256 校验能发现下载损坏或不匹配，
-  但不能固定版本；生产部署应指定实际存在、已经审核的 release tag，或从固定源码提交本地构建。
+- 主要部署使用 `./docker-deploy.sh`，原生 systemd 次要方式使用 `deploy/system/install.sh`。两者都会生成
+  高熵 bootstrap/cursor/metrics 密钥，并默认只把 HTTP 管理端发布到宿主机回环地址。首次登录后立即
+  修改 bootstrap 密码；`quickstart.sh` 只用于本地试用和开发。
+- Docker 有意在同一个非 root 容器与 PID namespace 中监督 Python HTTP 和 C++ ingestd。维护协议会记录
+  ingestd 的 OS PID，再由 Python 用 `kill(pid, 0)` 校验；拆到隔离 PID namespace 可能把仍存活的 writer
+  误判为已退出。不得扩容 Compose `app` 服务，也不得让多个容器或主机共享一个数据卷。
+- 受支持部署流程会先由 Python 完成 SQLite schema 迁移并通过 readiness，再开放 ingestd。升级期间应停止
+  全部旧 writer，只允许一个 migrator；初始化失败时不得绕过门禁手工启动 SMTP。
+- 从实际存在、已经审核的源码 tag 或 commit 部署；Docker 和 systemd 都构建该检出。本地 quickstart fallback
+  仍默认使用可变 `INGESTD_VERSION=latest`；发布资产 SHA-256 只能发现损坏或不匹配，不能固定版本。
+- Docker 配置位于 `.rapid-inbox-docker/rapid-inbox.env`，邮件数据位于 named volume；停服后同时保护并备份
+  两者。`docker compose down -v` 会删除数据卷，受支持的 `./docker-deploy.sh down` 会保留它。卷必须位于
+  可靠支持 POSIX 锁的本地文件系统，不能使用 NFS 等网络卷。
 - 优先使用后台签发的 API Key。v2 只使用 `Authorization: Bearer`；关闭 v1 Key 的 Query 传输，
   避免凭据进入浏览历史、Referer、代理和日志。
 - API Key 使用最小 kind/scope，并明确选择 `none`、`selected` 或 `all` 域授权。空域列表是拒绝，
@@ -90,6 +96,8 @@ wendao@ofoco.cn
   多实例部署必须在网关增加全局限流，并统一监控 401/403/429。
 - 公网 SMTP 必须保持有限并发和有限建连滑窗。默认 Python 并发上限为 1024、共享每 IP
   建连上限为每分钟 60000；非回环 Python SMTP 监听会拒绝显式的无限并发配置。
+- `/health/ready` 只验证 Python 控制面、SQLite 与存储，不能证明 SMTP 协议可用。部署验收还必须检查
+  SMTP banner 与 `EHLO`/`NOOP`/`QUIT`，受支持的 Docker healthcheck 和 systemd verifier 都会执行。
 - Key 委派同时收窄 scope、域、邮箱、IP CIDR、到期时间、速率与传输方式；受限父 Key 不能创建
   或更新出任意 IP、永不过期、不限速或新增 query 传输的子 Key。所有 Key 写操作会在单一数据库
   事务内重新加载调用者与目标策略；不要在自定义扩展中拆开“授权读取”和实际 rotate/update。
@@ -98,7 +106,7 @@ wendao@ofoco.cn
   预算不得小于单封邮件上限。任意域模式尤其需要容量配额和滥用响应方案。
 - 保持 `HTTP_MAX_REQUEST_BODY_BYTES` 为业务确需的最小值；它同时限制 Content-Length 和 chunked
   请求；同时设置 `HTTP_REQUEST_BODY_TIMEOUT_SECONDS`、`HTTP_BODY_MEMORY_BUDGET_BYTES` 和
-  `HTTP_CONCURRENCY_LIMIT`；quickstart 会把并发值同步传给 Uvicorn。它们仍不能替代反向代理的
+  `HTTP_CONCURRENCY_LIMIT`；受支持启动器会把并发值同步传给 Uvicorn。它们仍不能替代反向代理的
   连接数、header、速率和超时限制。
 - 用 `HTTP_LIVE_CONNECTION_LIMIT` 约束每个进程内的管理 SSE 与公共邮箱 WebSocket；多进程或
   多实例部署仍应在反向代理设置全局长连接上限、握手速率和空闲超时。
@@ -109,8 +117,8 @@ wendao@ofoco.cn
 
 - 邮件 HTML 通过 sandbox iframe 和严格 CSP 展示，但邮件正文和附件仍属于不可信输入。不要在
   服务主机直接打开附件；下载端应结合杀毒、内容检测和独立工作站策略。
-- `.env`、`storage/`、SQLite、备份、日志、真实邮件样本和 API Key 都不得提交到 Git。默认目录/
-  文件权限会收紧到 `0700/0600`，仍应使用专用低权限账户及加密磁盘/备份。
+- `.env`、`.rapid-inbox-docker/`、`storage/`、SQLite、备份、日志、真实邮件样本和 API Key 都不得提交到
+  Git。默认目录/文件权限会收紧，受支持部署也使用专用低权限身份，但仍需加密磁盘/备份和宿主机访问控制。
 - `INGEST_DURABLE_ACK=true` 在 SMTP 250 前保存 raw + manifest；只有同时开启
   `INGEST_STORAGE_FSYNC=true` 才以掉电持久性为目标。关闭 durable ACK 会引入已确认邮件丢失风险。
   若域在 RCPT 后并发改名/删除，最终事务会拒绝跨租户改投；已 durable ACK 的 artifact 会保留到

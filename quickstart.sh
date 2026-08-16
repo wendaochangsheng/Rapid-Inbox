@@ -24,7 +24,9 @@ usage() {
     cat <<'EOF'
 Usage: bash quickstart.sh [--python-smtp] [--build-local] [--binary-url URL] [--ingestd-version VERSION] [--http-port PORT] [--smtp-port PORT] [--no-install]
 
-Starts Rapid Inbox with a one-command newbie flow.
+Starts Rapid Inbox directly from the source tree for local evaluation and development.
+For long-running deployments, use ./docker-deploy.sh (primary) or
+deploy/system/install.sh (native systemd alternative).
 
 Default mode:
   - Python HTTP bound to 127.0.0.1:8000
@@ -121,7 +123,7 @@ install_python_deps() {
     if [ "$INSTALL_EXTRAS" -ne 1 ]; then
         return
     fi
-    "$PYTHON_BIN" -m pip install -c "$ROOT_DIR/constraints-dev.txt" -e "$ROOT_DIR[dev]"
+    "$PYTHON_BIN" -m pip install -c "$ROOT_DIR/constraints-dev.txt" -e "${ROOT_DIR}[dev]"
 }
 
 build_cpp_ingestd() {
@@ -484,7 +486,8 @@ export HTTP_CONCURRENCY_LIMIT
 export SMTP_HOST="$SMTP_HOST"
 export SMTP_PORT="$SMTP_PORT"
 
-mkdir -p -m 700 "$RUN_DIR"
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUN_DIR"
 : > "$RUN_DIR/http.log"
 : > "$RUN_DIR/ingestd.log"
 chmod 600 "$RUN_DIR/http.log" "$RUN_DIR/ingestd.log"

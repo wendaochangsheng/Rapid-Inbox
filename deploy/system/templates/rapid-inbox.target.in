@@ -1,0 +1,7 @@
+[Unit]
+Description=Rapid Inbox HTTP and SMTP services
+Requires=rapid-inbox-http.service rapid-inbox-ingestd.service
+After=rapid-inbox-http.service rapid-inbox-ingestd.service
+
+[Install]
+WantedBy=multi-user.target
