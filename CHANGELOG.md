@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 明确项目的适用场景、单机部署、数据保留、授权使用、公开查阅、平台兼容和 Alpha 成熟度边界；
+  区分当前已实现能力与 Roadmap。
+- 修正文档中默认公开、C++ 限流默认值、发布版本和 Python/C++ 测试范围的历史漂移。
+- C++ CTest 注册本地化验证码回归，并在 ingestd 构建 job 中运行 Python/C++ 跨进程集成测试。
+
+### 安全
+
+- 管理写表单要求与受信 ASGI scheme/Host 一致的 Origin 或 Referer；登录兼容缺少来源头的
+  非浏览器客户端，但拒绝显式跨源来源。
+- C++ 解析结果超过 16 MiB 恢复 manifest 预算时回退到有界 pending receipt，由 Python 恢复器
+  从已持久化 raw 重新解析，避免 durable ACK 与跨语言恢复上限不一致。
+
+## [0.1.0] - 2026-08-16
+
 ### 新增
 
 - 两种收件模式：只接收已配置域名的 `managed_only`，以及通过系统 `*` 策略接收已到达本服务的任意合法域投递的 `managed_plus_catchall`；任意域默认私有，可独立开启公共 Web/API 与保留期。
@@ -50,7 +66,7 @@
 - v2 API Key 列表使用固定 1000–5000 行扫描预算和最后扫描位置 continuation cursor；兼容 v1 的
   域列表、SMTP events 与批量删除也加入硬分页/1000-ID 上限，公开邮箱 cursor 改为绑定主体和邮箱的 HMAC 签名。
 - SMTP 会话、审计与 file-GC 稳态清理查询按现有索引顺序执行；新 GC tombstone 与到期重试使用两个有界索引流公平合并，避免全表扫描或重试饥饿。
-- HTTP 安全头/同源守卫改为直接 ASGI 中间件，压测工具为每个 worker 复用独立连接池；进程 RSS 指标读取当前驻留页而非继承的历史峰值。
+- HTTP 安全头/外部访问守卫改为直接 ASGI 中间件，压测工具为每个 worker 复用独立连接池；进程 RSS 指标读取当前驻留页而非继承的历史峰值。
 
 ### 安全
 
@@ -101,11 +117,5 @@
 - 管理/API `DELETE` 现在将投递立即到期，后台清理会硬删除记录并通过 file-GC outbox 可重试地释放磁盘文件。
 - 修复批量写入中毒任务可能影响健康同批邮件的问题，并补充确定性隔离测试。
 
-## [0.1.0]
-
-### 新增
-
-- SMTP 收件、公开收件箱、管理后台和 HTTP API 的基础能力。
-- 本地 SQLite 与磁盘文件持久化。
-- 域名、邮箱、消息、附件、API Key、审计和系统设置管理。
-- 启动恢复、邮件解析、HTML 预览和实时收件更新。
+[Unreleased]: https://github.com/wendaochangsheng/Rapid-Inbox/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/wendaochangsheng/Rapid-Inbox/releases/tag/v0.1.0

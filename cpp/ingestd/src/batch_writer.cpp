@@ -37,6 +37,8 @@ namespace {
 constexpr std::string_view kMaintenanceLockPath = ".maintenance.lock";
 constexpr std::string_view kMaintenanceDrainedPath = ".maintenance.drained.json";
 constexpr std::string_view kIngestStatusPath = ".ingestd.status.json";
+// Keep this in sync with app.ingest.recovery.MAX_RECOVERY_MANIFEST_BYTES.
+constexpr std::size_t kMaxRecoveryManifestBytes = 16 * 1024 * 1024;
 
 class UniqueFd {
 public:
@@ -994,6 +996,9 @@ void BatchWriter::write_pending_artifacts(const MailJob& job) const {
     // two can leave an unreferenced raw blob, never a manifest that points at a
     // missing raw message.
     const std::string pending_manifest = build_manifest(job, nullptr, nullptr);
+    if (pending_manifest.size() > kMaxRecoveryManifestBytes) {
+        throw std::runtime_error("pending recovery manifest exceeds the size limit");
+    }
     write_file_atomic(job.raw_path, job.raw_content);
     write_file_atomic(job.manifest_path, pending_manifest);
 }
@@ -1120,8 +1125,20 @@ void BatchWriter::write_storage_artifacts(
         if (ParsedMail* parsed = std::get_if<ParsedMail>(&result)) {
             write_parsed_artifacts(job, *parsed);
         }
-        write_file_atomic(job.manifest_path,
-                          build_manifest(job, parsed_result(result), failure_result(result)));
+        const std::string final_manifest =
+            build_manifest(job, parsed_result(result), failure_result(result));
+        if (final_manifest.size() <= kMaxRecoveryManifestBytes) {
+            write_file_atomic(job.manifest_path, final_manifest);
+            continue;
+        }
+
+        // Python recovery must be able to read the durable envelope and reparse
+        // the raw message. Never replace it with a parsed payload it cannot read.
+        const std::string pending_manifest = build_manifest(job, nullptr, nullptr);
+        if (pending_manifest.size() > kMaxRecoveryManifestBytes) {
+            throw std::runtime_error("recovery manifest exceeds the size limit");
+        }
+        write_file_atomic(job.manifest_path, pending_manifest);
     }
 }
 

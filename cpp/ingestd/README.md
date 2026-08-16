@@ -1,6 +1,6 @@
 # rapid-inbox-ingestd
 
-`rapid-inbox-ingestd` is Rapid Inbox's production SMTP data plane. It accepts
+`rapid-inbox-ingestd` is Rapid Inbox's primary SMTP data plane. It accepts
 mail, persists a recoverable receipt, performs MIME parsing and verification-code
 extraction, writes message artifacts, and commits the shared SQLite schema used
 by the Python HTTP/admin process.
@@ -48,8 +48,10 @@ jobs, and joins writer/domain-refresh threads before exit.
 4. Workers collect up to `INGEST_BATCH_MAX_MESSAGES` for at most
    `INGEST_FLUSH_INTERVAL_MS`, parse MIME in parallel, and write text/HTML and
    attachment artifacts.
-5. The pending manifest is atomically replaced with the final parsed/failed
-   manifest, so recovery also has the completed parse result.
+5. The pending manifest is normally atomically replaced with the final
+   parsed/failed manifest, so recovery also has the completed parse result. If
+   that JSON would exceed Python recovery's 16 MiB per-manifest limit, ingestd
+   keeps a bounded pending manifest and recovery reparses the durable raw EML.
 6. SQLite writes are serialized into short `BEGIN IMMEDIATE` group commits on
    one lazily opened connection. The writer keeps a persistent prepared
    statement set between batches, drops the complete session after any SQLite
@@ -92,7 +94,7 @@ its RCPT snapshot, but cannot redirect it to another owner.
 | `INGEST_DURABLE_ACK=true`, `INGEST_STORAGE_FSYNC=true` | Raw + manifest files and directory entries were fsynced before ACK. This is the strongest mode and has higher latency. |
 | `INGEST_DURABLE_ACK=false` | The job only entered the bounded in-memory queue. A crash or `kill -9` can lose already-acknowledged mail. |
 
-Keep durable ACK enabled in production. Enable storage fsync when the deployment
+Keep durable ACK enabled for deployed instances. Enable storage fsync when the deployment
 requires acknowledgement to survive host power loss, and benchmark the actual
 filesystem before choosing batch/worker values.
 
@@ -138,7 +140,7 @@ before graceful shutdown removes the status file.
 ## Logging
 
 The C++ data plane uses the same `LOG_LEVEL` and `LOG_FORMAT` settings as the
-Python control plane. JSON is the production default; each record is one
+Python control plane. JSON is the deployment default; each record is one
 thread-safe stderr line with a millisecond UTC `ts`, `level`, `event`, `service`,
 `pid`, and typed event fields. `text` is intended for local troubleshooting.
 
@@ -162,7 +164,7 @@ are defensively redacted by the logger.
 | `SMTP_MAX_CONNECTIONS` | `1024` | Concurrent connection ceiling |
 | `SMTP_MAX_LINE_LENGTH` | `1000` | Maximum SMTP command/data line |
 | `SMTP_LISTEN_BACKLOG` | `1024` | Kernel listen backlog |
-| `SMTP_CONNECTION_RATE_LIMIT_COUNT` | `0` | Per-peer sliding-window connection allowance; `0` disables it |
+| `SMTP_CONNECTION_RATE_LIMIT_COUNT` | `60000` | Per-peer sliding-window connection allowance; `0` disables it |
 | `SMTP_CONNECTION_RATE_LIMIT_WINDOW_SECONDS` | `60` | Per-peer connection window |
 | `INGEST_QUEUE_MAX_MESSAGES` | `10000` | Total reserved, queued, and in-flight message budget |
 | `INGEST_QUEUE_MAX_BYTES` | `536870912` | Total byte budget; must be at least one maximum-size message |

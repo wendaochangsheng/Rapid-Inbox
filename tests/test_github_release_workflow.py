@@ -13,6 +13,8 @@ def test_release_workflow_builds_and_publishes_ingestd_binary() -> None:
     assert "actions/checkout@v7" in content
     assert "cmake -S cpp/ingestd -B cpp/ingestd/build" in content
     assert "ctest --test-dir cpp/ingestd/build --output-on-failure" in content
+    assert "python -m pytest -q tests/test_cpp_ingestd_integration.py" in content
+    assert "actions/setup-python@v7" in content
     assert "rapid-inbox-ingestd-linux-x86_64.tar.gz" in content
     assert "actions/upload-artifact@v7" in content
     assert "actions/download-artifact@v8" in content

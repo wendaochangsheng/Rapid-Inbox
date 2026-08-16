@@ -39,6 +39,7 @@ void test_verification_code_extracts_chinese_code();
 void test_verification_code_extracts_grouped_digit_code();
 void test_verification_code_extracts_alphanumeric_code();
 void test_verification_code_extracts_html_openai_code();
+void test_verification_code_extracts_openai_localized_codes();
 void test_verification_code_ignores_order_number();
 void test_verification_code_ignores_ambiguous_two_codes();
 void test_verification_code_extracts_numeric_html_entities();
@@ -120,6 +121,7 @@ void test_batch_writer_missing_domain_policy_rejects_without_creating_database()
 void test_batch_writer_uses_job_policy_without_touching_database();
 void test_batch_writer_ignores_preexisting_part_symlinks();
 void test_batch_writer_writes_sqlite_parsed_records();
+void test_batch_writer_falls_back_to_pending_manifest_when_parsed_manifest_is_oversized();
 void test_batch_writer_marks_parse_failure_without_rejecting_raw();
 void test_batch_writer_aggregates_minute_metrics_idempotently();
 void test_batch_writer_accumulates_rejected_metrics();
@@ -159,6 +161,7 @@ int main() {
         test_verification_code_extracts_grouped_digit_code();
         test_verification_code_extracts_alphanumeric_code();
         test_verification_code_extracts_html_openai_code();
+        test_verification_code_extracts_openai_localized_codes();
         test_verification_code_ignores_order_number();
         test_verification_code_ignores_ambiguous_two_codes();
         test_verification_code_extracts_numeric_html_entities();
@@ -240,6 +243,7 @@ int main() {
         test_batch_writer_uses_job_policy_without_touching_database();
         test_batch_writer_ignores_preexisting_part_symlinks();
         test_batch_writer_writes_sqlite_parsed_records();
+        test_batch_writer_falls_back_to_pending_manifest_when_parsed_manifest_is_oversized();
         test_batch_writer_marks_parse_failure_without_rejecting_raw();
         test_batch_writer_aggregates_minute_metrics_idempotently();
         test_batch_writer_accumulates_rejected_metrics();

@@ -54,6 +54,19 @@ jobs:
       - name: Test ingestd
         run: ctest --test-dir cpp/ingestd/build --output-on-failure
 
+      - name: Set up Python for integration tests
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Python integration dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints-dev.txt -e ".[dev]"
+
+      - name: Test Python and C++ integration
+        run: python -m pytest -q tests/test_cpp_ingestd_integration.py
+
       - name: Package ingestd binary
         run: |
           mkdir -p dist/package

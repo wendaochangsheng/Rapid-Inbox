@@ -25,14 +25,22 @@ cp .env.example .env
 .venv/bin/rapid-inbox-http
 ```
 
-运行测试：
+运行 Python 与可用时的跨语言集成测试：
 
 ```bash
-# 全部测试
 .venv/bin/pytest
 
 # 指定测试文件
 .venv/bin/pytest tests/test_admin_api.py
+```
+
+若改动涉及 C++ ingestd、共享 schema、SMTP 行为或跨进程恢复，还需要构建并运行 C++ 与集成测试：
+
+```bash
+cmake -S cpp/ingestd -B cpp/ingestd/build
+cmake --build cpp/ingestd/build
+ctest --test-dir cpp/ingestd/build --output-on-failure
+.venv/bin/pytest tests/test_cpp_ingestd_integration.py
 ```
 
 ## 提交前检查
@@ -44,7 +52,10 @@ cp .env.example .env
 python3 -m compileall -q app tests
 ```
 
-如果改动只涉及文档，请确保链接、命令和文件名仍然准确。
+这组命令不会构建 ingestd，也不会执行 CTest；若 `cpp/ingestd/build/rapid-inbox-ingestd` 尚不存在，
+根 `pytest` 收集到的 3 个跨语言集成测试会显示为 skipped。涉及 C++ 或共享收件链路时，应先执行
+上方构建/CTest，再重新运行 `tests/test_cpp_ingestd_integration.py`。
+如果改动只涉及文档，请确保链接、命令、版本和文件名仍然准确。
 
 ## 分支与提交
 

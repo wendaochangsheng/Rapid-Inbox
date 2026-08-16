@@ -2,9 +2,9 @@
 
 # Rapid Inbox
 
-**本地优先的临时邮箱服务**
+**本地优先、自托管的入站临时邮箱服务**
 
-高吞吐 C++ SMTP 收件入口、公开收件箱、管理后台和 HTTP API<br/>
+C++ SMTP 收件入口、可选公开收件箱、管理后台和 HTTP API<br/>
 邮件、附件、元数据和审计全部落本地磁盘与 SQLite
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org)
@@ -13,8 +13,10 @@
 [![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](CHANGELOG.md)
+[![CI](https://github.com/wendaochangsheng/Rapid-Inbox/actions/workflows/release-ingestd.yml/badge.svg?branch=main)](https://github.com/wendaochangsheng/Rapid-Inbox/actions/workflows/release-ingestd.yml)
+[![Release](https://img.shields.io/github/v/release/wendaochangsheng/Rapid-Inbox)](https://github.com/wendaochangsheng/Rapid-Inbox/releases)
 
-[快速开始](#快速开始) · [Demo](#demo) · [路线图](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5) · [特性](#特性) · [配置](#配置) · [使用](#基本使用) · [贡献](CONTRIBUTING.md) · [安全](SECURITY.md)
+[快速开始](#快速开始) · [Demo](#demo) · [项目边界](#项目边界) · [路线图](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5) · [已实现能力](#当前已实现) · [配置](#配置) · [使用](#基本使用) · [贡献](CONTRIBUTING.md) · [安全](SECURITY.md)
 
 </div>
 
@@ -22,11 +24,34 @@
 
 ## 简介
 
-Rapid Inbox 是一个本地优先的临时收件服务，面向 **验证码收件**、**测试环境邮件捕获**、**内部工具联调** 和 **轻量自托管** 场景。
+Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、开发者和测试团队，用于
+**验证码收件**、**CI/E2E 邮件捕获**、**内部工具联调** 和 **轻量自托管** 场景。
 
-核心目标是把 **收得到、看得清、管得住、容易恢复** 做好，不依赖外部邮件服务或云端数据库。
+核心目标是把 **收得到、看得清、管得住、容易恢复** 做好。邮件内容、附件和索引默认保存在
+本地磁盘与 SQLite，不依赖第三方邮件 SaaS 或云数据库；公网收件仍需自有域名、DNS/MX 和可达的 SMTP 入口。
 
 > 项目目前处于早期版本（Alpha），接口和数据结构可能继续调整。
+
+> **English summary:** Rapid Inbox is an alpha-stage, inbound-only, self-hosted SMTP inbox for
+> email testing, verification-code workflows, and internal integrations. It uses a
+> single-host SQLite/local-filesystem architecture and is not an outbound mail server,
+> hosted mailbox service, or multi-node mail platform.
+
+## 项目边界
+
+| 维度 | 当前边界 |
+| --- | --- |
+| **适用场景** | 自托管的入站测试收件、验证码提取、CI/E2E 邮件捕获和内部工具联调 |
+| **部署模型** | 单机、本地磁盘与 SQLite；一个数据目录运行一个 C++ ingestd，并建议配一个 Python HTTP 进程 |
+| **HTTP 路径** | 当前 UI/API 只支持发布在站点根路径 `/`；反向代理子路径和 ASGI `root_path` 尚不属于支持范围 |
+| **明确非目标** | 发信 SMTP、IMAP/POP3、完整公网 MTA、托管邮箱 SaaS、复杂反垃圾/恶意附件沙箱和企业级多节点 HA |
+| **部署者/外部运维职责** | 本项目不代管或自动配置 DNS/MX、SMTP TLS 终止、防火墙、备份及多实例全局限流 |
+| **公开边界** | 新建域和任意域策略默认关闭公共 Web/API；只有显式开启后才能匿名浏览 Web，公共 API 仍需 `public.read` Key |
+| **数据保留** | “临时邮箱”描述使用场景，不代表默认自动销毁；`retention_days` 未设置或为 `0` 时不会自动删除邮件 |
+| **授权使用** | 部署者只应让系统处理自己控制或获明确授权的域与邮件；不得用于拦截第三方邮件、钓鱼、凭据收集、垃圾邮件或规避第三方规则 |
+| **成熟度** | `0.x` Alpha；没有 SLA 或公开吞吐保证，数据库、配置和 API 仍可能发生不兼容调整 |
+
+当前规划和明确暂不纳入的能力见 [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)。
 
 ## Demo
 
@@ -39,16 +64,18 @@ Rapid Inbox 是一个本地优先的临时收件服务，面向 **验证码收�
 
 </details>
 
-> 演示使用隔离环境中的脱敏测试数据，不包含真实邮箱、邮件或凭据。
+> 演示使用隔离环境中的脱敏测试数据，不包含真实邮箱、邮件或凭据。录制时使用 Python 内嵌 SMTP
+> 展示进程内 WebSocket 更新；默认 C++ ingestd 模式下，公开收件箱不会收到独立数据面进程的实时
+> WebSocket 推送，管理 SSE 建连/重连只能载入最近已提交历史。
 
-## 特性
+## 当前已实现
 
 | 分类 | 能力 |
 | --- | --- |
 | **邮件接收** | C++ `rapid-inbox-ingestd` 提供 durable ACK、字节级背压、group commit、多 worker MIME 解析和毒任务隔离；Python SMTP 保留为开发模式 |
 | **域名模式** | 支持仅接收已配置域名，或对到达本服务的 SMTP 投递启用 `managed_plus_catchall` 任意域模式；最长后缀规则优先，域规则可热刷新 |
 | **收件箱** | 域名默认私有；邮箱公开位默认启用，但只在域级公共开关开启后生效，且可按邮箱单独关闭；支持列表、详情、原始 EML、沙箱 HTML 预览和附件下载 |
-| **实时更新** | 公开收件箱通过 WebSocket 推送，管理后台通过 SSE 查看 SMTP 接收事件 |
+| **实时更新** | 仅 HTTP + Python 内嵌 SMTP 同进程模式通过 `LiveState` 实时推送；C++ ingestd 或独立 Python SMTP 与 HTTP 分进程时，公开收件箱需刷新，管理 SSE 建连/重连可载入最近已提交历史，但不会持续收到跨进程推送 |
 | **验证码识别** | 打分制提取算法，支持中英日韩西多语言上下文与字母数字/分隔符组合 |
 | **权限管理** | `viewer` / `operator` / `superadmin` RBAC；API Key 按 kind、scope、域授权模式、邮箱 glob、IP、限速和有效期约束 |
 | **HTTP API** | 推荐 `/api/v2`：Bearer-only、严格模型、Problem Details、稳定 cursor；保留 `/api/v1` 公开和管理接口 |
@@ -128,9 +155,11 @@ bash quickstart.sh --binary-url https://example.com/rapid-inbox-ingestd-linux-x8
 
 未指定版本时脚本仍使用 GitHub 的可变 `latest` 指针，并明确输出漂移警告。相邻 `.sha256` 只能证明
 下载内容与该次发布资产一致，不能固定版本；可重复部署应使用仓库中实际存在且已经审核的 release tag，
-或从固定、已审核的源码提交使用 `--build-local`。本文不假定当前一定存在某个具体 release tag。
+或从固定、已审核的源码提交使用 `--build-local`。当前发布版本见
+[GitHub Releases](https://github.com/wendaochangsheng/Rapid-Inbox/releases)，例如 `v0.1.0`。
 
-> 当前预编译二进制目标为 Linux x86_64。非 Linux x86_64、下载失败或指定 `--build-local` 时，quickstart 会回退到本地编译。
+> 当前 CI 和预编译资产只验证 Ubuntu 24.04 / Linux x86_64，且二进制为动态链接构建；其它发行版和
+> 平台尚无兼容矩阵。非 Linux x86_64、下载失败或指定 `--build-local` 时，quickstart 会尝试本地编译。
 
 如果本机需要本地编译，可先安装：
 
@@ -148,7 +177,7 @@ bash quickstart.sh --python-smtp
 ## 启动方式
 
 <details>
-<summary><b>C++ SMTP ingestd + Python HTTP</b>（高吞吐生产模式，推荐）</summary>
+<summary><b>C++ SMTP ingestd + Python HTTP</b>（推荐部署形态）</summary>
 
 ```bash
 # 1. 构建 C++ SMTP 收件入口
@@ -164,9 +193,11 @@ SMTP_HOST=0.0.0.0 SMTP_PORT=25 cpp/ingestd/build/rapid-inbox-ingestd --base-dir 
 
 默认 `INGEST_DURABLE_ACK=true`。SMTP 返回 `250 queued` 前，ingestd 已以原子替换方式写入
 raw EML 和 pending manifest；SQLite 元数据可以稍后批量提交，若进程在此期间退出，Python
-恢复器会从 manifest 重建记录。`INGEST_STORAGE_FSYNC=false` 只保证进程级崩溃恢复；需要覆盖
+恢复器会从 manifest 重建记录。最终 parsed manifest 与恢复器共享 16 MiB 单文件预算；若解析元数据
+会超过该预算，ingestd 会保留有界 pending manifest，让恢复器从 raw 重新解析。`INGEST_STORAGE_FSYNC=false`
+只保证进程级崩溃恢复；需要覆盖
 主机掉电时，将其设为 `true`，代价是更高的磁盘同步延迟。关闭 durable ACK 会退回“仅进入
-内存队列即确认”的高吞吐模式，此时异常退出可能丢失已返回 `250` 的邮件。
+内存队列即确认”模式，此时异常退出可能丢失已返回 `250` 的邮件。
 每批 SQLite 提交都会在事务内重新匹配全部收件人；并发 rename/delete 或向其它租户降级改投会
 以 `policy conflict` 回滚。若 durable ACK 已先返回，raw 与 manifest 会保留并进入明确的
 quarantine 取证路径，恢复器依据持久 tombstone 禁止用陈旧 manifest 复活已改名/删除域。
@@ -198,7 +229,7 @@ quarantine 取证路径，恢复器依据持久 tombstone 禁止用陈旧 manife
 .venv/bin/uvicorn app.main:app --reload
 ```
 
-直接使用 `uvicorn app.main:app` 时**不会**启用内嵌 SMTP。需要接收 SMTP 邮件时，生产推荐另开进程运行 `rapid-inbox-ingestd`，开发可使用 `rapid-inbox-http` 或 `rapid-inbox-smtp`。
+直接使用 `uvicorn app.main:app` 时**不会**启用内嵌 SMTP。需要接收 SMTP 邮件时，推荐另开进程运行 `rapid-inbox-ingestd`，开发可使用 `rapid-inbox-http` 或 `rapid-inbox-smtp`。
 
 </details>
 
@@ -218,7 +249,8 @@ git tag "$NEW_RELEASE_TAG"
 git push origin "$NEW_RELEASE_TAG"
 ```
 
-`NEW_RELEASE_TAG` 应由发布者按实际版本策略显式设置；本文不声明尚未发布的具体 tag。
+`NEW_RELEASE_TAG` 应由发布者按实际版本策略显式设置；已发布版本以
+[GitHub Releases](https://github.com/wendaochangsheng/Rapid-Inbox/releases) 为准。
 
 Release 发布完成后，`bash quickstart.sh` 默认从可变的 latest release 下载预编译 ingestd 并输出漂移警告。
 可重复部署应显式传入已审核 tag；需要本地编译时使用 `--build-local`。
@@ -250,13 +282,13 @@ Python HTTP、兼容 SMTP 与共享配置：
 | `HTTP_CONCURRENCY_LIMIT` | `1000` | 每进程 HTTP/WebSocket 总准入上限；quickstart 同时传给 Uvicorn `--limit-concurrency`，应用中间件也执行 |
 | `HTTP_LIVE_CONNECTION_LIMIT` | `256` | 每个 HTTP 进程共享的管理 SSE 与公共邮箱 WebSocket 长连接上限，超限返回 503/1013 |
 | `DATABASE_WRITE_QUEUE_CAPACITY` / `DATABASE_WRITE_MAX_WAITERS` | `256` / `1024` | SQLite 单写 actor 已接管请求与等待请求的双重上限，超限快速返回 503 |
-| `DATABASE_READ_POOL_SIZE` / `DATABASE_READ_QUEUE_CAPACITY` / `DATABASE_READ_MAX_WAITERS` / `DATABASE_READ_TIMEOUT_SECONDS` | `1` / `256` / `1024` / `5` | API v2 专用只读 actor、已接管请求与等待请求上限和端到端读时限。短查询的 Python 行物化受 GIL 约束，默认单 actor 实测更快；仅在长查询压测确认收益后增加连接数。维护会先排空请求并由 owner 线程关闭连接；这些数值均按 HTTP 进程分别计算 |
+| `DATABASE_READ_POOL_SIZE` / `DATABASE_READ_QUEUE_CAPACITY` / `DATABASE_READ_MAX_WAITERS` / `DATABASE_READ_TIMEOUT_SECONDS` | `1` / `256` / `1024` / `5` | API v2 专用只读 actor、已接管请求与等待请求上限和端到端读时限。默认单 actor 是保守的设计选择；增加连接数前应按实际 workload 压测。维护会先排空请求并由 owner 线程关闭连接；这些数值均按 HTTP 进程分别计算 |
 | `SMTP_HOST` / `SMTP_PORT` | `0.0.0.0` / `25` | SMTP 监听地址与端口 |
 | `MAX_MESSAGE_SIZE_BYTES` | `52428800` | 单封邮件最大体积，Python 与 C++ 共用 |
 | `MAX_RECIPIENTS_PER_MESSAGE` | `20` | 单封邮件最大 canonical 收件人数 |
 | `SMTP_IDLE_TIMEOUT_SECONDS` | `30` | SMTP 会话空闲断开时间 |
 | `SMTP_MAX_CONCURRENT_CONNECTIONS` | `1024` | Python SMTP 并发连接上限；非回环监听不允许配置为 `0` |
-| `SMTP_CONNECTION_RATE_LIMIT_COUNT` | `60000` | Python/C++ SMTP 每 IP 建连次数；保留高突发吞吐的同时约束连接抖动状态。来源 IP 状态使用摊销 O(1) 过期/LRU，按并发上限的 4 倍分配且硬封顶 65536 项，IPv6 地址轮换不能造成无界内存或全表扫描 |
+| `SMTP_CONNECTION_RATE_LIMIT_COUNT` | `60000` | Python/C++ SMTP 每 IP 建连次数；Python 使用有界的过期/LRU 状态，C++ 使用固定上限 map、周期性清理过期项并在满额时驱逐一个条目；两者都是单进程状态，不提供跨实例全局限流 |
 | `SMTP_CONNECTION_RATE_LIMIT_WINDOW_SECONDS` | `60` | Python/C++ SMTP 每 IP 建连滑窗 |
 | `SMTP_CLOSE_AFTER_DATA` | `true` | Python SMTP 完成一封 DATA 后是否关闭连接 |
 | `PARSE_WORKER_COUNT` | `4` | Python 恢复/兼容解析 worker 数量 |
@@ -450,13 +482,14 @@ SQLite writer 事务内重新读取调用者和目标权限，避免排队期间
 
 ## 性能边界与部署拓扑
 
-Rapid Inbox 的高吞吐目标是单机本地磁盘架构，不是无限横向扩展承诺：
+Rapid Inbox 的性能设计面向单机本地磁盘架构，不是无限横向扩展承诺，也不是未经实机测量的吞吐保证：
 
 - SQLite 使用 WAL，允许并发读取，但同一时刻仍只有一个写事务。ingestd 可并行解析/写文件，
   SQLite group commit 由互斥锁短时串行；Python 变更也受 `DatabaseWriter` 写锁串行保护。
 - `/api/v2` 使用 Runtime 私有的持久只读 actor 和 `mode=ro/query_only` 连接；准入、等待和
-  deadline 均有界，维护时先 drain/close。默认单 actor 是本机短查询实测最优值，盲目增加线程
-  会放大 Python 行物化的 GIL/futex 竞争；写连接仍显式使用 `synchronous=FULL`。
+  deadline 均有界，维护时先 drain/close。默认单 actor 是保守的设计选择；增加连接数前应按
+  实际 workload 压测，盲目增加线程可能放大 Python 行物化的 GIL/futex 竞争；写连接仍显式使用
+  `synchronous=FULL`。
 - `/api/v2` 的 SQLite 热路径由专用 actor 卸载，raw/附件保持流式文件响应；Dashboard 另用约
   1.5 秒共享缓存和防击穿锁。高并发新集成应优先使用 v2，保留的 v1 路由仍是兼容面。
   这些优化不会消除磁盘 IOPS 与 SQLite 单写者上限。
@@ -526,8 +559,9 @@ manifest 和数据库持久化，即使队列暂满仍保持 SMTP 成功响应�
 替换或维护 drained ACK 都会使会话失效并在下一批安全重建。
 
 启动恢复会核对 manifest 与 raw 文件大小/SHA-256，从中恢复未提交的域策略、邮件、投递和解析
-结果；全量历史、永久失败重试和同时间戳水位路径通过临时磁盘 SQLite 分批处理，不随历史数量占用
-Python 堆。单个 manifest 和每个解码/回放批次都限制为 16 MiB；缺失域策略、损坏或越界的 manifest
+结果；全量历史、永久失败重试和同时间戳水位路径通过临时磁盘 SQLite 分批处理，核心 replay 状态
+不会随历史总量线性增长。单个 manifest 和每个解码/回放批次都限制为 16 MiB；缺失域策略、损坏或
+越界的 manifest
 会 fail-closed 移入 quarantine，不会推断公开权限，也不会阻断其它邮件恢复。管理后台「清除所有邮件」
 会创建跨进程 `.maintenance.lock`，让 C++ ingestd 暂时返回 `421/451`，再停止解析、清空邮件表、
 原子移走 raw/text/html/attachments/manifests/tmp 并压缩 SQLite；域名、管理员、API Key、
@@ -541,7 +575,7 @@ sidecar，完成完整性检查后再整体启动。
 
 ## 升级与不兼容变更
 
-本轮重构按新安全模型设计，不承诺旧调用语义：
+当前 0.x 阶段按新安全模型演进，不承诺旧调用语义：
 
 - 新建域名默认 `public_web_enabled=false`、`public_api_enabled=false`；需要公开时必须显式开启。
 - API Key 空域列表不再代表全域。旧 Key 会迁移为 `selected`（存在 grants）或 fail-closed 的
@@ -564,13 +598,13 @@ Key 的 `domain_grant_mode`、保留期、Metrics Token 和 fsync 选择。
 python3 -m venv .venv
 .venv/bin/pip install -c constraints-dev.txt -e ".[dev]"
 
-# 运行全部测试
-.venv/bin/pytest
-
-# C++ ingestd 测试
+# C++ ingestd 测试（先构建，避免跨语言集成测试被跳过）
 cmake -S cpp/ingestd -B cpp/ingestd/build
 cmake --build cpp/ingestd/build
 ctest --test-dir cpp/ingestd/build --output-on-failure
+
+# Python 测试；若 ingestd 已构建，会一并运行跨语言集成测试
+.venv/bin/pytest
 
 # 指定测试文件
 .venv/bin/pytest tests/test_admin_api.py tests/test_public_routes.py
@@ -612,10 +646,10 @@ RAPID_INBOX_API_TOKEN='<ri_service_...>' \
 ## 安全提醒
 
 - 不要在公开环境使用默认管理员密码；优先停用兼容令牌，必须使用时配置独立高熵值
-- 任意域模式会接受互联网上任何合法域的投递，但默认仍是私有查阅；不要为方便而全局打开公共 Web/API
+- 任意域模式会接受已到达本 SMTP 服务且 RCPT 域语法合法的投递，但不会替代 DNS/MX 配置；查阅默认私有，不要为方便而全局打开公共 Web/API
 - 非回环绑定启用 `/metrics` 时必须设置 `METRICS_TOKEN`，否则服务会拒绝启动；也可关闭指标端点
 - API Key token bucket 是单 HTTP 进程内状态；多进程部署还应在可信反向代理执行全局限流
-- SMTP 端口 `25` 在部分系统中需要管理员权限，生产部署建议通过反向代理、端口映射或专用服务账户处理
+- SMTP 端口 `25` 在部分系统中需要管理员权限，生产部署建议通过端口映射或专用服务账户处理
 - 公开收件箱适合测试和临时场景，不建议用于接收敏感长期邮件
 - `.env`、`storage/`、数据库和邮件落盘文件不应提交到 Git
 
@@ -623,7 +657,8 @@ RAPID_INBOX_API_TOKEN='<ri_service_...>' \
 
 ## 贡献
 
-欢迎提交 Issue、修复和改进。开始前建议先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，里面包含开发流程、测试方式和提交 PR 的注意事项。
+欢迎提交 Issue、修复和改进。项目由 [@wendaochangsheng](https://github.com/wendaochangsheng) 维护。
+开始前建议先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，里面包含开发流程、测试方式和提交 PR 的注意事项。
 
 ## 许可证
 

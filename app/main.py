@@ -5,6 +5,7 @@ import ipaddress
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -81,7 +82,7 @@ class LiveConnectionLimitMiddleware:
     @staticmethod
     def _is_live_connection(scope) -> bool:
         scope_type = scope.get("type")
-        path = str(scope.get("path") or "")
+        path = _scope_route_path(scope)
         if scope_type == "http":
             return (
                 str(scope.get("method") or "").upper() == "GET"
@@ -302,6 +303,15 @@ class RequestSecurityMiddleware:
                 _apply_security_headers(request, MutableHeaders(scope=message))
             await send(message)
 
+        if not _admin_form_origin_is_allowed(request):
+            response = JSONResponse(
+                {"detail": "cross-origin admin form submission rejected"},
+                status_code=403,
+                headers={"Connection": "close"},
+            )
+            await response(scope, receive, send_with_security_headers)
+            return
+
         if not self.settings.externally_bound() and _is_remote_client(request):
             findings = await asyncio.to_thread(self.runtime.external_request_security_findings)
             if findings:
@@ -320,6 +330,58 @@ def _request_scheme(request: Request) -> str:
     return request.url.scheme.lower()
 
 
+def _normalized_http_origin(value: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, hostname.lower(), port
+
+
+def _scope_route_path(scope) -> str:
+    path = str(scope.get("path") or "")
+    root_path = str(scope.get("root_path") or "")
+    if not root_path or not path.startswith(root_path):
+        return path
+    if path == root_path:
+        return ""
+    if len(path) > len(root_path) and path[len(root_path)] == "/":
+        return path[len(root_path) :]
+    return path
+
+
+def _admin_form_origin_is_allowed(request: Request) -> bool:
+    path = _scope_route_path(request.scope)
+    if request.method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return True
+    if path != "/admin" and not path.startswith("/admin/"):
+        return True
+
+    origins = request.headers.getlist("origin")
+    referers = request.headers.getlist("referer")
+    if len(origins) > 1 or len(referers) > 1:
+        return False
+    candidates = origins + referers
+    if not candidates:
+        # Preserve non-browser bootstrap/login clients. Authenticated admin
+        # writes require browser origin evidence in addition to SameSite=Lax.
+        return path == "/admin/login"
+
+    expected = _normalized_http_origin(str(request.base_url))
+    return expected is not None and all(
+        _normalized_http_origin(candidate) == expected for candidate in candidates
+    )
+
+
 def _apply_security_headers(request: Request, headers: MutableHeaders) -> None:
     headers.setdefault("X-Content-Type-Options", "nosniff")
     headers.setdefault("X-Frame-Options", "SAMEORIGIN")
@@ -330,7 +392,7 @@ def _apply_security_headers(request: Request, headers: MutableHeaders) -> None:
     # covers error responses, redirects and legacy v1 routes that do not use
     # the standard Authorization header (and therefore are not treated
     # specially by shared caches).
-    path = request.url.path
+    path = _scope_route_path(request.scope)
     if path.startswith(("/admin", "/api/", "/mail/")):
         headers["Cache-Control"] = "private, no-store"
     if _request_scheme(request) == "https":

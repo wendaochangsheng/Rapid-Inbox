@@ -5,6 +5,7 @@
 
 #include <sqlite3.h>
 
+#include <cstddef>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,7 @@ void check(bool condition, const std::string& message);
 namespace {
 
 namespace fs = std::filesystem;
+constexpr std::size_t kMaxRecoveryManifestBytes = 16 * 1024 * 1024;
 
 rapid_inbox::ingestd::DomainPolicySnapshot sample_policy() {
     rapid_inbox::ingestd::DomainPolicySnapshot policy;
@@ -393,6 +395,50 @@ void test_batch_writer_writes_sqlite_parsed_records() {
                              "'2026-05-12T03:04:00Z'");
     test::check(metric.step_row(), "metric bucket exists");
     test::check(sqlite3_column_int(metric.get(), 0) == 1, "metric deliveries");
+}
+
+void test_batch_writer_falls_back_to_pending_manifest_when_parsed_manifest_is_oversized() {
+    const fs::path root = fs::temp_directory_path() / "rapid-inbox-writer-oversized-manifest";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path db_path = root / "app.db";
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        initialize_schema(db);
+        db.exec("INSERT INTO domains (id, root_domain_ascii, root_domain_unicode, created_at, "
+                "updated_at) VALUES (1, 'adb.com', 'adb.com', '2026-05-12T03:04:05Z', "
+                "'2026-05-12T03:04:05Z')");
+    }
+
+    rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
+    rapid_inbox::ingestd::MailJob job = sample_job();
+    job.message_id = "msg_oversized_manifest";
+    job.raw_path = rapid_inbox::ingestd::raw_message_path(job.message_id, job.received_at);
+    job.manifest_path = rapid_inbox::ingestd::manifest_path(job.message_id, job.received_at);
+    job.raw_content =
+        "From: Sender <sender@example.com>\r\n"
+        "To: code@adb.com\r\n"
+        "Subject: Hello\r\n"
+        "X-Rapid-Inbox-Bloat: ";
+    job.raw_content.append(kMaxRecoveryManifestBytes + 1024, 'x');
+    job.raw_content.append("\r\n\r\nYour verification code is 123456.\r\n");
+
+    writer.write_batch({job});
+
+    const fs::path manifest_path = root / job.manifest_path;
+    const std::string manifest_content = read_text_file(manifest_path);
+    test::check(manifest_content.size() <= kMaxRecoveryManifestBytes,
+                "oversized parsed manifest stays within recovery limit");
+    test::check(manifest_content.find("\"raw_sha256\":\"digest\"") != std::string::npos,
+                "fallback manifest keeps raw hash");
+    test::check(manifest_content.find("\"rcpt_to\":\"code@adb.com\"") != std::string::npos,
+                "fallback manifest keeps durable recipient");
+    test::check(manifest_content.find("\"domain_policy\":{") != std::string::npos,
+                "fallback manifest keeps domain policy");
+    test::check(manifest_content.find("\"parsed\":") == std::string::npos,
+                "fallback manifest omits parsed payload");
+    test::check(manifest_content.find("X-Rapid-Inbox-Bloat") == std::string::npos,
+                "fallback manifest omits oversized headers");
 }
 
 void test_batch_writer_marks_parse_failure_without_rejecting_raw() {

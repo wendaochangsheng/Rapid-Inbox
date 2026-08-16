@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rapid-inbox"
 version = "0.1.0"
-description = "Local-first temporary inbox service with SMTP ingest, public mailboxes, an admin console, and HTTP APIs."
+description = "Local-first, self-hosted inbound email testing inbox with optional public mailboxes, an admin console, and HTTP APIs."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -14,9 +14,12 @@ authors = [
 ]
 keywords = [
   "email",
+  "email-testing",
   "smtp",
   "inbox",
+  "inbound-email",
   "temporary-email",
+  "self-hosted",
   "fastapi",
   "sqlite",
 ]

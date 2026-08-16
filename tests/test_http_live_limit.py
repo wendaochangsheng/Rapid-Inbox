@@ -13,7 +13,7 @@ from app.main import (
 )
 
 
-def _http_scope(path: str) -> dict:
+def _http_scope(path: str, *, root_path: str = "") -> dict:
     return {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -23,14 +23,14 @@ def _http_scope(path: str) -> dict:
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "root_path": "",
+        "root_path": root_path,
         "headers": [],
         "client": ("127.0.0.1", 12345),
         "server": ("127.0.0.1", 8000),
     }
 
 
-def _websocket_scope(path: str) -> dict:
+def _websocket_scope(path: str, *, root_path: str = "") -> dict:
     return {
         "type": "websocket",
         "asgi": {"version": "3.0"},
@@ -39,7 +39,7 @@ def _websocket_scope(path: str) -> dict:
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "root_path": "",
+        "root_path": root_path,
         "headers": [],
         "client": ("127.0.0.1", 12346),
         "server": ("127.0.0.1", 8000),
@@ -114,6 +114,63 @@ async def test_request_security_middleware_forwards_concurrent_streaming_respons
             "more_body": True,
         }
         assert sent[2]["body"] == b"-done"
+
+
+@pytest.mark.asyncio
+async def test_request_security_headers_honor_root_path(tmp_path) -> None:
+    async def public_cache_app(_scope, _receive, send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"cache-control", b"public, max-age=60")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    settings = Settings(
+        storage_root=tmp_path / "storage",
+        database_path=tmp_path / "storage" / "app.db",
+    )
+    middleware = RequestSecurityMiddleware(
+        public_cache_app,
+        settings=settings,
+        runtime=object(),
+    )
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await middleware(
+        _http_scope("/prefix/admin", root_path="/prefix"),
+        receive,
+        send,
+    )
+
+    headers = dict(sent[0]["headers"])
+    assert headers[b"cache-control"] == b"private, no-store"
+
+
+def test_live_connection_limit_classifies_routes_under_root_path() -> None:
+    assert LiveConnectionLimitMiddleware._is_live_connection(
+        _http_scope(
+            "/prefix/api/v1/admin/live/smtp/stream",
+            root_path="/prefix",
+        )
+    )
+    assert LiveConnectionLimitMiddleware._is_live_connection(
+        _websocket_scope(
+            "/prefix/mail/box@example.test/ws",
+            root_path="/prefix",
+        )
+    )
+    assert not LiveConnectionLimitMiddleware._is_live_connection(
+        _http_scope("/prefix/health/live", root_path="/prefix")
+    )
 
 
 @pytest.mark.asyncio

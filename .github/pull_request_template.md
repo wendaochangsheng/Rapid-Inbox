@@ -6,6 +6,8 @@
 
 - [ ] `.venv/bin/pytest`
 - [ ] `python3 -m compileall -q app tests`
+- [ ] `ctest --test-dir cpp/ingestd/build --output-on-failure`（涉及 C++）
+- [ ] `.venv/bin/pytest tests/test_cpp_ingestd_integration.py`（涉及 C++/共享收件链路，需先构建 ingestd）
 - [ ] 仅文档改动，已人工检查链接和命令
 
 ## 影响范围

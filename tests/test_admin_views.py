@@ -74,7 +74,7 @@ async def test_admin_login_accepts_missing_origin_header(app_fixture, runtime) -
 
 
 @pytest.mark.asyncio
-async def test_admin_login_accepts_reverse_proxy_origin_mismatch(app_fixture, runtime) -> None:
+async def test_admin_login_rejects_origin_mismatch(app_fixture, runtime) -> None:
     app, _ = app_fixture
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -84,10 +84,32 @@ async def test_admin_login_accepts_reverse_proxy_origin_mismatch(app_fixture, ru
             data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
         )
 
+    assert response.status_code == 403
+    assert response.json() == {"detail": "cross-origin admin form submission rejected"}
+    assert response.cookies.get(runtime.settings.session_cookie_name) is None
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["connection"] == "close"
+
+
+@pytest.mark.asyncio
+async def test_admin_login_accepts_trusted_https_origin(app_fixture, runtime) -> None:
+    app, _ = app_fixture
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://inbox.example",
+        headers={"Origin": "https://inbox.example"},
+    ) as client:
+        response = await client.post(
+            "/admin/login",
+            data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
+        )
+
     assert response.status_code == 303
     assert response.headers["location"] == "/admin/settings?force_password_change=1"
     assert response.cookies.get(runtime.settings.session_cookie_name) is not None
-    assert response.headers["cache-control"] == "private, no-store"
+    assert "secure" in response.headers["set-cookie"].lower()
+    assert response.headers["strict-transport-security"].startswith("max-age=")
 
 
 @pytest.mark.asyncio
@@ -172,7 +194,7 @@ async def test_admin_logout_revokes_session_and_clears_cookie(app_client, runtim
 
 
 @pytest.mark.asyncio
-async def test_admin_form_posts_do_not_enforce_origin(app_client, runtime) -> None:
+async def test_admin_form_posts_reject_cross_origin(app_client, runtime) -> None:
     await _login_and_change_initial_password(app_client, runtime)
 
     response = await app_client.post(
@@ -180,8 +202,66 @@ async def test_admin_form_posts_do_not_enforce_origin(app_client, runtime) -> No
         headers={"Origin": "https://evil.example"},
     )
 
+    assert response.status_code == 403
+    assert response.json() == {"detail": "cross-origin admin form submission rejected"}
+
+    still_authenticated = await app_client.get("/admin")
+    assert still_authenticated.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_authenticated_admin_form_posts_require_origin_or_referer(app_client, runtime) -> None:
+    await _login_and_change_initial_password(app_client, runtime)
+
+    origin = app_client.headers["origin"]
+    del app_client.headers["origin"]
+    try:
+        response = await app_client.post("/admin/logout")
+    finally:
+        app_client.headers["origin"] = origin
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "cross-origin admin form submission rejected"}
+
+
+@pytest.mark.asyncio
+async def test_authenticated_admin_form_posts_accept_same_origin_referer(app_client, runtime) -> None:
+    await _login_and_change_initial_password(app_client, runtime)
+
+    origin = app_client.headers["origin"]
+    del app_client.headers["origin"]
+    try:
+        response = await app_client.post(
+            "/admin/logout",
+            headers={"Referer": "http://testserver/admin"},
+        )
+    finally:
+        app_client.headers["origin"] = origin
+
     assert response.status_code == 303
     assert response.headers["location"] == "/admin/login"
+
+
+@pytest.mark.asyncio
+async def test_admin_form_origin_guard_fails_closed_under_unexpected_root_path(
+    app_fixture,
+    runtime,
+) -> None:
+    app, _ = app_fixture
+    transport = httpx.ASGITransport(app=app, root_path="/prefix")
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver/prefix/",
+    ) as client:
+        rejected = await client.post(
+            "admin/login",
+            headers={"Origin": "https://evil.example"},
+            data={"username": "admin", "password": runtime.settings.bootstrap_admin_password},
+        )
+
+    assert rejected.status_code == 403
+    assert rejected.json() == {"detail": "cross-origin admin form submission rejected"}
+    assert rejected.cookies.get(runtime.settings.session_cookie_name) is None
 
 
 @pytest.mark.asyncio
@@ -197,7 +277,7 @@ async def test_admin_security_does_not_trust_direct_forwarded_proto(app_client, 
     logout = await app_client.post(
         "/admin/logout",
         headers={
-            "Origin": "https://testserver",
+            "Origin": "http://testserver",
             "X-Forwarded-Proto": "https",
         },
     )
