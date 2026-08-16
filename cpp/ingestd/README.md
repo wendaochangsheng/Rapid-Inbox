@@ -1,5 +1,7 @@
 # rapid-inbox-ingestd
 
+**English** | [简体中文](README.zh-CN.md)
+
 `rapid-inbox-ingestd` is Rapid Inbox's primary SMTP data plane. It accepts
 mail, persists a recoverable receipt, performs MIME parsing and verification-code
 extraction, writes message artifacts, and commits the shared SQLite schema used

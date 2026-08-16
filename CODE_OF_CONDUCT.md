@@ -1,20 +1,22 @@
-# 行为准则
+**English** | [简体中文](CODE_OF_CONDUCT.zh-CN.md)
 
-Rapid Inbox 希望保持一个清晰、友善、务实的协作环境。讨论可以直接，反馈可以尖锐，但请把注意力放在问题本身。
+# Code of Conduct
 
-## 期待的行为
+Rapid Inbox aims to maintain a clear, friendly, and pragmatic collaboration environment. Discussions may be direct and feedback may be pointed, but please keep the focus on the issue itself.
 
-- 尊重不同经验水平和使用场景。
-- 用事实、复现步骤和代码证据说明问题。
-- 接受维护者对范围、优先级和实现方式的取舍。
-- 指出风险时，也尽量给出可行动的建议。
+## Expected behavior
 
-## 不接受的行为
+- Respect different levels of experience and different use cases.
+- Explain issues with facts, reproduction steps, and evidence from the code.
+- Accept maintainers' decisions about scope, priorities, and implementation approaches.
+- When identifying risks, try to provide actionable suggestions as well.
 
-- 人身攻击、骚扰、歧视或持续挑衅。
-- 公开泄露他人的密钥、邮件内容、个人信息或未公开漏洞细节。
-- 在 Issue 或 PR 中重复刷屏、偏离主题或施压式催促。
+## Unacceptable behavior
 
-## 处理方式
+- Personal attacks, harassment, discrimination, or persistent provocation.
+- Publicly disclosing other people's keys, email content, personal information, or details of undisclosed vulnerabilities.
+- Repeatedly spamming, going off topic, or applying undue pressure in Issues or PRs.
 
-维护者可以编辑或删除不合适的内容，关闭偏离主题的讨论，并在必要时限制参与。安全问题请按 [SECURITY.md](SECURITY.md) 中的方式私下报告。
+## Enforcement
+
+Maintainers may edit or remove inappropriate content, close off-topic discussions, and restrict participation when necessary. Report conduct incidents privately to `wendao@ofoco.cn`. Report security issues by following [SECURITY.md](SECURITY.md).

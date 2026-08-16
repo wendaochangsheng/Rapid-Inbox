@@ -1,213 +1,215 @@
-# Rapid Inbox 早期设计记录（SQLite / Python）
+**English** | [简体中文](rapid_inbox_design_spec.zh-CN.md)
+
+# Rapid Inbox Early Design Record (SQLite / Python)
 
 > [!IMPORTANT]
-> 本文保存项目最初的产品设计和任务拆分，用于追溯决策，不是当前版本的接口、安全或部署契约。
-> 实现已经演进为 C++ ingestd 与 Python HTTP 控制面的双进程架构；当前行为以
-> [README.md](README.md)、[SECURITY.md](SECURITY.md)、数据库 schema、测试和代码为准。
+> This document preserves the project's original product design and task breakdown for decision traceability. It is not the contract for the current interfaces, security model, or deployment model.
+> The implementation has evolved into a two-process architecture with the C++ ingestd and Python HTTP control plane. For current behavior, refer to
+> [README.md](README.md), [SECURITY.md](SECURITY.md), the database schema, tests, and code.
 
-## 1. 项目目标
+## 1. Project Goals
 
-实现一个“只收件、不发件”的极速邮箱系统，支持：
+Build a high-speed, receive-only email system that supports:
 
-1. 通过 SMTP 接收邮件。
-2. 管理员后台动态添加可接收邮件的域名。
-3. 支持根域、二级子域、三级及更深子域作为收件目标域名。
-4. 域和邮箱显式开启公共 Web 后，前台可无需密码通过 URL 访问邮箱，例如：
+1. Receiving email over SMTP.
+2. Dynamically adding domains that can receive email through the admin console.
+3. Using root domains, second-level subdomains, third-level subdomains, and deeper subdomains as recipient domains.
+4. Allowing passwordless mailbox access by URL after public Web access is explicitly enabled for the domain and mailbox, for example:
    - `https://adb.com/mail/xxx@adb.com`
-5. 前台可浏览某邮箱下的所有邮件、查看正文、下载附件、查看原始邮件。
-6. 管理后台可查看 SMTP 活动和历史会话，以及域名、邮箱、邮件、API Key、审计日志、系统设置；
-   早期同进程方案以实时事件为目标，当前分进程边界见 README。
-7. 提供完整 HTTP API：
-   - 管理员 API
-   - 普通访问 API
-8. 使用 SQLite 保存元数据；原始邮件与正文/附件存文件系统。
-9. 系统以“极简热路径、快速回 250”为最高优先级。
-10. 不做任何发件行为。
-11. 不做垃圾邮件过滤、杀毒、SPF/DKIM/DMARC 拒收。
-12. 不因为内容可疑而丢弃邮件；仅在“域名不允许 / 协议错误 / 超过尺寸上限 / 本地存储失败”时拒收。
+5. Letting the public frontend browse all messages in a mailbox, view message bodies, download attachments, and view raw messages.
+6. Letting the admin console inspect SMTP activity and historical sessions, as well as domains, mailboxes, messages, API keys, audit logs, and system settings;
+   the early single-process design targeted real-time events, while the current process boundary is documented in the README.
+7. Providing a complete HTTP API:
+   - Admin API
+   - General-access API
+8. Storing metadata in SQLite and raw messages plus bodies/attachments in the filesystem.
+9. Giving the minimal hot path and a fast 250 response the highest priority.
+10. Never sending email.
+11. Not performing spam filtering, antivirus scanning, or SPF/DKIM/DMARC-based rejection.
+12. Not discarding messages because their content appears suspicious; messages are rejected only when the domain is not allowed, the protocol is invalid, the size limit is exceeded, or local storage fails.
 
-## 2. 非目标
+## 2. Non-Goals
 
-1. 不实现 IMAP / POP3。
-2. 不实现发信 SMTP Submission。
-3. 不实现企业级多节点集群。
-4. 不实现复杂反垃圾策略。
-5. 不实现通用私人邮箱、端到端加密或企业邮件套件；公开收件箱仅用于显式开启的测试/临时场景。
+1. Implementing IMAP / POP3.
+2. Implementing SMTP Submission for outbound mail.
+3. Implementing an enterprise-grade multi-node cluster.
+4. Implementing sophisticated anti-spam policies.
+5. Implementing a general-purpose private mailbox, end-to-end encryption, or an enterprise mail suite; public inboxes are only for explicitly enabled testing or temporary scenarios.
 
-## 3. 总体设计结论
+## 3. Overall Design Decisions
 
-### 3.1 选型
+### 3.1 Technology Choices
 
-- **语言**：Python 3.10+
-- **SMTP 收件层**：当前默认使用 C++20 `rapid-inbox-ingestd`，`aiosmtpd` 保留为开发/兼容模式
-- **HTTP/API 层**：FastAPI
-- **数据库**：SQLite
-- **模板引擎**：Jinja2（服务端渲染）
-- **反向代理**：Nginx / Caddy
-- **后台实时流**：SSE（Server-Sent Events）
-- **原始邮件存储**：本地文件系统（`.eml`）
-- **附件存储**：本地文件系统
+- **Language**: Python 3.10+
+- **SMTP receiving layer**: currently defaults to the C++20 `rapid-inbox-ingestd`; `aiosmtpd` remains available for development and compatibility modes
+- **HTTP/API layer**: FastAPI
+- **Database**: SQLite
+- **Template engine**: Jinja2 (server-side rendering)
+- **Reverse proxy**: Nginx / Caddy
+- **Admin real-time stream**: SSE (Server-Sent Events)
+- **Raw message storage**: local filesystem (`.eml`)
+- **Attachment storage**: local filesystem
 
-### 3.2 架构原则
+### 3.2 Architectural Principles
 
-1. **SMTP 热路径只做三件事**：
-   - 判定目标域是否允许
-   - 将原始邮件字节流落盘
-   - 成功后立即回 `250`
-2. **解析 MIME / 提取附件 / 生成预览 / 写复杂索引** 全部异步完成。
-3. **SQLite 只存元数据与索引**，大对象（raw mail、正文文件、附件）不直接存 SQLite。
-4. **所有写操作经过单一写队列**，避免 SQLite 多写冲突。
-5. **前台与 API 直接读取元数据索引**，不走 IMAP。
-6. **多收件人共用一份原始邮件**，每个邮箱使用 delivery 记录关联。
+1. **The SMTP hot path does only three things**:
+   - Determines whether the recipient domain is allowed
+   - Persists the raw message byte stream
+   - Returns `250` immediately after success
+2. **MIME parsing / attachment extraction / preview generation / complex index writes** all happen asynchronously.
+3. **SQLite stores only metadata and indexes**; large objects (raw messages, body files, and attachments) are not stored directly in SQLite.
+4. **All writes pass through a single writer queue** to avoid contention between SQLite writers.
+5. **The frontend and API read metadata indexes directly** without using IMAP.
+6. **Multiple recipients share one raw message**, with a delivery record linking each mailbox.
 
-## 4. 逻辑架构
+## 4. Logical Architecture
 
-### 4.1 组件
+### 4.1 Components
 
 #### A. SMTP Ingress
 
-职责：
-- 监听 25 端口
-- 接收 SMTP 会话
-- 校验收件人目标域名是否在允许范围
-- 将原始邮件保存为 `.eml`
-- 创建占位 message + delivery 记录
-- 推送异步解析任务
+Responsibilities:
+- Listen on port 25
+- Receive SMTP sessions
+- Verify that recipient domains match an allowed rule
+- Save raw messages as `.eml` files
+- Create placeholder message and delivery records
+- Enqueue asynchronous parsing tasks
 
 #### B. Ingest / Parse Worker
 
-职责：
-- 读取原始 `.eml`
-- 解析头、文本正文、HTML 正文、附件
-- 更新 message 详情
-- 生成预览字段
-- 抽取附件文件
+Responsibilities:
+- Read raw `.eml` files
+- Parse headers, text bodies, HTML bodies, and attachments
+- Update message details
+- Generate preview fields
+- Extract attachment files
 
 #### C. HTTP / Public Frontend
 
-职责：
-- 提供公开邮箱列表页
-- 提供邮件详情页
-- 提供原始邮件下载
-- 提供附件下载
+Responsibilities:
+- Provide the public mailbox listing page
+- Provide the message detail page
+- Provide raw message downloads
+- Provide attachment downloads
 
 #### D. Admin Backend
 
-职责：
-- 域名管理
-- 邮箱/邮件管理
-- API Key 管理
-- 审计日志
-- 系统设置
-- 实时 SMTP 会话监控
+Responsibilities:
+- Domain management
+- Mailbox/message management
+- API key management
+- Audit logs
+- System settings
+- Real-time SMTP session monitoring
 
 #### E. DB Writer
 
-职责：
-- 串行化所有 SQLite 写操作
-- 为 SMTP、Worker、Admin 提供统一写入口
+Responsibilities:
+- Serialize all SQLite write operations
+- Provide a unified write entry point for SMTP, Worker, and Admin
 
 #### F. Live Event Bus
 
-职责：
-- 维护内存态 live sessions
-- 向后台 SSE 推送实时连接事件
+Responsibilities:
+- Maintain live sessions in memory
+- Push real-time connection events to the admin console over SSE
 
-## 5. 域名与子域支持规则
+## 5. Domain and Subdomain Support Rules
 
-### 5.1 域名管理模型
+### 5.1 Domain Management Model
 
-后台添加的不是“单个邮箱”，而是“域规则”。
+The admin console adds a "domain rule," not an individual mailbox.
 
-每条域规则包含：
-- `root_domain_ascii`：例如 `adb.com`
-- `accept_exact`：是否接收 `*@adb.com`
-- `accept_subdomains`：是否接收 `*@x.adb.com`、`*@y.x.adb.com`
+Each domain rule contains:
+- `root_domain_ascii`: for example, `adb.com`
+- `accept_exact`: whether to accept `*@adb.com`
+- `accept_subdomains`: whether to accept `*@x.adb.com` and `*@y.x.adb.com`
 - `public_web_enabled`
 - `public_api_enabled`
 - `is_active`
-- `plus_addressing_mode`：`keep` / `strip`
-- `local_part_case_sensitive`：默认 `false`
+- `plus_addressing_mode`: `keep` / `strip`
+- `local_part_case_sensitive`: defaults to `false`
 
-### 5.2 匹配规则
+### 5.2 Matching Rules
 
-对于收件地址 `local@sub.a.adb.com`：
+For the recipient address `local@sub.a.adb.com`:
 
-1. 先将域名转为 **lowercase + IDNA ASCII**。
-2. 做“最长后缀匹配”。
-3. 若命中规则：
-   - 完全相等时要求 `accept_exact = true`
-   - 属于其子域时要求 `accept_subdomains = true`
-4. 若同时命中多个规则，选择 **最长 root_domain**。
+1. First convert the domain to **lowercase + IDNA ASCII**.
+2. Perform a longest-suffix match.
+3. If a rule matches:
+   - An exact match requires `accept_exact = true`
+   - A subdomain match requires `accept_subdomains = true`
+4. If multiple rules match, select the **longest root_domain**.
 
-示例：
+Examples:
 
-- 已配置 `adb.com` 且 `accept_subdomains = true`
-  - 接收 `a@adb.com`
-  - 接收 `a@x.adb.com`
-  - 接收 `a@y.x.adb.com`
-- 已配置 `x.adb.com`，优先级高于 `adb.com`
-  - `a@b.x.adb.com` 先归属于 `x.adb.com`
+- With `adb.com` configured and `accept_subdomains = true`:
+  - Accept `a@adb.com`
+  - Accept `a@x.adb.com`
+  - Accept `a@y.x.adb.com`
+- With `x.adb.com` configured, it takes priority over `adb.com`:
+  - `a@b.x.adb.com` is associated with `x.adb.com` first
 
-### 5.3 必须补充的 DNS 说明
+### 5.3 Required DNS Explanation
 
-应用层支持“子域收件” ≠ DNS 自动支持“所有子域投递到你这台机器”。
+Application-level support for "subdomain receiving" does not mean DNS automatically supports delivering every subdomain to this server.
 
-后台添加 `adb.com` 以后，管理员页面必须展示建议 DNS：
+After an administrator adds `adb.com`, the admin page must show the recommended DNS records:
 
-- 根域邮件：
+- Root-domain mail:
   - `adb.com MX 10 mx1.mail-host.example`
-- 子域邮件：
+- Subdomain mail:
   - `*.adb.com MX 10 mx1.mail-host.example`
-- MX 目标主机：
+- MX target host:
   - `mx1.mail-host.example A <server_ip>`
-  - `mx1.mail-host.example AAAA <server_ipv6>`（可选）
+  - `mx1.mail-host.example AAAA <server_ipv6>` (optional)
 
-> 设计要求：管理后台必须有“DNS 检查”功能，告诉管理员当前域是否真的具备接收根域邮件与子域邮件的 DNS 条件。
+> Design requirement: the admin console must provide a "DNS check" feature that tells administrators whether the current domain actually has the DNS configuration required to receive mail for the root domain and its subdomains.
 
-### 5.4 Wildcard DNS 的产品说明
+### 5.4 Product Explanation for Wildcard DNS
 
-文档与后台提示中必须明确：
+The documentation and admin guidance must make the following clear:
 
-1. `*.adb.com` 主要覆盖不存在的子名字；根域 `adb.com` 仍需单独配置。
-2. 现有精确记录、委派（zone cut）或更具体名字，可能让 wildcard 结果与预期不同。
-3. 因此后台不能只显示“已添加域名”，还要显示“DNS 是否真的会把该域/子域邮件路由到本系统”。
+1. `*.adb.com` mainly covers subdomain names that do not otherwise exist; the root domain `adb.com` still requires a separate record.
+2. Existing exact records, delegations (zone cuts), or more specific names can make wildcard results differ from expectations.
+3. Therefore, the admin console must show not only that a domain has been added, but also whether DNS will actually route mail for that domain and its subdomains to this system.
 
-## 6. 邮箱模型
+## 6. Mailbox Model
 
-### 6.1 虚拟邮箱
+### 6.1 Virtual Mailboxes
 
-系统不要求先创建邮箱再收信。
+The system does not require a mailbox to be created before it can receive mail.
 
-只要目标域命中已启用规则，任何 `local-part@domain` 都是**虚拟邮箱**：
-- 首次收到邮件时自动创建 mailbox 元数据
-- 或首次访问 `/mail/<address>` 时惰性创建空 mailbox 记录
+As long as the recipient domain matches an enabled rule, any `local-part@domain` is a **virtual mailbox**:
+- Create mailbox metadata automatically when the first message arrives
+- Or lazily create an empty mailbox record when `/mail/<address>` is first visited
 
-### 6.2 邮箱 URL
+### 6.2 Mailbox URLs
 
-前台公开路由：
+Public frontend routes:
 
 - `GET /mail/{mailbox_address}`
 - `GET /mail/{mailbox_address}/{delivery_id}`
 
-要求：
-- 逻辑上支持 `xxx@adb.com`
-- 实际客户端请求时允许 `%40` 编码
-- 前端页面中统一使用已编码 URL 生成链接
+Requirements:
+- Logically support `xxx@adb.com`
+- Allow `%40` encoding in actual client requests
+- Consistently generate links with encoded URLs in frontend pages
 
-### 6.3 对不存在邮箱的行为
+### 6.3 Behavior for a Nonexistent Mailbox
 
-- 若 `domain` 受本系统管理：
-  - 返回 200
-  - 页面显示“暂无邮件”
-- 若 `domain` 不受管理：
-  - 返回 404
+- If the `domain` is managed by this system:
+  - Return 200
+  - Show "No messages yet" on the page
+- If the `domain` is not managed:
+  - Return 404
 
-## 7. SMTP 收件流程（核心）
+## 7. SMTP Receiving Flow (Core)
 
-### 7.1 状态机
+### 7.1 State Machine
 
-SMTP 会话只处理：
+An SMTP session handles only:
 - `EHLO/HELO`
 - `MAIL FROM`
 - `RCPT TO`
@@ -215,89 +217,90 @@ SMTP 会话只处理：
 - `QUIT`
 - `RSET`
 
-### 7.2 RCPT 策略
+### 7.2 RCPT Policy
 
-`RCPT TO` 阶段：
-- 仅检查收件人目标域是否命中允许规则
-- 不检查邮箱是否预创建
-- 不做垃圾判定
-- 不做发件人域白名单
-- 不做 SPF/DKIM/DMARC 拒收
+During `RCPT TO`:
 
-### 7.3 DATA 热路径
+- Only check whether the recipient domain matches an allowed rule
+- Do not check whether the mailbox was pre-created
+- Do not classify spam
+- Do not apply a sender-domain allowlist
+- Do not reject based on SPF/DKIM/DMARC
 
-1. 生成 `smtp_session_id`
-2. 生成 `message_id`
-3. 将完整 `envelope.content` 原样写入临时文件
+### 7.3 DATA Hot Path
+
+1. Generate `smtp_session_id`
+2. Generate `message_id`
+3. Write the complete `envelope.content` unchanged to a temporary file
 4. `flush + fsync`
-5. 原子重命名到最终 `.eml`
-6. 将“占位消息 + delivery + mailbox upsert”写入 DB 写队列
-7. 将“解析任务”写入内存任务队列
-8. 返回 `250 queued as <message_id>`
+5. Atomically rename it to the final `.eml` file
+6. Submit the "placeholder message + delivery + mailbox upsert" to the DB writer queue
+7. Submit the "parsing task" to the in-memory task queue
+8. Return `250 queued as <message_id>`
 
-### 7.4 失败处理
+### 7.4 Failure Handling
 
-- 域不允许：`550`
-- 邮件过大：`552`
-- 本地写盘失败：`451`
-- SQLite 占位写失败：
-  - SMTP 不应因此丢失已落盘邮件
-  - 通过 recovery scanner 补录
-- 解析失败：
-  - 邮件仍显示在邮箱中
+- Domain not allowed: `550`
+- Message too large: `552`
+- Local disk write failure: `451`
+- SQLite placeholder write failure:
+  - SMTP must not lose a message that has already been persisted
+  - Backfill it through the recovery scanner
+- Parsing failure:
+  - The message remains visible in the mailbox
   - `parse_status = failed`
-  - 可后台重试 reparse
+  - Reparse can be retried from the admin console
 
-### 7.5 占位策略
+### 7.5 Placeholder Strategy
 
-为实现“收件后尽快可见”：
+To make a message visible as soon as possible after receipt:
 
-在异步完整解析前，先插入一条占位消息：
+Insert a placeholder message before full asynchronous parsing:
 - `subject = NULL`
 - `from_addr = envelope_from`
 - `parse_status = pending`
 - `text_preview = NULL`
 
-前台列表显示：
-- 收件时间
-- `from`（可先显示 envelope_from）
-- 解析中标记
+The frontend list displays:
+- Receipt time
+- `from` (initially, it can display envelope_from)
+- A parsing-in-progress indicator
 
-完整解析后再更新为真实头字段。
+After full parsing, update these fields with the actual header values.
 
-## 8. 数据一致性与恢复
+## 8. Data Consistency and Recovery
 
-### 8.1 原子写盘
+### 8.1 Atomic Disk Writes
 
-文件保存必须使用：
-- `.part` 临时文件
+File persistence must use:
+- A `.part` temporary file
 - `fsync`
-- `os.replace()` 原子替换
+- Atomic replacement with `os.replace()`
 
-### 8.2 恢复扫描器
+### 8.2 Recovery Scanner
 
-启动时必须执行：
+The following must run at startup:
 
-1. 扫描 `storage/raw/` 中的 `.eml`
-2. 对不存在 DB 记录的 raw 文件，补建 message/delivery
-3. 对 `parse_status = pending/failed` 可重试解析
-4. 清理陈旧 `.part`
+1. Scan for `.eml` files under `storage/raw/`
+2. Backfill message/delivery records for raw files that have no database record
+3. Optionally retry parsing records with `parse_status = pending/failed`
+4. Clean up stale `.part` files
 
-### 8.3 去重策略
+### 8.3 Deduplication Strategy
 
-不对“内容相同”的邮件做自动去重。
+Do not automatically deduplicate messages with identical content.
 
-原因：
-- 同一封原始邮件可能本来就被重复投递
-- 不应因 hash 相同而吞掉第二次到达
+Reasons:
+- The same raw message may legitimately be delivered more than once
+- A second arrival must not be swallowed because it has the same hash
 
-`sha256` 仅用于：
-- 完整性校验
-- 运维比对
+`sha256` is used only for:
+- Integrity verification
+- Operational comparison
 
-## 9. 存储设计
+## 9. Storage Design
 
-### 9.1 文件布局
+### 9.1 File Layout
 
 ```text
 /data/rapid-inbox/
@@ -312,9 +315,9 @@ SMTP 会话只处理：
   logs/
 ```
 
-### 9.2 SQLite PRAGMA 要求
+### 9.2 SQLite PRAGMA Requirements
 
-启动时设置：
+Set at startup:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -323,104 +326,104 @@ PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = FULL;
 ```
 
-说明：
-- 默认使用 `WAL`
-- 默认使用 `FULL`，降低 SQLite 提交在掉电时回滚或损坏的风险；端到端持久性仍取决于
-  durable ACK、文件/目录 fsync、文件系统和存储硬件
-- 若用户接受极小的掉电回滚风险，可切换 `NORMAL` 换更低延迟
+Notes:
+- Use `WAL` by default
+- Use `FULL` by default to reduce the risk of a SQLite commit being rolled back or corrupted after power loss; end-to-end durability still depends on
+  durable ACK, file/directory fsync, the filesystem, and storage hardware
+- Users who accept a very small risk of rollback after power loss can switch to `NORMAL` for lower latency
 
-## 10. SQLite 表设计
+## 10. SQLite Table Design
 
-> 详见配套 `sqlite_schema.sql`。
+> See the accompanying `sqlite_schema.sql` for details.
 
 ### 10.1 admins
 
-管理员账号。
+Administrator accounts.
 
 ### 10.2 admin_sessions
 
-后台网页登录会话，使用 cookie session。
+Admin Web login sessions using cookie-based sessions.
 
 ### 10.3 domains
 
-域规则表。
+Domain rules.
 
 ### 10.4 mailboxes
 
-虚拟邮箱表。
+Virtual mailboxes.
 
-一条邮箱记录对应一个“规范化邮箱地址”，例如：
+Each mailbox record corresponds to a normalized mailbox address, for example:
 - `xxx@adb.com`
 - `xxx@1.adb.com`
 
 ### 10.5 smtp_sessions
 
-SMTP 连接摘要表。
+SMTP connection summaries.
 
 ### 10.6 smtp_events
 
-SMTP 历史事件表（非热路径必需，但后台排障需要）。
+Historical SMTP events (not required on the hot path, but needed for admin troubleshooting).
 
 ### 10.7 messages
 
-原始消息对象表；一封 raw 邮件只保存一次。
+Raw message objects; each raw message is stored only once.
 
 ### 10.8 message_deliveries
 
-消息与邮箱的投递关系表。
+Delivery relationships between messages and mailboxes.
 
-如果一封邮件同时投递给：
+If one message is delivered to both:
 - `a@adb.com`
 - `b@adb.com`
 
-则：
-- `messages` 只有 1 行
-- `message_deliveries` 有 2 行
+Then:
+- `messages` has only 1 row
+- `message_deliveries` has 2 rows
 
 ### 10.9 attachments
 
-附件索引表。
+Attachment index.
 
 ### 10.10 api_keys / api_key_scopes / api_key_domain_grants / api_key_mailbox_grants
 
-API Key、权限范围、资源绑定。
+API keys, permission scopes, and resource bindings.
 
 ### 10.11 audit_logs
 
-审计日志。
+Audit logs.
 
 ### 10.12 system_settings
 
-全局设置键值表。
+Global key-value settings.
 
-## 11. 权限模型
+## 11. Authorization Model
 
-### 11.1 管理后台身份模型
+### 11.1 Admin Console Identity Model
 
-后台 UI 使用：
-- 管理员用户名/密码登录
-- 登录成功后签发 session cookie
+The admin UI uses:
+- Administrator username/password login
+- A session cookie issued after successful login
 
-### 11.2 API Key 模型
+### 11.2 API Key Model
 
-API Key 采用：
-- `prefix + secret` 形式
-- 数据库只存 `secret_hash`
-- 创建时仅显示一次明文 key
+An API key uses:
+- A `prefix + secret` format
+- Only `secret_hash` is stored in the database
+- The plaintext key is shown only once, when it is created
 
-建议格式：
+Recommended formats:
 - `ri_admin_<prefix>_<secret>`
 - `ri_public_<prefix>_<secret>`
 
-### 11.3 API Key 类型
+### 11.3 API Key Types
 
 - `admin`
 - `service`
 - `public`
 
-### 11.4 Scope 列表
+### 11.4 Scope List
 
-最小 scope 集：
+Minimum scope set:
 
 - `system.read`
 - `system.write`
@@ -437,58 +440,58 @@ API Key 采用：
 - `apikeys.write`
 - `public.read`
 
-### 11.5 资源限制
+### 11.5 Resource Restrictions
 
-API Key 除 scope 外，还要支持资源绑定：
+In addition to scopes, an API key must support resource bindings:
 
-- 域级授权
-- 邮箱级授权
+- Domain-level authorization
+- Mailbox-level authorization
 
-示例：
-- 某 key 只有 `public.read`
-- 且只允许 `adb.com`
-- 或只允许 `foo@adb.com`
+Example:
+- A key has only `public.read`
+- And it is restricted to `adb.com`
+- Or it is restricted to `foo@adb.com`
 
-### 11.6 Key 校验顺序
+### 11.6 Key Validation Order
 
-1. 根据前缀快速查 key
-2. 校验 hash
-3. 校验状态/过期时间
-4. 校验源 IP 白名单（如有）
-5. 校验 scope
-6. 校验 domain/mailbox 绑定
-7. 记录 `last_used_at` / `last_used_ip`
+1. Look up the key quickly by prefix
+2. Verify the hash
+3. Verify status/expiration
+4. Verify the source IP allowlist (if present)
+5. Verify the scope
+6. Verify domain/mailbox bindings
+7. Record `last_used_at` / `last_used_ip`
 
-## 12. HTTP 路由设计
+## 12. HTTP Route Design
 
 ## 12.1 Public HTML
 
-### 邮箱页
+### Mailbox Page
 
 - `GET /mail/{mailbox_address}`
-  - 功能：邮箱邮件列表
-  - 无需登录
+  - Function: mailbox message list
+  - No login required
 
-### 邮件详情页
+### Message Detail Page
 
 - `GET /mail/{mailbox_address}/{delivery_id}`
-  - 功能：查看邮件详情
-  - 无需登录
+  - Function: view message details
+  - No login required
 
-### 原始邮件
+### Raw Message
 
 - `GET /mail/{mailbox_address}/{delivery_id}/raw`
-  - 功能：下载 raw `.eml`
+  - Function: download the raw `.eml`
 
-### 附件下载
+### Attachment Download
 
 - `GET /mail/{mailbox_address}/{delivery_id}/attachments/{attachment_id}`
 
 ## 12.2 Public API
 
-> 设计决策：HTML 页面匿名；JSON API 默认要求 API Key。这样前台仍然“无密码访问”，同时 API 保持权限模型完整。
+> Design decision: HTML pages are anonymous; the JSON API requires an API key by default. This keeps the frontend passwordless while preserving the complete authorization model for the API.
 
-### 获取邮箱邮件列表
+### List Mailbox Messages
 
 - `GET /api/v1/public/mailboxes/{mailbox_address}/messages`
 - Header: `X-API-Key: ...`
@@ -496,7 +499,7 @@ API Key 除 scope 外，还要支持资源绑定：
   - `limit`
   - `cursor`
 
-返回：
+Response:
 
 ```json
 {
@@ -516,21 +519,21 @@ API Key 除 scope 外，还要支持资源绑定：
 }
 ```
 
-### 获取邮件详情
+### Get Message Details
 
 - `GET /api/v1/public/mailboxes/{mailbox_address}/messages/{delivery_id}`
 
-### 下载原始邮件
+### Download Raw Message
 
 - `GET /api/v1/public/mailboxes/{mailbox_address}/messages/{delivery_id}/raw`
 
-### 下载附件
+### Download Attachment
 
 - `GET /api/v1/public/mailboxes/{mailbox_address}/messages/{delivery_id}/attachments/{attachment_id}`
 
 ## 12.3 Admin API
 
-### 域名管理
+### Domain Management
 
 - `GET /api/v1/admin/domains`
 - `POST /api/v1/admin/domains`
@@ -539,7 +542,7 @@ API Key 除 scope 外，还要支持资源绑定：
 - `DELETE /api/v1/admin/domains/{id}`
 - `POST /api/v1/admin/domains/{id}/dns-check`
 
-`POST /api/v1/admin/domains` 请求示例：
+Example `POST /api/v1/admin/domains` request:
 
 ```json
 {
@@ -555,7 +558,7 @@ API Key 除 scope 外，还要支持资源绑定：
 }
 ```
 
-### 邮箱管理
+### Mailbox Management
 
 - `GET /api/v1/admin/mailboxes`
 - `GET /api/v1/admin/mailboxes/{id}`
@@ -563,7 +566,7 @@ API Key 除 scope 外，还要支持资源绑定：
 - `DELETE /api/v1/admin/mailboxes/{id}`
 - `GET /api/v1/admin/mailboxes/{id}/messages`
 
-### 邮件管理
+### Message Management
 
 - `GET /api/v1/admin/messages`
 - `GET /api/v1/admin/messages/{message_id}`
@@ -571,15 +574,15 @@ API Key 除 scope 外，还要支持资源绑定：
 - `DELETE /api/v1/admin/deliveries/{delivery_id}`
 - `POST /api/v1/admin/deliveries/bulk-delete`
 
-### SMTP 会话 / 实时信息
+### SMTP Sessions / Live Information
 
 - `GET /api/v1/admin/smtp/sessions`
 - `GET /api/v1/admin/smtp/sessions/{session_id}`
 - `GET /api/v1/admin/live/smtp/stream`
 
-`/live/smtp/stream` 使用 SSE。
+`/live/smtp/stream` uses SSE.
 
-### API Key 管理
+### API Key Management
 
 - `GET /api/v1/admin/api-keys`
 - `POST /api/v1/admin/api-keys`
@@ -588,15 +591,15 @@ API Key 除 scope 外，还要支持资源绑定：
 - `POST /api/v1/admin/api-keys/{id}/rotate`
 - `POST /api/v1/admin/api-keys/{id}/revoke`
 
-### 审计与设置
+### Audit and Settings
 
 - `GET /api/v1/admin/audit-logs`
 - `GET /api/v1/admin/settings`
 - `PATCH /api/v1/admin/settings`
 
-## 13. 管理后台页面
+## 13. Admin Console Pages
 
-### 13.1 页面清单
+### 13.1 Page List
 
 - `/admin/login`
 - `/admin`
@@ -609,20 +612,20 @@ API Key 除 scope 外，还要支持资源绑定：
 - `/admin/audit`
 - `/admin/settings`
 
-### 13.2 首页仪表盘
+### 13.2 Home Dashboard
 
-显示：
-- 当前活跃 SMTP 会话数
-- 1 分钟 / 5 分钟收件速率
-- 待解析队列长度
-- 近 24 小时接收数
-- 近 24 小时失败数
-- 磁盘占用
-- 域名数 / 邮箱数 / 邮件数
+Displays:
+- Current active SMTP session count
+- 1-minute / 5-minute receipt rate
+- Pending parsing queue length
+- Number received in the last 24 hours
+- Number of failures in the last 24 hours
+- Disk usage
+- Domain count / mailbox count / message count
 
-### 13.3 实时连接面板
+### 13.3 Live Connection Panel
 
-SSE 推送字段：
+Fields pushed over SSE:
 
 ```json
 {
@@ -638,7 +641,7 @@ SSE 推送字段：
 }
 ```
 
-事件类型：
+Event types:
 - `connected`
 - `ehlo`
 - `mail_from`
@@ -649,96 +652,95 @@ SSE 推送字段：
 - `disconnected`
 - `error`
 
-## 14. 前台页面行为
+## 14. Public Frontend Behavior
 
-### 14.1 邮箱列表页
+### 14.1 Mailbox List Page
 
-展示：
-- 收件时间
-- 发件人
-- 主题
-- 附件标记
-- 解析状态
-- 分页
+Displays:
+- Receipt time
+- Sender
+- Subject
+- Attachment indicator
+- Parsing status
+- Pagination
 
-### 14.2 邮件详情页
+### 14.2 Message Detail Page
 
-展示：
-- Header 摘要
-- 文本正文
-- HTML 正文
-- 原始邮件下载
-- 附件列表
+Displays:
+- Header summary
+- Text body
+- HTML body
+- Raw message download
+- Attachment list
 
-### 14.3 HTML 邮件渲染安全
+### 14.3 HTML Message Rendering Security
 
-必须满足：
-- 不把原始 HTML 直接插入主站 DOM
-- 使用独立渲染路由 + sandbox iframe，或先做严格清洗
-- 默认不自动加载远程图片
-- 允许本地 CID 附件重写后显示
+The following requirements must be met:
+- Do not insert raw HTML directly into the main site's DOM
+- Use a separate rendering route with a sandboxed iframe, or sanitize it strictly first
+- Do not load remote images automatically by default
+- Allow rewritten local CID attachments to be displayed
 
-## 15. 性能目标（产品要求）
+## 15. Performance Targets (Product Requirements)
 
-以下为实现目标，不是保证值：
+The following are implementation targets, not guarantees:
 
-1. 小邮件（<= 100KB）`DATA` 结束到返回 `250`：
-   - 空闲机器中位数目标 < 250ms
-2. 已接收邮件在前台列表可见：
-   - 目标 < 1s
-3. 后台实时连接事件延迟：
-   - 目标 < 500ms
+1. For a small message (<= 100KB), time from the end of `DATA` to the `250` response:
+   - Median target < 250ms on an idle machine
+2. Time until a received message is visible in the frontend list:
+   - Target < 1s
+3. Latency for a live connection event in the admin console:
+   - Target < 500ms
 
-### 15.1 性能关键点
+### 15.1 Performance Critical Points
 
-1. SMTP 热路径禁止：
-   - MIME 深解析
-   - 附件提取
-   - HTML 清洗
-   - DNS 远程查询
-   - 复杂 SQL 搜索
-2. 域规则需加载到内存。
-3. 使用单写队列避免 SQLite 写锁抖动。
-4. 前台读取使用短事务和只读连接。
+1. The SMTP hot path must not perform:
+   - Deep MIME parsing
+   - Attachment extraction
+   - HTML sanitization
+   - Remote DNS queries
+   - Complex SQL searches
+2. Domain rules must be loaded into memory.
+3. Use a single writer queue to avoid SQLite write-lock contention.
+4. Frontend reads should use short transactions and read-only connections.
 
-## 16. 运营与安全补充要求
+## 16. Operations and Security Supplementary Requirements
 
-### 16.1 即使“不做反垃圾”，仍必须有的系统保护
+### 16.1 System Protections Required Even Without Anti-Spam
 
-这些不是垃圾过滤，而是系统自保：
+These protect the system itself; they are not spam filtering:
 
-- 最大消息大小限制（可配置）
-- 单连接空闲超时
-- 并发连接上限
-- 单消息最大收件人数上限
-- 单 IP 短时连接上限（只防止打死服务，不用于判垃圾）
-- 磁盘占用告警
+- Maximum message size limit (configurable)
+- Per-connection idle timeout
+- Concurrent connection limit
+- Maximum recipients per message
+- Short-term per-IP connection limit (only to prevent service exhaustion, not for spam classification)
+- Disk usage alerting
 
-### 16.2 审计要求
+### 16.2 Audit Requirements
 
-必须记录：
-- 域名新增/修改/删除
-- API Key 创建/轮换/吊销
-- 管理员登录/登出
-- 邮件删除/批量删除
-- 设置变更
+The following must be recorded:
+- Domain creation/modification/deletion
+- API key creation/rotation/revocation
+- Administrator login/logout
+- Message deletion/bulk deletion
+- Settings changes
 
-### 16.3 备份要求
+### 16.3 Backup Requirements
 
-至少备份：
-- SQLite 数据库文件
-- `-wal` / `-shm` 文件（若在线冷拷贝）
-- 原始邮件目录
-- 附件目录
+At minimum, back up:
+- SQLite database file
+- `-wal` / `-shm` files (when making an online cold copy)
+- Raw message directory
+- Attachment directory
 
-### 16.4 隐私与产品说明
+### 16.4 Privacy and Product Explanation
 
-后台与首页必须明确提示：
+The admin console and home page must clearly show:
 
-> 新建域和任意域策略默认私有。只有管理员显式开启域级公共 Web/API 后，对应邮箱公开位才会生效；
-> 公开收件箱仅适用于测试、临时和展示场景，不适用于私人通信或长期敏感信息。
+> New domains and the any-domain policy are private by default. A corresponding mailbox becomes public only after an administrator explicitly enables domain-level public Web/API access; public inboxes are intended only for testing, temporary, and demonstration scenarios, not for private communication or long-term sensitive information.
 
-## 17. 建议代码目录（初始规划）
+## 17. Suggested Code Directory (Initial Plan)
 
 ```text
 app/
@@ -786,65 +788,63 @@ app/
   static/
 ```
 
-## 18. 实现顺序（初始任务分解）
+## 18. Implementation Order (Initial Task Breakdown)
 
-### Phase 1：最小可用收件链路
+### Phase 1: Minimum Viable Receiving Path
 
-1. 建 SQLite schema
-2. 完成 domain matcher
-3. 完成 SMTP 收件与 raw 落盘
-4. 完成 mailbox/message/delivery 占位写入
-5. 完成前台邮箱列表与邮件详情页
+1. Create the SQLite schema
+2. Complete the domain matcher
+3. Complete SMTP receiving and raw persistence
+4. Complete placeholder writes for mailbox/message/delivery
+5. Complete the frontend mailbox list and message detail pages
 
-### Phase 2：后台与 API
+### Phase 2: Admin and API
 
-6. 管理员登录
-7. 域名 CRUD
-8. 管理员 API
+6. Administrator login
+7. Domain CRUD
+8. Admin API
 9. Public API
-10. API Key / scope / 资源绑定
+10. API keys / scopes / resource bindings
 
-### Phase 3：实时与运维
+### Phase 3: Real-Time and Operations
 
-11. SMTP 实时连接 SSE
-12. 历史 SMTP 会话查询
-13. DNS 检查页面
-14. 审计日志
+11. SMTP live-connection SSE
+12. Historical SMTP session queries
+13. DNS check page
+14. Audit logs
 15. Recovery scanner
 
-### Phase 4：邮件细节
+### Phase 4: Message Details
 
-16. MIME 解析
-17. 附件提取
-18. HTML 安全渲染
-19. 批量删除 / reparse / 下载 raw
+16. MIME parsing
+17. Attachment extraction
+18. Secure HTML rendering
+19. Bulk deletion / reparse / raw download
 
-## 19. 验收标准
+## 19. Acceptance Criteria
 
-1. 添加 `adb.com` 后，可接收 `foo@adb.com`。
-2. 开启 `accept_subdomains` 后，可接收 `foo@x.adb.com`、`foo@y.x.adb.com`。
-3. 显式开启域级公共 Web 后，访问 `https://adb.com/mail/foo@adb.com` 可查看该邮箱邮件。
-4. 无需前台登录即可浏览已显式公开的邮箱。
-5. HTTP 与 Python SMTP 同进程时，管理后台可实时看到 SMTP 连接与收件事件；分进程数据面只保证
-   已提交历史可查询，跨进程实时通知不属于当前实现。
-6. 管理员 API Key 可按 scope 与域/邮箱限制权限。
-7. Public API 可按 read-only key 获取公开邮箱消息。
-8. 在 durable ACK 模式下，邮件原始文件落盘成功后才返回 `250`。
-9. SQLite 写压力上来时，前台读仍可继续。
-10. 程序异常重启后，恢复扫描器可以找回已落盘但未入库的邮件。
+1. After adding `adb.com`, the system can receive `foo@adb.com`.
+2. After enabling `accept_subdomains`, the system can receive `foo@x.adb.com` and `foo@y.x.adb.com`.
+3. After explicitly enabling domain-level public Web access, visiting `https://adb.com/mail/foo@adb.com` shows that mailbox's messages.
+4. A publicly enabled mailbox can be browsed without a frontend login.
+5. When HTTP and Python SMTP run in the same process, the admin console can show SMTP connections and receipt events in real time; with a separate-process data plane, only committed history is guaranteed to be queryable, and cross-process real-time notifications are outside the current implementation.
+6. An administrator API key can restrict permissions by scope and by domain/mailbox.
+7. The Public API can retrieve messages from a public mailbox using a read-only key.
+8. In durable ACK mode, the raw message file is persisted successfully before `250` is returned.
+9. Frontend reads can continue while SQLite write pressure increases.
+10. After an abnormal restart, the recovery scanner can recover messages that were persisted but not inserted into the database.
 
-## 20. 初始设计约束（历史记录，非当前强制契约）
+## 20. Initial Design Constraints (Historical Record, Not Current Mandatory Contract)
 
-以下条目记录早期方案，不能替代当前代码、配置、README、SECURITY 或测试。实现已经演进为
-C++ ingestd 与 Python 控制面双进程架构；贡献者修改行为时应先更新当前契约和回归测试。
+The following entries record the early design and cannot replace the current code, configuration, README, SECURITY, or tests. The implementation has evolved into a two-process C++ ingestd and Python control-plane architecture; contributors must update the current contract and regression tests before changing behavior.
 
-1. **前台 HTML：仅对显式开启公共 Web 的域/邮箱匿名开放**
-2. **Public JSON API：要求 API Key**
-3. **管理员 UI：账号密码 + session cookie**
-4. **管理员 API：要求 API Key**
-5. **SMTP 仅做收件，不做发件**
-6. **SQLite 只存索引；大文件放磁盘**
-7. **收件热路径严禁做重处理**
-8. **初始计划：占位入库 + 异步解析；当前实现以实际数据面批处理顺序为准**
-9. **新建域和任意域策略默认私有；管理员可分别开启域级 Web/API，并继续按邮箱关闭公开位**
-10. **企业级多节点扩展不是当前目标；若改变该边界，必须重新设计并明确存储、事件和迁移契约**
+1. **Public HTML: anonymous access only for domains/mailboxes explicitly enabled for public Web access**
+2. **Public JSON API: requires an API key**
+3. **Admin UI: username/password + session cookie**
+4. **Admin API: requires an API key**
+5. **SMTP receives only; it does not send**
+6. **SQLite stores indexes only; large files go on disk**
+7. **Heavy processing is forbidden on the receiving hot path**
+8. **Initial plan: placeholder insertion + asynchronous parsing; the current implementation follows the actual data-plane batch order**
+9. **New domains and the any-domain policy are private by default; administrators can separately enable domain-level Web/API access and continue to disable public access per mailbox**
+10. **Enterprise-grade multi-node expansion is not a current goal; changing this boundary requires redesigning and documenting storage, event, and migration contracts**

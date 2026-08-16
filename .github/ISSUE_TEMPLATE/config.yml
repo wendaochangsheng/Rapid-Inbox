@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
-  - name: 安全问题
+  - name: Security issue / 安全问题
     url: mailto:wendao@ofoco.cn
-    about: 涉及漏洞、密钥、数据泄露或权限绕过时，请私下报告。
+    about: Report vulnerabilities, exposed credentials, data leaks, or authorization bypasses privately. / 涉及漏洞、密钥、数据泄露或权限绕过时，请私下报告。

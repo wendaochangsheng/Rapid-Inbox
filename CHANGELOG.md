@@ -1,121 +1,111 @@
-# 更新日志
+**English** | [简体中文](CHANGELOG.zh-CN.md)
 
-本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 和 [语义化版本](https://semver.org/lang/zh-CN/) 的思路记录重要变化。当前处于 `0.x` 阶段，接口和数据结构可能继续调整。
+# Changelog
+
+This project records notable changes in the spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/). The project is currently in the `0.x` stage, and interfaces and data structures may continue to change.
 
 ## [Unreleased]
 
-### 变更
+### Changed
 
-- 明确项目的适用场景、单机部署、数据保留、授权使用、公开查阅、平台兼容和 Alpha 成熟度边界；
-  区分当前已实现能力与 Roadmap。
-- 修正文档中默认公开、C++ 限流默认值、发布版本和 Python/C++ 测试范围的历史漂移。
-- C++ CTest 注册本地化验证码回归，并在 ingestd 构建 job 中运行 Python/C++ 跨进程集成测试。
+- Made project-facing Markdown bilingual: standard filenames now contain English, complete
+  Simplified Chinese versions use the `.zh-CN.md` suffix, and GitHub Issue/PR templates present
+  both languages in one file.
+- Clarified the project's use cases and its boundaries for single-node deployment, data retention, authorized use, public access, platform compatibility, and Alpha maturity; distinguished currently implemented capabilities from the Roadmap.
+- Corrected historical documentation drift concerning default public access, C++ rate-limit defaults, release versions, and Python/C++ test coverage.
+- Registered the localized verification-code regression with CTest and made the ingestd build job run the Python/C++ cross-process integration tests.
 
-### 安全
+### Security
 
-- 管理写表单要求与受信 ASGI scheme/Host 一致的 Origin 或 Referer；登录兼容缺少来源头的
-  非浏览器客户端，但拒绝显式跨源来源。
-- C++ 解析结果超过 16 MiB 恢复 manifest 预算时回退到有界 pending receipt，由 Python 恢复器
-  从已持久化 raw 重新解析，避免 durable ACK 与跨语言恢复上限不一致。
+- Administration write forms require an Origin or Referer matching the trusted ASGI scheme/Host. Login remains compatible with non-browser clients that omit source headers, but rejects an explicitly cross-origin source.
+- When a C++ parsing result exceeds the 16 MiB recovery-manifest budget, it falls back to a bounded pending receipt and the Python recovery process reparses the persisted raw message, avoiding a mismatch between durable ACK and the cross-language recovery limit.
 
 ## [0.1.0] - 2026-08-16
 
-### 新增
+### Added
 
-- 两种收件模式：只接收已配置域名的 `managed_only`，以及通过系统 `*` 策略接收已到达本服务的任意合法域投递的 `managed_plus_catchall`；任意域默认私有，可独立开启公共 Web/API 与保留期。
-- 管理员 RBAC 与完整账号生命周期：`viewer`、`operator`、`superadmin`，支持创建、停用、密码重置、会话撤销，并保护最后一个启用的 superadmin。
-- API Key 显式域授权模式 `none/selected/all`、邮箱 glob、kind/scope 校验、IP CIDR、传输方式、限速、到期、轮换、吊销和删除。
-- `/api/v2` 新 API：`admin` / `service` / `public` Key 均使用 Bearer-only 认证，提供公开邮箱、域名/DNS、邮箱/邮件、SMTP 会话/事件、仪表盘、系统设置、维护、API Key、管理员和审计资源；使用严格 Pydantic schema、统一 JSON envelope、RFC 9457 风格 Problem Details、HMAC 签名 cursor 和稳定 operation ID，raw/附件保持文件响应。
-- 结构化 JSON/text 日志、安全 Request ID、按路由模板记录的 HTTP 日志、Prometheus `/metrics`、`/health/live`、`/health/ready` 和 `/version`；版本端点标记推荐 `v2` 并列出受支持的 `v1`/`v2`。
-- 缓存化运维仪表盘：HTTP RPS/P95、独立邮件/投递/拒绝/解析失败、SMTP/解析队列、SQLite/WAL、磁盘、后台任务和清理状态。
-- 持久化域归属迁移与整邮箱删除作业：邮箱删除使用代次隔离加固定 rowid frontier，每批最多
-  1000 行，支持失败/取消/重启续跑；即使物理清理导致 SQLite 复用 rowid，也不会误删作业创建后的新投递。
-- 投递级保留策略和文件 GC outbox：分批删除、失败持久化、指数退避重试；独立清理 SMTP 会话、空邮箱、指标和审计日志。
-- C++ `rapid-inbox-ingestd` durable ACK、SIZE/8BITMIME/PIPELINING/SMTPUTF8 与严格 ESMTP 参数校验、IPv4/IPv6 监听、有界单 IP 建连滑窗、跨进程维护锁、域规则热刷新、任意域 fallback、毒任务 quarantine 和 per-domain 投递到期时间。
-- 打分制验证码识别，覆盖中英日韩西多语言、分组数字、字母数字和 HTML 场景。
-- `quickstart.sh` 一键启动与 GitHub Actions ingestd 二进制发布流程；新增 SMTP 与只读 HTTP 高并发压测脚本。
+- Two ingestion modes: `managed_only`, which accepts only configured domains, and `managed_plus_catchall`, which uses the system `*` policy to accept deliveries to any syntactically valid domain that reach this service. Any-domain mail is private by default and can independently enable public Web/API access and retention periods.
+- Administrator RBAC and a complete account lifecycle: `viewer`, `operator`, and `superadmin`, with account creation, disabling, password reset, and session revocation, while protecting the last enabled superadmin.
+- Explicit API Key domain authorization modes `none/selected/all`, mailbox globs, kind/scope validation, IP CIDRs, transports, rate limits, expiration, rotation, revocation, and deletion.
+- A new `/api/v2` API: `admin`, `service`, and `public` Keys all use Bearer-only authentication. It provides resources for public mailboxes, domains/DNS, mailboxes/messages, SMTP sessions/events, dashboards, system settings, maintenance, API Keys, administrators, and audit records. It uses strict Pydantic schemas, a unified JSON envelope, RFC 9457-style Problem Details, HMAC-signed cursors, and stable operation IDs; raw messages and attachments remain file responses.
+- Structured JSON/text logs, secure Request IDs, HTTP logs recorded by route template, Prometheus `/metrics`, `/health/live`, `/health/ready`, and `/version`. The version endpoint marks `v2` as recommended and lists supported `v1`/`v2` versions.
+- A cached operations dashboard covering HTTP RPS/P95, separate message/delivery/rejection/parse-failure metrics, SMTP/parsing queues, SQLite/WAL, disk, background tasks, and cleanup status.
+- Persistent domain-ownership migration and whole-mailbox deletion jobs. Mailbox deletion uses generation isolation plus a fixed rowid frontier, processes at most 1000 rows per batch, and can resume after failure, cancellation, or restart. It does not mistakenly delete new deliveries created after the job, even if physical cleanup lets SQLite reuse rowids.
+- Delivery-level retention policies and a file-GC outbox: batched deletion, persistent failures, and exponential-backoff retries, with separate cleanup of SMTP sessions, empty mailboxes, metrics, and audit logs.
+- C++ `rapid-inbox-ingestd` durable ACK, SIZE/8BITMIME/PIPELINING/SMTPUTF8, strict ESMTP parameter validation, IPv4/IPv6 listeners, a bounded per-IP connection-rate window, a cross-process maintenance lock, hot-reloaded domain rules, any-domain fallback, poison-task quarantine, and per-domain delivery expiration times.
+- Scored verification-code recognition covering Chinese, English, Japanese, Korean, and Spanish; grouped digits; alphanumeric codes; and HTML scenarios.
+- A one-command `quickstart.sh` startup flow and a GitHub Actions ingestd binary-release workflow, plus SMTP and read-only HTTP high-concurrency benchmark scripts.
 
-### 性能与可靠性
+### Performance and reliability
 
-- ingestd 在 `DATA` 前只预留消息槽，正文按可配置大块增长字节 reservation；预算覆盖 reservation、排队和处理中批次，既避免每行加锁和无界内存，也不再让小邮件连接预占整封上限。进入 `DATA` 后的大小/字节压力会消费到终止点并只返回一次 `552/451`，保持 PIPELINING 帧同步。
-- ingestd 域规则改为带 generation 的不可变共享快照；长连接仅在有效 `MAIL` 边界热切换，`RCPT` 无锁复用事务快照。域匹配由逐规则线性扫描改为精确哈希与无临时分配的最长后缀哈希查找。
-- 默认在 SMTP `250` 前原子写入 raw + pending manifest；可选文件/目录 fsync。SQLite 元数据异步 group commit，异常退出后由 manifest 重建。
-- MIME/附件处理使用多 worker，SQLite 事务短时串行；批次失败会二分隔离，健康邮件不再被毒邮件反复拖累。
-- API Key 鉴权使用有界短 TTL 缓存并在变更时失效；selected 域授权保持即时 fail-closed；`last_used_at` 写入节流，限流改为有界固定内存 token bucket。
-- API v2 的全域/无域 Key 命中热缓存时不再为每个请求调度默认线程池；缓存 miss 才异步读取 SQLite，selected 域授权仍坚持逐次 fail-closed 查询。
-- Python 解析队列新增消息数与 raw 字节双重预算，active/queued 统一计数；队列压力不否定已持久化邮件，周期 pending 扫描会公平补入队。
-- 管理 SSE 与公共邮箱 WebSocket 共享每进程长连接准入上限，避免慢连接耗尽 HTTP 文件描述符与任务容量。
-- HTTP 总并发、请求体总接收时限、共享 body 字节预算、SQLite writer 等待者和密码任务等待者均改为有界准入，过载快速失败并提示退避。
-- API v2 SQLite 读取改为 Runtime 私有的持久只读 actor：连接、已接管请求和等待者分别有硬上限，端到端 deadline/取消可中断长查询，维护会排空并关闭 owner 连接后再 checkpoint/VACUUM；fatal 状态进入 readiness。
-- Python 兼容 SMTP 默认限制 1024 个并发连接，共享建连滑窗默认限制为每 IP 每分钟 60000 次；非回环 SMTP 监听拒绝显式配置为无限并发。
-- quickstart 在启动任何服务进程前显式完成 SQLite schema/轻量迁移，失败即整体退出；Uvicorn 同步应用 `HTTP_CONCURRENCY_LIMIT`。
-- quarantine 与孤立 raw/text/html/附件清理使用跨批次续跑的持久 iterator pass，不再每轮从目录树根重复扫描同一前缀；已结束维护记录另行分批清理。
-- Dashboard 的数据库和磁盘采集移出事件循环，并用短 TTL 与防击穿锁让 HTML/API 共用快照；
-  大表总量改由单行事务计数器读取，收件/投递/拒绝/解析失败改为 C++ 批内聚合的分钟桶，24 小时
-  查询成本固定在约 1441 个桶，不再每 1.5 秒扫描当天全部邮件。
-- Python 短命读连接不再重复设置数据库级 `journal_mode`/`synchronous`，避免每请求触发 WAL 初始化；写连接仍显式使用 `FULL`。
-- C++ SQLite writer 跨批次复用单连接和 persistent prepared statements；失败、数据库替换与维护
-  握手会安全关闭并按需重建会话。
-- 启动 recovery 使用临时磁盘 SQLite 分批 spool 全量历史、永久失败重试与同 mtime 水位路径，
-  Python 堆不再随历史 manifest 数量增长，同时避免粗粒度时间戳漏扫新收件。
-- 公共/管理详情对正文、headers 与 CID 图片实施独立硬预算，完整 raw/附件继续通过
-  `FileResponse` 流式下载；同步日志格式化和 stderr I/O 移入容量 4096 的独立队列线程。
-- recovery 校验 raw 大小与 SHA-256；单文件、扫描批次和磁盘 spool 回放页均以 16 MiB 字节预算切分，已完成邮件在读取 JSON 前过滤；无效 manifest 移入 quarantine，不再阻断其它邮件恢复。
-- 域规则变更的历史邮箱归属迁移改为持久化 job 与每批 1000 行的独立事务，批间允许 SMTP writer 插队；非路由字段更新不再扫描历史邮箱。
-- API v2 受限消息列表改由获授权的 mailbox/delivery 候选驱动，稀疏 selected-domain、mailbox glob 与 mailbox ID 查询不再扫描全局消息时间线。
-- v2 API Key 列表使用固定 1000–5000 行扫描预算和最后扫描位置 continuation cursor；兼容 v1 的
-  域列表、SMTP events 与批量删除也加入硬分页/1000-ID 上限，公开邮箱 cursor 改为绑定主体和邮箱的 HMAC 签名。
-- SMTP 会话、审计与 file-GC 稳态清理查询按现有索引顺序执行；新 GC tombstone 与到期重试使用两个有界索引流公平合并，避免全表扫描或重试饥饿。
-- HTTP 安全头/外部访问守卫改为直接 ASGI 中间件，压测工具为每个 worker 复用独立连接池；进程 RSS 指标读取当前驻留页而非继承的历史峰值。
+- Before `DATA`, ingestd reserves only a message slot. Message bodies grow their byte reservation in configurable large blocks. The budget covers reservations, queued work, and in-flight batches, avoiding per-line locking and unbounded memory without making small-message connections reserve the entire per-message limit. After entering `DATA`, size/byte pressure consumes through the terminator and returns only one `552/451`, preserving PIPELINING frame synchronization.
+- ingestd domain rules use generation-tagged immutable shared snapshots. Long-lived connections switch snapshots only at a valid `MAIL` boundary, while `RCPT` reuses the transaction snapshot without locks. Domain matching changed from a linear scan of every rule to exact hashes and longest-suffix hash lookup without temporary allocations.
+- By default, raw + pending manifest are atomically written before the SMTP `250`; file/directory fsync is optional. SQLite metadata uses asynchronous group commit and is rebuilt from manifests after an abnormal exit.
+- MIME/attachment processing uses multiple workers while SQLite transactions are briefly serialized. Failed batches are split recursively, so healthy messages are no longer repeatedly delayed by a poison message.
+- API Key authentication uses a bounded short-TTL cache that is invalidated on changes. Authorization for `selected` domains remains immediately fail-closed. `last_used_at` writes are throttled, and rate limiting uses a bounded, fixed-memory token bucket.
+- API v2 Keys with all-domain or no-domain authorization no longer schedule work in the default thread pool for every hot-cache request. Only cache misses read SQLite asynchronously; `selected` domain authorization still performs a fail-closed query for every request.
+- The Python parsing queue has dual limits for message count and raw bytes, with unified active/queued accounting. Queue pressure does not reject already persisted messages, and periodic pending scans feed the queue fairly.
+- Administration SSE and public-mailbox WebSockets share a per-process admission limit for long-lived connections, preventing slow connections from exhausting HTTP file descriptors and task capacity.
+- HTTP total concurrency, total request-body receive time, shared body-byte budget, SQLite-writer waiters, and password-task waiters all use bounded admission. Overload fails quickly and asks clients to back off.
+- API v2 SQLite reads use a persistent read-only actor private to each Runtime. Connections, admitted requests, and waiters each have hard limits; end-to-end deadlines and cancellation can interrupt long queries. Maintenance drains and closes the owner connection before checkpoint/VACUUM, and a fatal state affects readiness.
+- The Python compatibility SMTP server defaults to 1024 concurrent connections and a shared per-IP connection-rate window of 60000 per minute. A non-loopback SMTP listener rejects an explicitly unbounded concurrency configuration.
+- quickstart explicitly completes SQLite schema setup and lightweight migrations before starting any service process, and exits entirely on failure. It also applies `HTTP_CONCURRENCY_LIMIT` to Uvicorn.
+- Quarantine and orphaned raw/text/html/attachment cleanup use a persistent iterator pass that resumes across batches instead of restarting at the same directory-tree prefix every cycle. Finished maintenance records are cleaned separately in batches.
+- Dashboard database and disk collection moved out of the event loop. A short TTL and single-flight lock let HTML/API callers share a snapshot. Large-table totals are read from single-row transactional counters; ingestion/delivery/rejection/parse-failure data comes from minute buckets aggregated within C++ batches, so a 24-hour query has a fixed cost of about 1441 buckets instead of scanning every message from the day every 1.5 seconds.
+- Short-lived Python read connections no longer repeatedly set database-level `journal_mode`/`synchronous`, avoiding WAL initialization on every request. Write connections still explicitly use `FULL`.
+- The C++ SQLite writer reuses one connection and persistent prepared statements across batches. Failures, database replacement, and maintenance handshakes close the session safely and rebuild it when needed.
+- Startup recovery uses a temporary on-disk SQLite database to batch-spool complete history, permanent-failure retries, and paths at the same mtime watermark. The Python heap no longer grows with historical manifest count, while newly received mail is not missed on coarse-grained filesystems.
+- Public and administration detail views apply independent hard budgets to bodies, headers, and CID images. Complete raw messages and attachments continue to stream through `FileResponse`. Synchronous log formatting and stderr I/O run in a separate bounded queue thread with capacity 4096.
+- Recovery verifies raw-message size and SHA-256. Per-file, scan-batch, and disk-spool replay pages are each split under a 16 MiB byte budget. Completed messages are filtered before JSON is read, and invalid manifests move to quarantine instead of blocking other message recovery.
+- Historical mailbox-ownership migration after domain-rule changes uses a persistent job and independent transactions of 1000 rows per batch, allowing the SMTP writer to proceed between batches. Changes to non-routing fields no longer scan historical mailboxes.
+- Restricted API v2 message lists are driven by authorized mailbox/delivery candidates. Sparse `selected`-domain, mailbox-glob, and mailbox-ID queries no longer scan the global message timeline.
+- API v2 Key lists use a fixed 1000-5000-row scan budget and a continuation cursor containing the last scanned position. Compatibility v1 domain lists, SMTP events, and bulk deletion also gained hard pagination/1000-ID limits. Public-mailbox cursors are now HMAC-signed and bound to the principal and mailbox.
+- Steady-state cleanup queries for SMTP sessions, audit records, and file-GC follow existing index order. New GC tombstones and expired retries use two bounded index streams merged fairly, avoiding full-table scans and retry starvation.
+- HTTP security headers and the external-access guard use direct ASGI middleware. Benchmark workers each reuse a separate connection pool. Process RSS metrics read current resident pages rather than an inherited historical peak.
 
-### 安全
+### Security
 
-- 新建域名和任意域策略默认关闭公共 Web/API；邮箱公开位默认启用但仅作为域开关下的二级门控。SMTP 可接收不再隐含匿名可查。
-- 新 API Key 的空域列表不再隐式表示全域；作用域、域和邮箱约束逐层收窄。
-- API Key 子委派新增父级 IP 网络、到期时间、限速和 header/query 传输方式的 containment 校验。
-- API Key create/update/rotate/revoke/delete 在同一个 writer 事务内重载调用者与目标策略并再次
-  校验 containment，关闭授权读取与密钥轮换之间的 TOCTOU 提权窗口。
-- v1/v2 的全局仪表盘、SMTP、审计、系统、维护和管理员等资源要求 `all` 域授权；域/邮箱/邮件仍可按 `selected` 授权过滤。
-- 管理员创建、角色变更、密码重置与会话撤销新增独立 credentials/session scope 和事务内委派 containment；低权限 Key 不能创建或接管权限更高的可登录账号。
-- `selected` 域主体不能通过修改 `root_domain` 把已有授权 ID 搬到新租户；域标识变更要求事务内重新确认 all-domain 授权。
-- 域创建的授权、域行和 rehome job，以及域删除的授权、routing tombstone 和删除本身，均在 `BEGIN IMMEDIATE` 内完成；排队期间撤销或缩权不会留下半成品。
-- 系统设置、clear-all、邮箱公开/隐藏与删除、邮件删除/重解析均在最终 `BEGIN IMMEDIATE` 事务中
-  重新加载会话或 API Key；等待 writer、maintenance drain 或预检之后撤权会 fail-closed 且原子回滚。
-- `HOST` 配为非回环地址时拒绝使用默认 bootstrap/兼容凭据；首次管理员必须修改密码。
-- 管理会话 Cookie 使用 HttpOnly/SameSite，HTTPS 下启用 Secure/HSTS。
-- ASGI 请求体同时限制声明长度和 streamed/chunked 实际字节，默认 1 MiB、最大可配 64 MiB，超限返回 413 并关闭连接。
-- 访问日志不记录查询串；Metrics 支持独立令牌，非回环绑定启用指标但未配置令牌时拒绝启动；HTML 邮件使用 sandbox iframe 和严格 CSP。
-- quickstart 下载预编译 ingestd 时校验发布的 SHA-256，不执行校验不匹配的归档。
-- quickstart 的 HTTP 默认监听改为 `127.0.0.1`；显式外网绑定会警告必须使用可信 HTTPS 反向代理。可变 `latest` 下载会提示版本漂移，生产部署应固定已审核 tag 或源码提交。
-- 清空邮件通过 `.maintenance.lock` 与 ingestd 协调，避免文件移动/数据库压缩期间继续接收。
-- 过期 heartbeat 只有在 PID 被可靠判定已退出时才允许维护继续；存活、无权限验证或损坏状态均
-  fail-closed 等待匹配 drained ACK。
-- C++ ingestd 通过 `.ingestd.instance.lock` 的内核文件锁强制每个 storage root 单实例，进程崩溃
-  自动释放，避免多个实例覆盖 heartbeat/drained ACK。
+- New domains and the any-domain policy disable public Web/API access by default. The mailbox public flag is enabled by default but acts only as a secondary gate under the domain switch. SMTP acceptance no longer implies anonymous access.
+- An empty domain list for a new API Key no longer implicitly means all domains; scope, domain, and mailbox constraints narrow access layer by layer.
+- API Key child delegation gained containment checks for parent IP networks, expiration time, rate limits, and header/query transports.
+- API Key create/update/rotate/revoke/delete operations reload caller and target policies in the same writer transaction and validate containment again, closing the TOCTOU privilege-escalation window between authorization reads and Key rotation.
+- Global dashboard, SMTP, audit, system, maintenance, administrator, and similar resources in v1/v2 require `all` domain authorization. Domain, mailbox, and message resources can still be filtered through `selected` authorization.
+- Administrator creation, role changes, password reset, and session revocation gained separate credential/session scopes and transactional delegation containment. A lower-privileged Key cannot create or take over an account that can log in with greater privileges.
+- A `selected`-domain principal cannot move an already authorized ID to a new tenant by changing `root_domain`. Domain-identity changes require all-domain authorization to be reconfirmed in the transaction.
+- Authorization, the domain row, and the rehome job for domain creation, as well as authorization, the routing tombstone, and deletion itself for domain deletion, all complete inside `BEGIN IMMEDIATE`. Revocation or narrowing while queued cannot leave partial state.
+- System settings, clear-all, mailbox public/private changes and deletion, and message deletion/reparse all reload the session or API Key inside the final `BEGIN IMMEDIATE` transaction. Revocation while waiting for the writer, maintenance drain, or preflight fails closed and rolls back atomically.
+- When `HOST` is set to a non-loopback address, default bootstrap and compatibility credentials are rejected. The first administrator must change the password.
+- Administration session cookies use HttpOnly/SameSite and enable Secure/HSTS under HTTPS.
+- ASGI request bodies limit both declared lengths and actual streamed/chunked bytes, defaulting to 1 MiB and configurable up to 64 MiB. Oversized requests return 413 and close the connection.
+- Access logs omit query strings. Metrics support a separate token, and a non-loopback service refuses to start when metrics are enabled without a token. HTML email uses a sandboxed iframe and a strict CSP.
+- quickstart verifies the released SHA-256 when downloading a prebuilt ingestd and does not execute an archive whose checksum does not match.
+- quickstart's default HTTP listener changed to `127.0.0.1`. Explicit external binding warns that a trusted HTTPS reverse proxy is required. Mutable `latest` downloads warn about version drift; production deployments should pin a reviewed tag or source commit.
+- Clearing messages coordinates with ingestd through `.maintenance.lock`, preventing continued ingestion while files are moved or the database is compacted.
+- An expired heartbeat allows maintenance to proceed only when the PID is reliably known to have exited. A live PID, an unverifiable PID due to permissions, or corrupted state all fail closed and wait for the matching drained ACK.
+- C++ ingestd uses a kernel file lock on `.ingestd.instance.lock` to enforce one instance per storage root. It is released automatically after a crash, preventing multiple instances from overwriting heartbeat/drained ACK state.
 
-### 不兼容变更
+### Breaking changes
 
-- 域名公共 Web/API 默认值从开启改为关闭，升级后应显式复核公开边界。
-- API Key 空 grants 变为 fail-closed；需要所有当前及未来域时必须设置 `domain_grant_mode=all`。
-- 邮件清理改为投递级 `expires_at`；`retention_days=NULL/0` 表示不自动过期，不再使用旧的全局 10 分钟规则。
-- API v2 只接受 Authorization Bearer，使用严格字段、统一 envelope 和 cursor，不保证 v1 response shape。
-- C++ ingestd 默认 durable ACK；关闭后才恢复“仅内存入队即 250”的旧语义。
+- The default for domain public Web/API access changed from enabled to disabled. Review public-access boundaries explicitly after upgrading.
+- Empty API Key grants now fail closed. To authorize all current and future domains, set `domain_grant_mode=all`.
+- Message cleanup now uses delivery-level `expires_at`. `retention_days=NULL/0` means no automatic expiration; the old global 10-minute rule is no longer used.
+- API v2 accepts only Authorization Bearer, uses strict fields, a unified envelope, and cursors, and does not guarantee the v1 response shape.
+- C++ ingestd enables durable ACK by default. Disabling it restores the old "250 after in-memory enqueue only" semantics.
 
-### 修复
+### Fixed
 
-- Python SMTP per-IP 限流状态改用访问 LRU 与 accepted-time 过期索引，摊销 O(1) 清理并按并发上限的四倍分配、硬封顶 65,536 个来源，避免 IPv6 地址轮换造成 O(N²) 扫描和无界增长。
-- 缺失持久 `domain_policy` 的 structured recovery manifest 现在严格 fail-closed 并进入 quarantine，不再用公开默认值复活历史私密域和邮箱。
-- API Key 缓存增加提交后失效 epoch；与 rotate/revoke/delete 并发的冷读取不能在失效之后重新填入旧密钥或旧 usage policy。
-- 移除管理员表单的 Origin/Referer 强制校验，避免 HTTPS 终止代理改写协议或 Host 后误拦登录及后台操作。
-- 修复重复 canonical 收件人产生重复投递、超长附件文件名、存储路径越界和维护期间收件竞态。
-- 新建更具体托管域或修改 canonical 策略时，历史 catch-all/父域邮箱会在事务内单向提升并安全
-  合并重复投递；旧域 Key 不再继续读取已经归入子域的邮箱。
-- 修复大正文/内联附件并发详情请求造成的内存放大，以及慢 stderr 将 asyncio 请求线程串行阻塞。
-- 修复 C++ SMTP 将 null reverse-path 当成未执行 MAIL、无法解析 ESMTP 参数，以及 DATA 超限提前回复导致后续命令错位的问题；C++/Python 同步执行严格邮箱、域名和长度边界。
-- C++ SMTP 的 `VRFY` 现在固定返回不披露信息的 `252`，不会回显用户输入；长连接不再无限沿用已经禁用或已修改大小/保留期的旧域策略。
-- Python/C++ 在最终写事务重新确认每个 RCPT 的域身份；rename/delete 不再把已接收邮件挂到新租户，陈旧 durable manifest 由 tombstone 引导到 quarantine，同域已 ACK 的 C++ 在途邮件仍可安全完成。
-- 管理/API `DELETE` 现在将投递立即到期，后台清理会硬删除记录并通过 file-GC outbox 可重试地释放磁盘文件。
-- 修复批量写入中毒任务可能影响健康同批邮件的问题，并补充确定性隔离测试。
+- Python SMTP per-IP rate-limit state now uses an access LRU and an accepted-time expiration index for amortized O(1) cleanup. It allocates four times the concurrency limit and has a hard cap of 65,536 sources, preventing IPv6 address rotation from causing O(N²) scans and unbounded growth.
+- Structured recovery manifests missing a persisted `domain_policy` now fail closed and move to quarantine instead of reviving historically private domains and mailboxes with public defaults.
+- The API Key cache gained a post-commit invalidation epoch. A cold read concurrent with rotate/revoke/delete cannot repopulate an old credential or usage policy after invalidation.
+- Removed mandatory Origin/Referer validation from administration forms, avoiding false rejection of login and administration operations when an HTTPS-terminating proxy rewrites the protocol or Host.
+- Fixed duplicate deliveries from repeated canonical recipients, overly long attachment filenames, storage-path traversal, and ingestion races during maintenance.
+- When a more specific managed domain is created or a canonical policy changes, historical catch-all/parent-domain mailboxes are promoted in one direction within transactions and duplicate deliveries are merged safely. Keys for the old domain can no longer read mailboxes that have moved into a child domain.
+- Fixed memory amplification from concurrent detail requests for large bodies/inline attachments and event-loop serialization when stderr is slow.
+- Fixed C++ SMTP treating a null reverse-path as though `MAIL` had not run, failing to parse ESMTP parameters, and replying too early after a `DATA` size violation, which desynchronized subsequent commands. C++ and Python now enforce the same strict mailbox, domain, and length boundaries.
+- C++ SMTP `VRFY` now always returns a non-disclosing `252` and never echoes user input. Long-lived connections no longer keep using indefinitely a stale domain policy whose domain was disabled or whose size/retention settings changed.
+- Python/C++ reconfirm every RCPT's domain identity in the final write transaction. Rename/delete can no longer attach accepted mail to a new tenant; tombstones direct stale durable manifests to quarantine, while already-ACKed in-flight C++ mail for the same domain can still complete safely.
+- Administration/API `DELETE` now immediately expires deliveries. Background cleanup hard-deletes records and releases files through a retryable file-GC outbox.
+- Fixed a poison task in a batch potentially affecting healthy messages in the same batch, and added deterministic isolation tests.
 
 [Unreleased]: https://github.com/wendaochangsheng/Rapid-Inbox/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/wendaochangsheng/Rapid-Inbox/releases/tag/v0.1.0
