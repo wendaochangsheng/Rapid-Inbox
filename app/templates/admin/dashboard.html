@@ -806,7 +806,7 @@
       <tbody>
         {% for task_name, task in background_tasks.items() %}
           <tr>
-            <td>{% if task_name == "message_retention" %}过期邮件清理{% elif task_name == "pending_parse_scan" %}待解析恢复扫描{% else %}<code>{{ task_name }}</code>{% endif %}</td>
+            <td>{% if task_name == "message_retention" %}过期邮件清理{% elif task_name == "pending_parse_scan" %}待解析恢复扫描{% elif task_name == "mailbox_live_events" %}公开邮箱实时事件{% else %}<code>{{ task_name }}</code>{% endif %}</td>
             <td><span class="pill {% if task.status == 'ok' %}pill--success{% elif task.status == 'danger' %}pill--danger{% else %}pill--warning{% endif %}">{{ "运行中" if task.running else "已停止" }}</span></td>
             <td>{{ cn_datetime(task.last_success_at) if task.last_success_at else "尚无" }}</td>
             <td>{% if task.last_error_at %}{{ cn_datetime(task.last_error_at) }} · {{ task.last_error_type or "未知错误" }}{% else %}无{% endif %}</td>

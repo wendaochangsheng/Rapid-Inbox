@@ -71,10 +71,11 @@ See [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)
 </details>
 
 > The demo uses sanitized test data in an isolated environment and contains no real mailboxes,
-> messages, or credentials. It was recorded with Python's embedded SMTP server to demonstrate
-> in-process WebSocket updates. In the default C++ ingestd mode, public inboxes do not receive
-> real-time WebSocket pushes from the separate data-plane process; admin SSE connections and
-> reconnections can only load recently committed history.
+> messages, or credentials. It was recorded with Python's embedded SMTP server. Current deployments
+> persist committed public-mailbox delivery changes in a SQLite live-event outbox and tail them from
+> the Python HTTP process, so the default C++ ingestd and standalone Python SMTP modes can update an
+> open public inbox over WebSocket without a manual refresh. Connection-level administration SMTP
+> SSE remains process-local; reconnects can fall back to committed history.
 
 ## Implemented Features
 
@@ -83,12 +84,12 @@ See [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)
 | **Email ingestion** | C++ `rapid-inbox-ingestd` provides durable ACKs, byte-level backpressure, group commit, multi-worker MIME parsing, and poison-task isolation; Python SMTP remains available as a development mode |
 | **Domain modes** | Receive only configured domains, or enable `managed_plus_catchall` for any-domain SMTP deliveries that reach this service; longest-suffix rules take precedence and domain rules are hot-reloaded |
 | **Inboxes** | Domains are private by default; the per-mailbox public flag defaults to enabled but takes effect only when the domain-level public switch is enabled, and it can still be disabled per mailbox; supports lists, details, raw EML, sandboxed HTML previews, and attachment downloads |
-| **Live updates** | Only the same-process HTTP + embedded Python SMTP mode pushes live updates through `LiveState`; when C++ ingestd or standalone Python SMTP runs in a separate process from HTTP, public inboxes require refreshes and admin SSE can load recent committed history on connect/reconnect but receives no continuous cross-process pushes |
+| **Live updates** | Python and C++ ingress persist committed public-mailbox delivery changes in a SQLite live-event outbox; each HTTP runtime tails the outbox and pushes matching mailbox updates over WebSocket, so open public inboxes do not require manual refreshes. Cursor gaps trigger a page resync. Administration SMTP connection/command SSE remains process-local; separate ingress exposes committed history rather than continuous per-session telemetry |
 | **Verification-code detection** | A scored extraction algorithm with Chinese, English, Japanese, Korean, and Spanish context plus alphanumeric and separated-code patterns |
 | **Access control** | `viewer` / `operator` / `superadmin` RBAC; API Keys are constrained by kind, scope, domain grant mode, mailbox glob, IP, rate limit, and expiry |
 | **HTTP API** | `/api/v2` is recommended: Bearer-only, strict models, Problem Details, and stable cursors; public and admin `/api/v1` endpoints remain available |
 | **Observability** | JSON/text structured logs, safe Request IDs, Prometheus metrics, live/ready probes, and a cached operations dashboard |
-| **Persistence and recovery** | SQLite WAL stores indexes; raw / text / html / attachments / manifests live on disk; manifests can rebuild metadata that was not committed |
+| **Persistence and recovery** | SQLite WAL stores indexes and the compact live-event outbox that bridges committed delivery notifications from ingress to HTTP; raw / text / html / attachments / manifests live on disk; manifests can rebuild metadata that was not committed |
 | **Cleanup** | Delivery-retention cleanup in batches; file GC is registered inside the transaction and performed outside it with exponential-backoff retries; sessions, empty mailboxes, metrics, and audit records are cleaned independently |
 | **Maintenance tools** | A cross-process `.maintenance.lock` coordinates clearing mail, pauses new ingestion, removes files, and compacts SQLite |
 
@@ -111,7 +112,10 @@ This one command builds the image, creates a mode-`0600` private configuration w
 cursor-signing, and metrics secrets, starts the Python control plane, waits for schema migration and
 `/health/ready`, then starts the C++ SMTP ingress. The image runs as a non-root user. Both processes
 are supervised in one container and one PID namespace because the cross-process maintenance protocol
-records and verifies operating-system PIDs.
+records and verifies operating-system PIDs. A SQLite live-event outbox carries committed public-mailbox
+delivery notifications across this process boundary. Public WebSocket cursor generations remain local
+to one HTTP process, so keep one HTTP worker per instance (as the supplied runners do); a multi-worker
+or multi-replica HTTP tier requires sticky routing until cursor generations are shared.
 
 Default host bindings:
 

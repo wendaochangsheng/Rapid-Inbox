@@ -249,6 +249,53 @@ BEGIN
     WHERE rowid = NEW.rowid;
 END;
 
+-- Cross-process mailbox updates are recorded in the same transaction as the
+-- delivery change. The HTTP process tails this compact outbox and fans events
+-- out to its in-memory WebSocket subscribers; SMTP writers don't need an IPC
+-- dependency or process-specific SQLite functions.
+CREATE TABLE IF NOT EXISTS mailbox_live_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL
+        CHECK (event_type IN ('mailbox_delivery', 'mailbox_delivery_updated')),
+    delivery_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (delivery_id) REFERENCES message_deliveries(id) ON DELETE CASCADE,
+    UNIQUE (event_type, delivery_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mailbox_live_events_delivery_id
+ON mailbox_live_events(delivery_id, id);
+
+CREATE TRIGGER IF NOT EXISTS mailbox_live_events_after_delivery_insert
+AFTER INSERT ON message_deliveries
+WHEN NEW.status = 'active'
+BEGIN
+    INSERT INTO mailbox_live_events (event_type, delivery_id, created_at)
+    VALUES ('mailbox_delivery', NEW.id, NEW.delivered_at);
+END;
+
+CREATE TRIGGER IF NOT EXISTS mailbox_live_events_after_message_parse_update
+AFTER UPDATE OF parse_status, indexed_at ON messages
+WHEN OLD.parse_status IS NOT NEW.parse_status
+    OR OLD.indexed_at IS NOT NEW.indexed_at
+BEGIN
+    INSERT OR REPLACE INTO mailbox_live_events (event_type, delivery_id, created_at)
+    SELECT 'mailbox_delivery_updated', delivery.id,
+           COALESCE(NEW.indexed_at, NEW.received_at)
+    FROM message_deliveries AS delivery
+    WHERE delivery.message_id = NEW.id
+      AND delivery.status = 'active';
+END;
+
+-- Keep databases migrated to this schema compatible with older clear-all
+-- code, which temporarily disables foreign keys and does not know this table.
+CREATE TRIGGER IF NOT EXISTS mailbox_live_events_after_delivery_delete
+AFTER DELETE ON message_deliveries
+BEGIN
+    DELETE FROM mailbox_live_events
+    WHERE delivery_id = OLD.id;
+END;
+
 CREATE TABLE IF NOT EXISTS mail_metric_buckets (
     bucket_ts TEXT PRIMARY KEY,
     received INTEGER NOT NULL DEFAULT 0,

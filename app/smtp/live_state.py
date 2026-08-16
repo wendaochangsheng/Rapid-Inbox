@@ -43,9 +43,12 @@ class LiveState:
 
         with self._lock:
             generation = self._generation
-            events = [dict(event) for event in self._events]
             latest_seq = self._next_seq - 1
-            oldest_seq = int(events[0].get("seq", self._next_seq)) if events else self._next_seq
+            oldest_seq = (
+                int(self._events[0].get("seq", self._next_seq))
+                if self._events
+                else self._next_seq
+            )
             gap_reason: str | None = None
             if expected_generation != generation:
                 gap_reason = "generation_changed"
@@ -55,10 +58,22 @@ class LiveState:
                 gap_reason = "cursor_ahead"
 
             if gap_reason is not None:
-                return generation, events, gap_reason, oldest_seq, latest_seq
+                return (
+                    generation,
+                    [dict(event) for event in self._events],
+                    gap_reason,
+                    oldest_seq,
+                    latest_seq,
+                )
+            if seq == latest_seq:
+                return generation, [], None, oldest_seq, latest_seq
             return (
                 generation,
-                [event for event in events if int(event.get("seq", 0)) > seq],
+                [
+                    dict(event)
+                    for event in self._events
+                    if int(event.get("seq", 0)) > seq
+                ],
                 None,
                 oldest_seq,
                 latest_seq,

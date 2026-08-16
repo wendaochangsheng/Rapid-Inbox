@@ -49,30 +49,30 @@ async def test_cpp_ingestd_accepts_mail_and_python_reads_it(tmp_path: Path) -> N
     initialize_database(settings.database_path)
     runtime = RapidInboxRuntime(settings)
     await runtime.start()
+    process: subprocess.Popen[str] | None = None
     try:
         await runtime.create_domain("adb.com")
-    finally:
-        await runtime.stop()
+        _, live_cursor = runtime.live_state.snapshot_state()
+        live_seq = int(live_cursor.rsplit(":", 1)[1])
 
-    port = _free_port()
-    env = {
-        **os.environ,
-        "SMTP_HOST": "127.0.0.1",
-        "SMTP_PORT": str(port),
-        "STORAGE_ROOT": str(settings.storage_root),
-        "DATABASE_PATH": str(settings.database_path),
-        "INGEST_FLUSH_INTERVAL_MS": "50",
-        "INGEST_BATCH_MAX_MESSAGES": "10",
-    }
-    process = subprocess.Popen(
-        [str(binary), "--base-dir", str(tmp_path)],
-        cwd=Path.cwd(),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
+        port = _free_port()
+        env = {
+            **os.environ,
+            "SMTP_HOST": "127.0.0.1",
+            "SMTP_PORT": str(port),
+            "STORAGE_ROOT": str(settings.storage_root),
+            "DATABASE_PATH": str(settings.database_path),
+            "INGEST_FLUSH_INTERVAL_MS": "50",
+            "INGEST_BATCH_MAX_MESSAGES": "10",
+        }
+        process = subprocess.Popen(
+            [str(binary), "--base-dir", str(tmp_path)],
+            cwd=Path.cwd(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         for _ in range(50):
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.1):
@@ -93,32 +93,39 @@ async def test_cpp_ingestd_accepts_mail_and_python_reads_it(tmp_path: Path) -> N
 
         deadline = asyncio.get_running_loop().time() + 5
         while True:
-            runtime = RapidInboxRuntime(settings)
-            await runtime.start()
-            try:
-                mailbox = await runtime.get_mailbox_view("code@adb.com")
-                if mailbox["message_count"] == 1:
-                    assert mailbox["items"][0]["parse_status"] == "parsed"
-                    assert mailbox["items"][0]["verification_code"] == "123456"
-                    detail = await runtime.get_delivery_detail(
-                        "code@adb.com",
-                        mailbox["items"][0]["delivery_id"],
-                    )
-                    assert detail["text_body"].strip() == "Your code is 123456"
-                    assert detail["verification_code"] == "123456"
-                    break
-            finally:
-                await runtime.stop()
+            mailbox = await runtime.get_mailbox_view("code@adb.com")
+            live_events = [
+                event
+                for event in runtime.live_state.snapshot_since(live_seq)
+                if event.get("type") == "mailbox_delivery"
+                and event.get("mailbox") == "code@adb.com"
+            ]
+            if mailbox["message_count"] == 1 and live_events:
+                assert mailbox["items"][0]["parse_status"] == "parsed"
+                assert mailbox["items"][0]["verification_code"] == "123456"
+                detail = await runtime.get_delivery_detail(
+                    "code@adb.com",
+                    mailbox["items"][0]["delivery_id"],
+                )
+                assert detail["text_body"].strip() == "Your code is 123456"
+                assert detail["verification_code"] == "123456"
+                assert live_events[-1]["delivery_id"] == mailbox["items"][0]["delivery_id"]
+                assert live_events[-1]["parse_status"] == "parsed"
+                break
             if asyncio.get_running_loop().time() >= deadline:
-                raise AssertionError("message was not visible to Python runtime")
+                raise AssertionError(
+                    "C++ delivery was not visible through the HTTP runtime live outbox"
+                )
             await asyncio.sleep(0.1)
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        await runtime.stop()
 
 
 @pytest.mark.asyncio

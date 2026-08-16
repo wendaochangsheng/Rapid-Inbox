@@ -87,6 +87,10 @@ async def mailbox_page(
     offset: int = Query(default=0, ge=0, le=1_000_000),
 ) -> Response:
     service = _message_service(request)
+    mailbox_live_enabled = offset == 0
+    live_cursor = ""
+    if mailbox_live_enabled:
+        _, live_cursor = request.app.state.runtime.live_state.snapshot_state()
     try:
         mailbox = await service.get_public_mailbox_view(
             mailbox_address,
@@ -103,8 +107,6 @@ async def mailbox_page(
         total_count=mailbox["message_count"],
         item_count=len(mailbox["items"]),
     )
-    _, live_cursor = request.app.state.runtime.live_state.snapshot_state()
-    mailbox_live_enabled = mailbox["offset"] == 0
     return await _render_async(
         request,
         "public/mailbox.html",
@@ -139,21 +141,51 @@ async def mailbox_websocket(mailbox_address: str, websocket: WebSocket) -> None:
 
     runtime = websocket.app.state.runtime
     parsed_cursor = _parse_live_cursor(after_cursor)
-    if parsed_cursor is not None and parsed_cursor[0] == runtime.live_state.generation:
-        last_seq = max(parsed_cursor[1], 0)
-    else:
+    if after_cursor is None:
         _, live_cursor = runtime.live_state.snapshot_state()
-        parsed_live_cursor = _parse_live_cursor(live_cursor)
-        last_seq = 0 if parsed_live_cursor is None else parsed_live_cursor[1]
+        parsed_cursor = _parse_live_cursor(live_cursor)
+    if parsed_cursor is None:
+        _, live_cursor = runtime.live_state.snapshot_state()
+        await websocket.send_json(
+            {
+                "type": "mailbox_resync",
+                "reason": "invalid_cursor",
+                "cursor": live_cursor,
+            }
+        )
+        await websocket.close(code=1012)
+        return
+
+    stream_generation, last_seq = parsed_cursor
+    last_seq = max(last_seq, 0)
 
     canonical_mailbox = str(mailbox["mailbox"])
 
     try:
         while True:
-            new_events = runtime.live_state.snapshot_since(last_seq)
+            (
+                current_generation,
+                new_events,
+                gap_reason,
+                oldest_seq,
+                latest_seq,
+            ) = runtime.live_state.snapshot_stream_window(stream_generation, last_seq)
+            if gap_reason is not None:
+                await websocket.send_json(
+                    {
+                        "type": "mailbox_resync",
+                        "reason": gap_reason,
+                        "cursor": f"{current_generation}:{latest_seq}",
+                        "oldest_available_seq": oldest_seq,
+                        "latest_available_seq": latest_seq,
+                    }
+                )
+                await websocket.close(code=1012)
+                return
             if new_events:
-                last_seq = int(new_events[-1].get("seq", last_seq))
                 for event in new_events:
+                    event_seq = int(event.get("seq", last_seq))
+                    last_seq = event_seq
                     event_type = str(event.get("type") or "")
                     if event_type not in {"mailbox_delivery", "mailbox_delivery_updated"}:
                         continue
@@ -174,9 +206,25 @@ async def mailbox_websocket(mailbox_address: str, websocket: WebSocket) -> None:
                         item["parse_status"] = "pending"
                         item["subject"] = None
                         item["verification_code"] = None
-                    await websocket.send_json({"type": event_type, "item": item})
+                    await websocket.send_json(
+                        {
+                            "type": event_type,
+                            "cursor": f"{current_generation}:{event_seq}",
+                            "item": item,
+                        }
+                    )
                 continue
-            await asyncio.sleep(0.25)
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            if message.get("type") == "websocket.disconnect":
+                return
+            # This endpoint is a server-only notification stream. Rejecting
+            # application frames prevents a client from turning receive-ready
+            # messages into an unthrottled polling loop.
+            await websocket.close(code=1008)
+            return
     except asyncio.CancelledError:
         return
     except (WebSocketDisconnect, RuntimeError):

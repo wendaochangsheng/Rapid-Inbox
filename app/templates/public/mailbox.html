@@ -771,26 +771,40 @@
   if (mailboxLiveEnabled && mailboxLiveUrl) {
     let mailboxSocket = null;
     let reconnectTimer = null;
+    let mailboxLiveStopped = false;
+    const initialSocketUrl = new URL(mailboxLiveUrl, window.location.href);
+    let mailboxLiveCursor = initialSocketUrl.searchParams.get("after_cursor") || "";
     const connectMailboxSocket = () => {
+      if (mailboxLiveStopped) return;
       const socketUrl = new URL(mailboxLiveUrl, window.location.href);
       socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
+      socketUrl.searchParams.set("after_cursor", mailboxLiveCursor);
       mailboxSocket = new WebSocket(socketUrl);
       mailboxSocket.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
-          if (!payload?.item) return;
-          upsertMailboxItem(payload.type, payload.item);
+          if (payload?.type === "mailbox_resync") {
+            mailboxLiveStopped = true;
+            if (reconnectTimer) window.clearTimeout(reconnectTimer);
+            window.location.reload();
+            return;
+          }
+          if (payload?.item) upsertMailboxItem(payload.type, payload.item);
+          if (payload?.cursor) mailboxLiveCursor = payload.cursor;
         } catch (error) {
           console.error("Failed to handle mailbox live payload", error);
         }
       };
       mailboxSocket.onerror = () => { mailboxSocket?.close(); };
       mailboxSocket.onclose = () => {
+        mailboxSocket = null;
+        if (mailboxLiveStopped) return;
         reconnectTimer = window.setTimeout(connectMailboxSocket, 1000);
       };
     };
     connectMailboxSocket();
     window.addEventListener("beforeunload", () => {
+      mailboxLiveStopped = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       mailboxSocket?.close();
     });

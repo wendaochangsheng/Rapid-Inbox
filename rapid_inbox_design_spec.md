@@ -18,7 +18,7 @@ Build a high-speed, receive-only email system that supports:
    - `https://adb.com/mail/xxx@adb.com`
 5. Letting the public frontend browse all messages in a mailbox, view message bodies, download attachments, and view raw messages.
 6. Letting the admin console inspect SMTP activity and historical sessions, as well as domains, mailboxes, messages, API keys, audit logs, and system settings;
-   the early single-process design targeted real-time events, while the current process boundary is documented in the README.
+   the current two-process design persists public-mailbox delivery notifications in SQLite and tails them in HTTP for WebSocket updates, while connection-level administration SMTP telemetry remains process-local.
 7. Providing a complete HTTP API:
    - Admin API
    - General-access API
@@ -47,6 +47,7 @@ Build a high-speed, receive-only email system that supports:
 - **Template engine**: Jinja2 (server-side rendering)
 - **Reverse proxy**: Nginx / Caddy
 - **Admin real-time stream**: SSE (Server-Sent Events)
+- **Public-mailbox real-time stream**: WebSocket backed by a SQLite live-event outbox
 - **Raw message storage**: local filesystem (`.eml`)
 - **Attachment storage**: local filesystem
 
@@ -92,6 +93,8 @@ Responsibilities:
 - Provide the message detail page
 - Provide raw message downloads
 - Provide attachment downloads
+- Push newly committed mailbox deliveries over WebSocket
+- Reload the current mailbox view when a WebSocket cursor gap requires resynchronization
 
 #### D. Admin Backend
 
@@ -101,7 +104,7 @@ Responsibilities:
 - API key management
 - Audit logs
 - System settings
-- Real-time SMTP session monitoring
+- Real-time SMTP session monitoring for in-process ingress; committed session history for separate ingress
 
 #### E. DB Writer
 
@@ -112,8 +115,10 @@ Responsibilities:
 #### F. Live Event Bus
 
 Responsibilities:
-- Maintain live sessions in memory
-- Push real-time connection events to the admin console over SSE
+- Persist cross-process public-mailbox delivery events in SQLite
+- Tail committed delivery events into bounded per-HTTP live state
+- Push matching mailbox updates over WebSocket
+- Keep connection-level SMTP telemetry in memory for administration SSE
 
 ## 5. Domain and Subdomain Support Rules
 
@@ -379,6 +384,13 @@ If one message is delivered to both:
 Then:
 - `messages` has only 1 row
 - `message_deliveries` has 2 rows
+
+### 10.8.1 mailbox_live_events
+
+Transactional outbox for public-mailbox WebSocket notifications. Delivery inserts and parse-state
+changes write this table in the same SQLite transaction as the source row. It retains at most one
+delivery event and the latest parse-update event per delivery, and delivery deletion removes both
+events even when legacy maintenance code has temporarily disabled foreign-key enforcement.
 
 ### 10.9 attachments
 
@@ -663,6 +675,8 @@ Displays:
 - Attachment indicator
 - Parsing status
 - Pagination
+- Live insertion and update of newly committed deliveries over WebSocket
+- Full-page resynchronization when the WebSocket cursor has a gap
 
 ### 14.2 Message Detail Page
 
@@ -687,7 +701,7 @@ The following are implementation targets, not guarantees:
 
 1. For a small message (<= 100KB), time from the end of `DATA` to the `250` response:
    - Median target < 250ms on an idle machine
-2. Time until a received message is visible in the frontend list:
+2. Time from the SQLite delivery commit until it is visible in an already-open public mailbox:
    - Target < 1s
 3. Latency for a live connection event in the admin console:
    - Target < 500ms
@@ -808,7 +822,7 @@ app/
 
 ### Phase 3: Real-Time and Operations
 
-11. SMTP live-connection SSE
+11. SMTP live-connection SSE and durable public-mailbox WebSocket delivery events
 12. Historical SMTP session queries
 13. DNS check page
 14. Audit logs
@@ -827,7 +841,7 @@ app/
 2. After enabling `accept_subdomains`, the system can receive `foo@x.adb.com` and `foo@y.x.adb.com`.
 3. After explicitly enabling domain-level public Web access, visiting `https://adb.com/mail/foo@adb.com` shows that mailbox's messages.
 4. A publicly enabled mailbox can be browsed without a frontend login.
-5. When HTTP and Python SMTP run in the same process, the admin console can show SMTP connections and receipt events in real time; with a separate-process data plane, only committed history is guaranteed to be queryable, and cross-process real-time notifications are outside the current implementation.
+5. Committed mailbox deliveries from embedded Python SMTP, standalone Python SMTP, and C++ ingestd appear in an already-open public mailbox over WebSocket without a manual refresh. Cursor gaps trigger a full-page resynchronization. Connection-level administration SMTP SSE remains in-process; separate ingress guarantees committed history, not per-command live telemetry.
 6. An administrator API key can restrict permissions by scope and by domain/mailbox.
 7. The Public API can retrieve messages from a public mailbox using a read-only key.
 8. In durable ACK mode, the raw message file is persisted successfully before `250` is returned.

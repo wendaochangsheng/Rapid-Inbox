@@ -7,15 +7,20 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.policy import SMTP
 from itertools import count
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import WebSocketDisconnect
+from fastapi.testclient import TestClient
 
 from app.config import default_settings
+from app.db.connection import connect_database, initialize_database
 import app.http.public_views as public_views_module
 import app.runtime as runtime_module
 from app.main import create_app
 from app.services.messages import MessageService
+from app.smtp.live_state import LiveState
 
 
 def _mail_bytes(subject: str, message_id: str, body: str) -> bytes:
@@ -607,6 +612,281 @@ async def test_public_mailbox_page_includes_websocket_bootstrap_on_first_page(ap
     assert "/mail/foo@adb.com/ws?after_cursor=" in response.text
     assert 'id="mail-list"' in response.text
     assert 'data-live-enabled="true"' in response.text
+    assert 'socketUrl.searchParams.set("after_cursor", mailboxLiveCursor)' in response.text
+    assert 'payload?.type === "mailbox_resync"' in response.text
+    assert "if (mailboxLiveStopped) return;" in response.text
+
+
+@pytest.mark.asyncio
+async def test_public_mailbox_page_snapshots_live_cursor_before_loading_mailbox(
+    app_client,
+    runtime,
+    monkeypatch,
+) -> None:
+    await runtime.create_domain("adb.com", public_web_enabled=True, public_api_enabled=True)
+    call_order: list[str] = []
+    original_snapshot = runtime.live_state.snapshot_state
+    original_get_public_mailbox_view = MessageService.get_public_mailbox_view
+
+    def tracked_snapshot():
+        call_order.append("snapshot")
+        return original_snapshot()
+
+    async def tracked_get_public_mailbox_view(self, *args, **kwargs):
+        call_order.append("mailbox")
+        return await original_get_public_mailbox_view(self, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.live_state, "snapshot_state", tracked_snapshot)
+    monkeypatch.setattr(MessageService, "get_public_mailbox_view", tracked_get_public_mailbox_view)
+
+    response = await app_client.get("/mail/foo@adb.com")
+
+    assert response.status_code == 200
+    assert call_order[:2] == ["snapshot", "mailbox"]
+
+
+class _MailboxWebSocketStub:
+    def __init__(
+        self,
+        live_state: LiveState,
+        cursor: str,
+        *,
+        disconnect_after_send: bool = False,
+    ) -> None:
+        self.query_params = {"after_cursor": cursor}
+        self.app = SimpleNamespace(
+            state=SimpleNamespace(runtime=SimpleNamespace(live_state=live_state))
+        )
+        self.disconnect_after_send = disconnect_after_send
+        self.accepted = False
+        self.sent: list[dict] = []
+        self.close_codes: list[int] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+        if self.disconnect_after_send:
+            raise WebSocketDisconnect(code=1000)
+
+    async def close(self, *, code: int) -> None:
+        self.close_codes.append(code)
+
+
+class _MailboxLiveServiceStub:
+    async def get_public_mailbox_view(self, *args, **kwargs) -> dict:
+        return {"mailbox": "foo@adb.com"}
+
+    async def get_public_mailbox_item(self, *args, **kwargs) -> dict:
+        return {
+            "delivery_id": "dlv_live",
+            "message_id": "msg_live",
+            "subject": "Live Subject",
+            "from_addr": "sender@example.com",
+            "verification_code": None,
+            "has_attachments": False,
+            "parse_status": "parsed",
+            "delivered_at": "2026-04-18T20:00:00Z",
+        }
+
+
+class _MailboxIncomingFrameWebSocketStub(_MailboxWebSocketStub):
+    async def receive(self) -> dict:
+        return {"type": "websocket.receive", "text": "unexpected-client-frame"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cursor_factory", "publish_count", "expected_reason"),
+    [
+        (lambda state: "invalid-cursor", 0, "invalid_cursor"),
+        (lambda state: "stale-generation:0", 0, "generation_changed"),
+        (lambda state: f"{state.generation}:0", 3, "ring_overrun"),
+    ],
+)
+async def test_public_mailbox_websocket_resyncs_when_live_cursor_has_a_gap(
+    monkeypatch,
+    cursor_factory,
+    publish_count: int,
+    expected_reason: str,
+) -> None:
+    live_state = LiveState(max_events=2)
+    cursor = cursor_factory(live_state)
+    for index in range(publish_count):
+        await live_state.publish(
+            {
+                "type": "mailbox_delivery",
+                "mailbox": "foo@adb.com",
+                "delivery_id": f"dlv_{index}",
+                "parse_status": "parsed",
+            }
+        )
+    websocket = _MailboxWebSocketStub(live_state, cursor)
+    monkeypatch.setattr(
+        public_views_module,
+        "_message_service",
+        lambda _websocket: _MailboxLiveServiceStub(),
+    )
+
+    await public_views_module.mailbox_websocket("foo@adb.com", websocket)
+
+    assert websocket.accepted is True
+    assert websocket.sent[0]["type"] == "mailbox_resync"
+    assert websocket.sent[0]["reason"] == expected_reason
+    assert websocket.sent[0]["cursor"] == f"{live_state.generation}:{publish_count}"
+    assert websocket.close_codes == [1012]
+
+
+@pytest.mark.asyncio
+async def test_public_mailbox_websocket_event_includes_resume_cursor(monkeypatch) -> None:
+    live_state = LiveState()
+    _, cursor = live_state.snapshot_state()
+    await live_state.publish(
+        {
+            "type": "mailbox_delivery",
+            "mailbox": "other@adb.com",
+            "delivery_id": "dlv_other",
+            "parse_status": "parsed",
+        }
+    )
+    await live_state.publish(
+        {
+            "type": "mailbox_delivery",
+            "mailbox": "foo@adb.com",
+            "delivery_id": "dlv_live",
+            "parse_status": "parsed",
+        }
+    )
+    websocket = _MailboxWebSocketStub(live_state, cursor, disconnect_after_send=True)
+    monkeypatch.setattr(
+        public_views_module,
+        "_message_service",
+        lambda _websocket: _MailboxLiveServiceStub(),
+    )
+
+    await public_views_module.mailbox_websocket("foo@adb.com", websocket)
+
+    assert websocket.sent == [
+        {
+            "type": "mailbox_delivery",
+            "cursor": f"{live_state.generation}:2",
+            "item": {
+                "delivery_id": "dlv_live",
+                "message_id": "msg_live",
+                "subject": "Live Subject",
+                "from_addr": "sender@example.com",
+                "verification_code": None,
+                "has_attachments": False,
+                "parse_status": "parsed",
+                "delivered_at": "2026-04-18T20:00:00Z",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_public_mailbox_websocket_rejects_client_application_frames(
+    monkeypatch,
+) -> None:
+    live_state = LiveState()
+    _, cursor = live_state.snapshot_state()
+    websocket = _MailboxIncomingFrameWebSocketStub(live_state, cursor)
+    monkeypatch.setattr(
+        public_views_module,
+        "_message_service",
+        lambda _websocket: _MailboxLiveServiceStub(),
+    )
+
+    await public_views_module.mailbox_websocket("foo@adb.com", websocket)
+
+    assert websocket.accepted is True
+    assert websocket.sent == []
+    assert websocket.close_codes == [1008]
+
+
+def test_public_mailbox_websocket_route_delivers_and_closes_cleanly(tmp_path) -> None:
+    settings = default_settings(tmp_path)
+    settings.ensure_directories()
+    initialize_database(settings.database_path)
+    with connect_database(settings.database_path, durable_writes=True) as connection:
+        domain_id = int(
+            connection.execute(
+                """
+                INSERT INTO domains (
+                    root_domain_ascii, public_web_enabled, created_at, updated_at
+                ) VALUES (
+                    'adb.com', 1, '2026-04-18T20:00:00Z', '2026-04-18T20:00:00Z'
+                )
+                """
+            ).lastrowid
+        )
+        mailbox_id = int(
+            connection.execute(
+                """
+                INSERT INTO mailboxes (
+                    domain_id, local_part_canonical, rcpt_domain_ascii,
+                    address_canonical, address_display, first_seen_at, last_seen_at,
+                    latest_message_at, message_count
+                ) VALUES (
+                    ?, 'foo', 'adb.com', 'foo@adb.com', 'foo@adb.com',
+                    '2026-04-18T20:00:00Z', '2026-04-18T20:00:00Z',
+                    NULL, 0
+                )
+                """,
+                (domain_id,),
+            ).lastrowid
+        )
+
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        _, cursor = runtime.live_state.snapshot_state()
+        with client.websocket_connect(
+            f"/mail/foo@adb.com/ws?after_cursor={cursor}"
+        ) as websocket:
+            with connect_database(
+                settings.database_path,
+                durable_writes=True,
+            ) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO messages (
+                        id, raw_path, raw_sha256, raw_size_bytes, subject, from_addr,
+                        received_at, indexed_at, parse_status
+                    ) VALUES (
+                        'msg-route-live', 'raw/msg-route-live.eml', 'route-live-sha', 1,
+                        'Route Live', 'sender@example.com', '2026-04-18T20:00:00Z',
+                        '2026-04-18T20:00:00Z', 'parsed'
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO message_deliveries (
+                        id, message_id, mailbox_id, rcpt_to, delivered_at
+                    ) VALUES (
+                        'dlv-route-live', 'msg-route-live', ?, 'foo@adb.com',
+                        '2026-04-18T20:00:00Z'
+                    )
+                    """,
+                    (mailbox_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE mailboxes
+                    SET latest_message_at = '2026-04-18T20:00:00Z',
+                        message_count = 1
+                    WHERE id = ?
+                    """,
+                    (mailbox_id,),
+                )
+            payload = websocket.receive_json()
+
+            assert payload["type"] == "mailbox_delivery"
+            assert payload["item"]["delivery_id"] == "dlv-route-live"
+            assert payload["item"]["subject"] == "Route Live"
+            assert payload["cursor"].startswith(f"{runtime.live_state.generation}:")
 
 
 @pytest.mark.asyncio
@@ -623,11 +903,18 @@ async def test_public_mailbox_live_events_include_new_delivery_and_parse_update(
     )
     await runtime.drain_parser_queue()
 
-    events = [
-        event
-        for event in runtime.live_state.snapshot_since(last_seq)
-        if event.get("type") in {"mailbox_delivery", "mailbox_delivery_updated"}
-    ]
+    deadline = asyncio.get_running_loop().time() + 2
+    while True:
+        events = [
+            event
+            for event in runtime.live_state.snapshot_since(last_seq)
+            if event.get("type") in {"mailbox_delivery", "mailbox_delivery_updated"}
+        ]
+        if len(events) >= 2:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("mailbox live outbox events were not published")
+        await asyncio.sleep(0.01)
     inserted = events[0]
     updated = events[-1]
     item = await MessageService(runtime).get_public_mailbox_item(
@@ -638,7 +925,6 @@ async def test_public_mailbox_live_events_include_new_delivery_and_parse_update(
 
     assert inserted["type"] == "mailbox_delivery"
     assert str(inserted["delivery_id"]).startswith("dlv_")
-    assert inserted["parse_status"] == "pending"
     assert updated["type"] == "mailbox_delivery_updated"
     assert updated["delivery_id"] == inserted["delivery_id"]
     assert item["parse_status"] == "parsed"

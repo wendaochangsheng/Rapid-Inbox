@@ -15,6 +15,10 @@ This project records notable changes in the spirit of [Keep a Changelog](https:/
 - Added the secondary native Debian/Ubuntu systemd installer with a dedicated service account,
   versioned releases, hardened HTTP/SMTP units, build-before-downtime updates, consistent SQLite
   backups, rollback handling, protocol acceptance, and data-preserving uninstall behavior.
+- Added a SQLite-backed public-mailbox live-event outbox and bounded HTTP tailer. Committed delivery
+  changes from C++ ingestd or standalone Python SMTP now update open public inboxes over WebSocket
+  without a manual refresh; cursor gaps force a full-page resynchronization, and tailer task health
+  participates in readiness.
 
 ### Changed
 

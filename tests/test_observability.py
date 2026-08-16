@@ -602,6 +602,12 @@ def test_text_log_formatter_keeps_the_same_safe_structured_context() -> None:
             "PENDING_PARSE_SCAN_INTERVAL_SECONDS",
             "pending_parse_scan",
         ),
+        (
+            "_mailbox_live_event_loop",
+            "_publish_pending_mailbox_live_events",
+            "MAILBOX_LIVE_EVENT_POLL_INTERVAL_SECONDS",
+            "mailbox_live_events",
+        ),
     ],
 )
 @pytest.mark.asyncio

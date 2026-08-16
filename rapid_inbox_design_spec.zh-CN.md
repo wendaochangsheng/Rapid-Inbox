@@ -18,7 +18,8 @@
    - `https://adb.com/mail/xxx@adb.com`
 5. 前台可浏览某邮箱下的所有邮件、查看正文、下载附件、查看原始邮件。
 6. 管理后台可查看 SMTP 活动和历史会话，以及域名、邮箱、邮件、API Key、审计日志、系统设置；
-   早期同进程方案以实时事件为目标，当前分进程边界见 README。
+   当前双进程方案会把公共邮箱投递通知持久化到 SQLite，并由 HTTP 读取后通过 WebSocket 更新页面，
+   管理端逐连接 SMTP 遥测仍属于进程内能力。
 7. 提供完整 HTTP API：
    - 管理员 API
    - 普通访问 API
@@ -47,6 +48,7 @@
 - **模板引擎**：Jinja2（服务端渲染）
 - **反向代理**：Nginx / Caddy
 - **后台实时流**：SSE（Server-Sent Events）
+- **公共邮箱实时流**：基于 SQLite live-event outbox 的 WebSocket
 - **原始邮件存储**：本地文件系统（`.eml`）
 - **附件存储**：本地文件系统
 
@@ -92,6 +94,8 @@
 - 提供邮件详情页
 - 提供原始邮件下载
 - 提供附件下载
+- 通过 WebSocket 推送已提交的新投递
+- WebSocket cursor 出现缺口时重新载入当前邮箱视图
 
 #### D. Admin Backend
 
@@ -101,7 +105,7 @@
 - API Key 管理
 - 审计日志
 - 系统设置
-- 实时 SMTP 会话监控
+- 同进程收件时实时监控 SMTP 会话；独立收件进程提供已提交会话历史
 
 #### E. DB Writer
 
@@ -112,8 +116,10 @@
 #### F. Live Event Bus
 
 职责：
-- 维护内存态 live sessions
-- 向后台 SSE 推送实时连接事件
+- 在 SQLite 中持久化跨进程公共邮箱投递事件
+- 将已提交投递事件读取到每个 HTTP 进程的有界 live state
+- 通过 WebSocket 推送匹配邮箱的更新
+- 在内存中保留供管理 SSE 使用的逐连接 SMTP 遥测
 
 ## 5. 域名与子域支持规则
 
@@ -378,6 +384,12 @@ SMTP 历史事件表（非热路径必需，但后台排障需要）。
 则：
 - `messages` 只有 1 行
 - `message_deliveries` 有 2 行
+
+### 10.8.1 mailbox_live_events
+
+用于公开邮箱 WebSocket 通知的事务型 outbox。新建投递与解析状态变化会在与源数据相同的
+SQLite 事务中写入该表。每个投递最多保留一条新建事件和最新一条解析更新事件；删除
+投递时会同步清理这两条事件，即使旧版维护代码临时关闭了外键检查。
 
 ### 10.9 attachments
 
@@ -662,6 +674,8 @@ SSE 推送字段：
 - 附件标记
 - 解析状态
 - 分页
+- 通过 WebSocket 实时插入和更新已提交投递
+- WebSocket cursor 出现缺口时执行整页重新同步
 
 ### 14.2 邮件详情页
 
@@ -686,7 +700,7 @@ SSE 推送字段：
 
 1. 小邮件（<= 100KB）`DATA` 结束到返回 `250`：
    - 空闲机器中位数目标 < 250ms
-2. 已接收邮件在前台列表可见：
+2. SQLite 投递提交到已打开的公开邮箱列表可见：
    - 目标 < 1s
 3. 后台实时连接事件延迟：
    - 目标 < 500ms
@@ -808,7 +822,7 @@ app/
 
 ### Phase 3：实时与运维
 
-11. SMTP 实时连接 SSE
+11. SMTP 实时连接 SSE 与持久公共邮箱 WebSocket 投递事件
 12. 历史 SMTP 会话查询
 13. DNS 检查页面
 14. 审计日志
@@ -827,8 +841,9 @@ app/
 2. 开启 `accept_subdomains` 后，可接收 `foo@x.adb.com`、`foo@y.x.adb.com`。
 3. 显式开启域级公共 Web 后，访问 `https://adb.com/mail/foo@adb.com` 可查看该邮箱邮件。
 4. 无需前台登录即可浏览已显式公开的邮箱。
-5. HTTP 与 Python SMTP 同进程时，管理后台可实时看到 SMTP 连接与收件事件；分进程数据面只保证
-   已提交历史可查询，跨进程实时通知不属于当前实现。
+5. Python 内嵌 SMTP、独立 Python SMTP 与 C++ ingestd 提交的邮箱投递，都能通过 WebSocket
+   出现在已打开的公开收件箱中，无需手动刷新；cursor 缺口会触发整页重新同步。管理端逐连接
+   SMTP SSE 仍属于进程内能力，独立收件进程保证已提交历史但不保证逐命令实时遥测。
 6. 管理员 API Key 可按 scope 与域/邮箱限制权限。
 7. Public API 可按 read-only key 获取公开邮箱消息。
 8. 在 durable ACK 模式下，邮件原始文件落盘成功后才返回 `250`。

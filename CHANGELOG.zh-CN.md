@@ -13,6 +13,9 @@
   内对 Python/C++ 进程的优雅监督。
 - 新增次要的 Debian/Ubuntu 原生 systemd 安装器：专用服务账户、版本化 release、加固后的
   HTTP/SMTP unit、停服前完成构建、一致 SQLite 备份、失败回滚、协议验收及保留数据的卸载边界。
+- 新增基于 SQLite 的公共邮箱 live-event outbox 与有界 HTTP tailer。C++ ingestd 或独立 Python
+  SMTP 已提交的投递变化现在会通过 WebSocket 更新已打开的公开收件箱，无需手动刷新；cursor
+  缺口会触发整页重新同步，tailer 任务健康状态也会参与 readiness。
 
 ### 变更
 

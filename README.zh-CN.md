@@ -65,9 +65,10 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 
 </details>
 
-> 演示使用隔离环境中的脱敏测试数据，不包含真实邮箱、邮件或凭据。录制时使用 Python 内嵌 SMTP
-> 展示进程内 WebSocket 更新；默认 C++ ingestd 模式下，公开收件箱不会收到独立数据面进程的实时
-> WebSocket 推送，管理 SSE 建连/重连只能载入最近已提交历史。
+> 演示使用隔离环境中的脱敏测试数据，不包含真实邮箱、邮件或凭据。录制时使用 Python 内嵌 SMTP。
+> 当前部署会把已提交的公共邮箱投递变化写入 SQLite live-event outbox，并由 Python HTTP 进程持续
+> 读取；因此默认 C++ ingestd 与独立 Python SMTP 模式也能通过 WebSocket 更新已打开的公开收件箱，
+> 无需手动刷新。管理端 SMTP 连接/命令 SSE 仍属于进程内能力；重连可回退到已提交历史。
 
 ## 当前已实现
 
@@ -76,12 +77,12 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 | **邮件接收** | C++ `rapid-inbox-ingestd` 提供 durable ACK、字节级背压、group commit、多 worker MIME 解析和毒任务隔离；Python SMTP 保留为开发模式 |
 | **域名模式** | 支持仅接收已配置域名，或对到达本服务的 SMTP 投递启用 `managed_plus_catchall` 任意域模式；最长后缀规则优先，域规则可热刷新 |
 | **收件箱** | 域名默认私有；邮箱公开位默认启用，但只在域级公共开关开启后生效，且可按邮箱单独关闭；支持列表、详情、原始 EML、沙箱 HTML 预览和附件下载 |
-| **实时更新** | 仅 HTTP + Python 内嵌 SMTP 同进程模式通过 `LiveState` 实时推送；C++ ingestd 或独立 Python SMTP 与 HTTP 分进程时，公开收件箱需刷新，管理 SSE 建连/重连可载入最近已提交历史，但不会持续收到跨进程推送 |
+| **实时更新** | Python/C++ 收件入口会把已提交的公共邮箱投递变化持久化到 SQLite live-event outbox；每个 HTTP runtime 持续读取并通过 WebSocket 推送匹配邮箱，因此已打开的公开收件箱无需手动刷新。cursor 缺口会触发页面重新同步。管理端 SMTP 连接/命令 SSE 仍是进程内能力；独立收件进程只提供已提交历史，不持续推送逐会话遥测 |
 | **验证码识别** | 打分制提取算法，支持中英日韩西多语言上下文与字母数字/分隔符组合 |
 | **权限管理** | `viewer` / `operator` / `superadmin` RBAC；API Key 按 kind、scope、域授权模式、邮箱 glob、IP、限速和有效期约束 |
 | **HTTP API** | 推荐 `/api/v2`：Bearer-only、严格模型、Problem Details、稳定 cursor；保留 `/api/v1` 公开和管理接口 |
 | **可观测性** | JSON/text 结构化日志、安全 Request ID、Prometheus 指标、live/ready 探针和缓存化运维仪表盘 |
-| **持久化与恢复** | SQLite WAL 保存索引；磁盘保存 raw / text / html / attachments / manifests；manifest 可重建未提交元数据 |
+| **持久化与恢复** | SQLite WAL 保存索引及在收件入口与 HTTP 间传递已提交投递通知的紧凑 live-event outbox；磁盘保存 raw / text / html / attachments / manifests；manifest 可重建未提交元数据 |
 | **清理系统** | 按投递保留期分批清理；事务内登记文件 GC，事务外删除并指数退避重试；独立清理会话、空邮箱、指标和审计 |
 | **维护工具** | 跨进程 `.maintenance.lock` 协调清空邮件，暂停新收件后清理文件并压缩 SQLite |
 
@@ -102,6 +103,9 @@ Docker Compose 是推荐部署方式。在已经审核的源码检出中安装�
 这一条命令会构建镜像、生成权限为 `0600` 的私密配置和随机 bootstrap/cursor/metrics 密钥，先启动
 Python 控制面并等待 schema 迁移与 `/health/ready`，再启动 C++ SMTP 入口。镜像使用非 root 用户；
 两个进程由同一个容器监督并共享 PID namespace，因为跨进程维护协议会记录并校验操作系统 PID。
+SQLite live-event outbox 负责跨越该进程边界传递已提交的公共邮箱投递通知。公共 WebSocket
+cursor generation 仍属于单个 HTTP 进程，因此每个实例应保持一个 HTTP worker（随附 runner
+即为此配置）；在 cursor generation 共享前，多 worker 或多副本 HTTP 层需使用粘性路由。
 
 宿主机默认绑定：
 

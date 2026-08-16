@@ -311,9 +311,37 @@ void test_batch_writer_writes_sqlite_parsed_records() {
     rapid_inbox::ingestd::BatchWriter writer(root, db_path, 5000, false);
     const rapid_inbox::ingestd::MailJob job = sample_job();
     writer.write_batch({job});
+
+    {
+        rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+        auto live_event = db.prepare(
+            "SELECT event_type, delivery_id, created_at FROM mailbox_live_events ORDER BY id");
+        test::check(live_event.step_row(),
+                    "C++ batch commit includes its mailbox live event");
+        test::check(
+            std::string(reinterpret_cast<const char*>(
+                sqlite3_column_text(live_event.get(), 0))) == "mailbox_delivery",
+            "C++ delivery emits mailbox delivery live event");
+        test::check(
+            std::string(reinterpret_cast<const char*>(
+                sqlite3_column_text(live_event.get(), 1))) == "dlv_1",
+            "C++ mailbox live event references the committed delivery");
+        test::check(
+            std::string(reinterpret_cast<const char*>(
+                sqlite3_column_text(live_event.get(), 2))) == job.received_at,
+            "C++ mailbox live event preserves delivery commit time");
+        test::check(!live_event.step_row(),
+                    "C++ batch emits one live event for one delivery");
+    }
+
     writer.write_batch({job});
 
     rapid_inbox::ingestd::SqliteDb db(db_path, 5000);
+    auto repeated_live_events = db.prepare("SELECT COUNT(*) FROM mailbox_live_events");
+    test::check(repeated_live_events.step_row(), "mailbox live event count exists");
+    test::check(sqlite3_column_int(repeated_live_events.get(), 0) == 1,
+                "duplicate C++ batch does not emit a duplicate mailbox live event");
+
     auto message = db.prepare(
         "SELECT parse_status, raw_path, envelope_from, subject, text_preview, "
         "text_body_path, html_body_path, verification_code "

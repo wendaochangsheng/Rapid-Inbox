@@ -44,6 +44,9 @@ from app.smtp.matcher import DomainMatch, DomainMatcher, DomainRule
 MESSAGE_RETENTION_CLEANUP_INTERVAL_SECONDS = 30
 PENDING_PARSE_SCAN_INTERVAL_SECONDS = 0.5
 PENDING_PARSE_SCAN_BATCH_SIZE = 5000
+MAILBOX_LIVE_EVENT_POLL_INTERVAL_SECONDS = 0.25
+MAILBOX_LIVE_EVENT_BATCH_SIZE = 512
+MAILBOX_LIVE_EVENT_MAX_PAGES_PER_POLL = 8
 MANIFEST_RECOVERY_SCAN_INTERVAL_SECONDS = 10.0
 MAX_MANIFEST_SWEEP_BYTES = 16 * 1024 * 1024
 SMTP_IP_RATE_STATE_MIN_ENTRIES = 1024
@@ -107,6 +110,9 @@ class RapidInboxRuntime:
         self._smtp_ip_expiry_order: OrderedDict[str, None] = OrderedDict()
         self._retention_cleanup_task: asyncio.Task[None] | None = None
         self._pending_parse_scan_task: asyncio.Task[None] | None = None
+        self._mailbox_live_event_task: asyncio.Task[None] | None = None
+        self._mailbox_live_event_cursor = 0
+        self._mailbox_live_event_database_identity: tuple[int, int] | None = None
         self._pending_parse_scan_cursor: tuple[str, str] | None = None
         self._last_manifest_recovery_at = monotonic()
         self._artifact_sweep_iterators: dict[
@@ -151,8 +157,14 @@ class RapidInboxRuntime:
         self.domains.reload()
         self.observability.background.register("message_retention")
         self.observability.background.register("pending_parse_scan")
+        self.observability.background.register("mailbox_live_events")
+        self._mailbox_live_event_cursor = await self._latest_mailbox_live_event_id()
+        self._mailbox_live_event_database_identity = (
+            self._current_mailbox_live_event_database_identity()
+        )
         self._retention_cleanup_task = asyncio.create_task(self._message_retention_loop())
         self._pending_parse_scan_task = asyncio.create_task(self._pending_parse_scan_loop())
+        self._start_mailbox_live_event_loop()
         self._started = True
 
     async def stop(self) -> None:
@@ -160,6 +172,10 @@ class RapidInboxRuntime:
 
         self._stopping = True
         try:
+            try:
+                await self._stop_mailbox_live_event_loop()
+            except asyncio.CancelledError:
+                pass
             try:
                 await self._stop_pending_parse_scan_loop()
             except asyncio.CancelledError:
@@ -190,6 +206,7 @@ class RapidInboxRuntime:
             try:
                 self.observability.background.stop("message_retention")
                 self.observability.background.stop("pending_parse_scan")
+                self.observability.background.stop("mailbox_live_events")
             finally:
                 close_error: BaseException | None = None
                 # Each resource is drained even if an earlier close reports an
@@ -222,6 +239,10 @@ class RapidInboxRuntime:
     def operational_state(self) -> dict[str, Any]:
         retention_running = self._retention_cleanup_task is not None and not self._retention_cleanup_task.done()
         pending_scan_running = self._pending_parse_scan_task is not None and not self._pending_parse_scan_task.done()
+        mailbox_live_events_running = (
+            self._mailbox_live_event_task is not None
+            and not self._mailbox_live_event_task.done()
+        )
         parse_queue_running = self.parse_queue.is_running
         read_pool_state = self.read_pool.operational_state()
         ok = bool(
@@ -229,6 +250,7 @@ class RapidInboxRuntime:
             and not self._stopping
             and retention_running
             and pending_scan_running
+            and mailbox_live_events_running
             and parse_queue_running
             and read_pool_state["ok"]
         )
@@ -241,6 +263,7 @@ class RapidInboxRuntime:
             "tasks": {
                 "message_retention": retention_running,
                 "pending_parse_scan": pending_scan_running,
+                "mailbox_live_events": mailbox_live_events_running,
             },
         }
 
@@ -301,7 +324,10 @@ class RapidInboxRuntime:
         authorization_principal: PermissionContext | None = None,
     ) -> dict[str, Any]:
         await self._begin_mail_maintenance()
+        restart_mailbox_live_events = self._mailbox_live_event_task is not None
         try:
+            if restart_mailbox_live_events:
+                await self._stop_mailbox_live_event_loop()
             maintenance_lock = await asyncio.to_thread(self.storage.begin_maintenance, "clear-mail")
             try:
                 await asyncio.to_thread(
@@ -325,6 +351,11 @@ class RapidInboxRuntime:
                             )
                             self._reset_artifact_sweep_iterators()
                             self.live_state.clear()
+                            # mailbox_live_events uses AUTOINCREMENT and clear-all
+                            # deliberately preserves its sqlite_sequence entry.
+                            # Resetting only the in-memory high-water mark lets the
+                            # restarted tailer observe the next committed event.
+                            self._mailbox_live_event_cursor = 0
                             try:
                                 result.update(
                                     await self.writer.execute_maintenance(
@@ -343,6 +374,13 @@ class RapidInboxRuntime:
             finally:
                 await asyncio.to_thread(self.storage.end_maintenance, maintenance_lock)
         finally:
+            if (
+                restart_mailbox_live_events
+                and self._started
+                and not self._stopping
+                and self._mailbox_live_event_task is None
+            ):
+                self._start_mailbox_live_event_loop()
             await self._end_mail_maintenance()
 
     async def _begin_mail_maintenance(self) -> None:
@@ -578,6 +616,157 @@ class RapidInboxRuntime:
             await task
         except asyncio.CancelledError:
             pass
+
+    async def _mailbox_live_event_loop(self) -> None:
+        await self.observability.run_periodic(
+            "mailbox_live_events",
+            MAILBOX_LIVE_EVENT_POLL_INTERVAL_SECONDS,
+            self._publish_pending_mailbox_live_events,
+        )
+
+    def _start_mailbox_live_event_loop(self) -> None:
+        if self._mailbox_live_event_task is not None:
+            return
+        self.observability.background.register("mailbox_live_events")
+        self._mailbox_live_event_task = asyncio.create_task(
+            self._mailbox_live_event_loop()
+        )
+
+    async def _stop_mailbox_live_event_loop(self) -> None:
+        task = self._mailbox_live_event_task
+        if task is None:
+            return
+        self._mailbox_live_event_task = None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _latest_mailbox_live_event_id(self) -> int:
+        row = await self.read_pool.fetch_one(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM mailbox_live_events"
+        )
+        return 0 if row is None else int(row["max_id"])
+
+    def _current_mailbox_live_event_database_identity(self) -> tuple[int, int]:
+        stat = self.settings.database_path.stat()
+        return int(stat.st_dev), int(stat.st_ino)
+
+    def _reset_mailbox_live_event_stream(
+        self,
+        database_identity: tuple[int, int],
+    ) -> None:
+        self._mailbox_live_event_database_identity = database_identity
+        self._mailbox_live_event_cursor = 0
+        self.live_state.clear()
+
+    async def _load_mailbox_live_event_page(
+        self,
+        after_id: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return await self.read_pool.fetch_all(
+            """
+                WITH event_page AS (
+                    SELECT id, event_type, delivery_id, created_at
+                    FROM mailbox_live_events
+                    WHERE id > ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                ),
+                event_state AS (
+                    SELECT COALESCE(
+                        (
+                            SELECT seq
+                            FROM sqlite_sequence
+                            WHERE name = 'mailbox_live_events'
+                        ),
+                        0
+                    ) AS high_water
+                )
+                SELECT
+                    event_state.high_water AS outbox_high_water,
+                    event.id,
+                    event.event_type,
+                    event.delivery_id,
+                    event.created_at,
+                    delivery.delivered_at,
+                    delivery.status AS delivery_status,
+                    message.id AS message_id,
+                    message.parse_status,
+                    mailbox.address_canonical AS mailbox
+                FROM event_state
+                LEFT JOIN event_page AS event ON 1 = 1
+                LEFT JOIN message_deliveries AS delivery
+                  ON delivery.id = event.delivery_id
+                LEFT JOIN messages AS message
+                  ON message.id = delivery.message_id
+                LEFT JOIN mailboxes AS mailbox
+                  ON mailbox.id = delivery.mailbox_id
+                ORDER BY event.id ASC
+                """,
+            (after_id, limit),
+        )
+
+    async def _publish_pending_mailbox_live_events(self) -> int:
+        published = 0
+        pages_loaded = 0
+        while pages_loaded < MAILBOX_LIVE_EVENT_MAX_PAGES_PER_POLL:
+            identity_before = self._current_mailbox_live_event_database_identity()
+            if identity_before != self._mailbox_live_event_database_identity:
+                self._reset_mailbox_live_event_stream(identity_before)
+
+            rows = await self._load_mailbox_live_event_page(
+                self._mailbox_live_event_cursor,
+                MAILBOX_LIVE_EVENT_BATCH_SIZE,
+            )
+            pages_loaded += 1
+            identity_after = self._current_mailbox_live_event_database_identity()
+            if identity_after != identity_before:
+                # The read pool already retries an inode replacement safely.
+                # Discard the possibly cross-generation page and replay the
+                # replacement outbox from zero under a fresh live cursor.
+                self._reset_mailbox_live_event_stream(identity_after)
+                continue
+
+            outbox_high_water = int(rows[0]["outbox_high_water"]) if rows else 0
+            if outbox_high_water < self._mailbox_live_event_cursor:
+                # Also cover an operator restoring a smaller database in place.
+                self._reset_mailbox_live_event_stream(identity_after)
+                continue
+
+            event_rows = [row for row in rows if row["id"] is not None]
+            if not event_rows:
+                return published
+            for row in event_rows:
+                event_id = int(row["id"])
+                if (
+                    row["delivery_status"] == "active"
+                    and row["mailbox"] is not None
+                    and row["message_id"] is not None
+                    and row["parse_status"] is not None
+                ):
+                    await self.live_state.publish(
+                        {
+                            "type": str(row["event_type"]),
+                            "delivery_id": str(row["delivery_id"]),
+                            "message_id": str(row["message_id"]),
+                            "mailbox": str(row["mailbox"]),
+                            "parse_status": str(row["parse_status"]),
+                            "ts": str(row["delivered_at"] or row["created_at"]),
+                            "outbox_id": event_id,
+                        }
+                    )
+                    published += 1
+                # Rows may lose their joined delivery during retention. Advance
+                # the global high-water mark even when there is nothing left to
+                # broadcast so one stale event cannot stall all later mailboxes.
+                self._mailbox_live_event_cursor = event_id
+            if len(event_rows) < MAILBOX_LIVE_EVENT_BATCH_SIZE:
+                return published
+            await asyncio.sleep(0)
+        return published
 
     def _cutoff_timestamp(self, *, seconds: int = 0, days: int = 0) -> str:
         current = datetime.fromisoformat(utc_now().replace("Z", "+00:00"))
@@ -1893,6 +2082,7 @@ class RapidInboxRuntime:
         for table_name in (
             "attachments",
             "mailbox_bulk_delete_jobs",
+            "mailbox_live_events",
             "message_deliveries",
             "messages",
             "mailboxes",
@@ -2379,7 +2569,7 @@ class RapidInboxRuntime:
             # transaction: a newly-created more-specific managed suffix is just
             # as important as a catch-all -> managed transition for ownership
             # and API-key isolation.
-            delivery_events: list[dict[str, Any]] = []
+            delivery_count = 0
             transaction_mailboxes: set[tuple[int, str]] = set()
             for rcpt_to, match, retention_days in transaction_matches:
                 mailbox_key = (int(match.domain_id), str(match.address_canonical))
@@ -2417,27 +2607,17 @@ class RapidInboxRuntime:
                         mailbox_id,
                     ),
                 )
-                delivery_events.append(
-                    {
-                        "delivery_id": delivery_id,
-                        "message_id": message_id,
-                        "mailbox": match.address_canonical,
-                        "rcpt_to": rcpt_to,
-                        "parse_status": "pending",
-                        "ts": received_at,
-                    }
-                )
+                delivery_count += 1
 
             self._increment_mail_metric(
                 connection,
                 received_at,
                 received=1,
-                deliveries=len(delivery_events),
+                deliveries=delivery_count,
             )
-            return delivery_events
 
         try:
-            delivery_events = await self.writer.execute(operation)
+            await self.writer.execute(operation)
         except _RecipientPolicyChangedError:
             await asyncio.to_thread(
                 self._discard_uncommitted_accept_artifacts,
@@ -2445,8 +2625,6 @@ class RapidInboxRuntime:
                 manifest_path,
             )
             return "451 recipient policy changed; retry later"
-        for event in delivery_events:
-            await self.live_state.publish({**event, "type": "mailbox_delivery"})
         # The raw file and database row are already durable.  Parsing is
         # intentionally best-effort here: bounded queue pressure must not turn
         # an accepted message into an SMTP failure.  The periodic pending scan
@@ -3636,7 +3814,6 @@ class RapidInboxRuntime:
                 lambda connection: self._mark_message_parse_failed(connection, task.message_id, str(exc))
             )
             await asyncio.to_thread(self._delete_attachment_files, attachment_paths)
-            await self._publish_mailbox_delivery_updates(task.message_id)
             return
 
         try:
@@ -3651,14 +3828,12 @@ class RapidInboxRuntime:
                 lambda connection: self._mark_message_parse_failed(connection, task.message_id, str(exc))
             )
             await asyncio.to_thread(self._delete_attachment_files, attachment_paths)
-            await self._publish_mailbox_delivery_updates(task.message_id)
             return
 
         attachment_paths = await self.writer.execute(
             lambda connection: self._apply_parsed_message(connection, task.message_id, parsed)
         )
         await asyncio.to_thread(self._delete_attachment_files, attachment_paths)
-        await self._publish_mailbox_delivery_updates(task.message_id)
 
     def _load_parse_message_source(self, message_id: str) -> tuple[str, str] | None:
         with connect_database(self.settings.database_path) as connection:
@@ -3810,45 +3985,6 @@ class RapidInboxRuntime:
                 self.storage.resolve(storage_path).unlink(missing_ok=True)
             except Exception:
                 continue
-
-    async def _publish_mailbox_delivery_updates(self, message_id: str) -> None:
-        events = await asyncio.to_thread(
-            self._load_mailbox_delivery_update_events,
-            message_id,
-        )
-        for event in events:
-            await self.live_state.publish({**event, "type": "mailbox_delivery_updated"})
-
-    def _load_mailbox_delivery_update_events(self, message_id: str) -> list[dict[str, Any]]:
-        with connect_database(self.settings.database_path) as connection:
-            rows = connection.execute(
-                """
-                SELECT
-                    d.id AS delivery_id,
-                    d.rcpt_to,
-                    d.delivered_at,
-                    m.id AS message_id,
-                    m.parse_status,
-                    mb.address_canonical AS mailbox
-                FROM message_deliveries AS d
-                JOIN messages AS m ON m.id = d.message_id
-                JOIN mailboxes AS mb ON mb.id = d.mailbox_id
-                WHERE d.message_id = ? AND d.status = 'active'
-                ORDER BY d.delivered_at ASC, d.id ASC
-                """,
-                (message_id,),
-            ).fetchall()
-        return [
-            {
-                "delivery_id": row["delivery_id"],
-                "message_id": row["message_id"],
-                "mailbox": row["mailbox"],
-                "rcpt_to": row["rcpt_to"],
-                "parse_status": row["parse_status"],
-                "ts": row["delivered_at"],
-            }
-            for row in rows
-        ]
 
     def _apply_recovery_manifest(self, connection: sqlite3.Connection, manifest: dict[str, Any]) -> bool:
         message_id = str(manifest["message_id"])
