@@ -196,6 +196,7 @@
   .badge-rcpt_accepted { background: rgba(79, 125, 74, 0.22); color: #94d188; }
   .badge-rcpt_rejected { background: rgba(177, 67, 67, 0.22); color: #f08c8c; }
   .badge-queued { background: rgba(74, 107, 128, 0.22); color: #8fb6cd; }
+  .badge-delivery_committed { background: rgba(79, 125, 74, 0.22); color: #94d188; }
   .badge-connect { background: rgba(74, 107, 128, 0.22); color: #8fb6cd; }
   .badge-disconnect { background: rgba(255, 255, 255, 0.08); color: #c8c4b6; }
   .badge-error { background: rgba(177, 67, 67, 0.22); color: #f08c8c; }
@@ -283,13 +284,13 @@
         <span class="pulse__dot"></span>
       </div>
       <div>
-        <p class="eyebrow" style="margin-bottom: 4px;">Live SSE 流</p>
+        <p class="eyebrow" style="margin-bottom: 4px;">Live WebSocket 流</p>
         <h2>实时监控中枢</h2>
         <div class="row" style="margin-top: 8px; gap: 8px;">
-          <span id="stream-status" class="pill pill--success">已连接</span>
+          <span id="stream-status" class="pill">连接中</span>
           <span class="muted" style="font-size: 0.84rem;">推送接口</span>
           <span class="endpoint-pill" id="endpoint-pill">
-            <span id="endpoint-url">{{ stream_url }}</span>
+            <span id="endpoint-url">{{ websocket_url }}</span>
             <button class="copy-icon-btn" type="button" onclick="navigator.clipboard.writeText(document.getElementById('endpoint-url').textContent)" title="复制接口" aria-label="复制接口">
               <i data-lucide="copy" style="width: 13px; height: 13px;"></i>
             </button>
@@ -425,9 +426,9 @@
       });
     }
 
-    if (!feed || !window.EventSource) {
+    if (!feed || !window.WebSocket) {
       if (statusText) {
-        statusText.textContent = "不支持 SSE";
+        statusText.textContent = "浏览器不支持 WebSocket";
         statusText.className = "pill pill--danger";
       }
       if (statusWrapper) statusWrapper.classList.add("pulse--down");
@@ -438,6 +439,7 @@
       if (type === 'rcpt_accepted') return 'badge-rcpt_accepted';
       if (type === 'rcpt_rejected') return 'badge-rcpt_rejected';
       if (type === 'queued') return 'badge-queued';
+      if (type === 'delivery_committed') return 'badge-delivery_committed';
       if (type === 'connect') return 'badge-connect';
       if (type === 'disconnect') return 'badge-disconnect';
       if (type === 'error') return 'badge-error';
@@ -543,34 +545,120 @@
       }
     };
 
-    const source = new EventSource({{ stream_url | tojson }});
+    const initialSocketUrl = new URL({{ websocket_url | tojson }}, window.location.href);
+    let liveCursor = initialSocketUrl.searchParams.get("after_cursor") || "";
+    let socket = null;
+    let reconnectTimer = null;
+    let stableConnectionTimer = null;
+    let reconnectAttempt = 0;
+    let stopped = false;
+    let suspendedForPage = false;
 
-    source.onopen = () => {
+    const setDisconnected = (label = "连接已断开") => {
       if (statusText) {
-        statusText.textContent = "已连接";
-        statusText.className = "pill pill--success";
-      }
-      if (statusWrapper) statusWrapper.classList.remove("pulse--down");
-    };
-
-    const eventTypes = {{ live_event_types | tojson }};
-    eventTypes.forEach((type) => {
-      source.addEventListener(type, (event) => {
-        try {
-          appendEvent(JSON.parse(event.data));
-        } catch (error) {
-          appendEvent({ type, raw: event.data });
-        }
-      });
-    });
-
-    source.onerror = () => {
-      if (statusText) {
-        statusText.textContent = "连接已断开";
+        statusText.textContent = label;
         statusText.className = "pill pill--danger";
       }
       if (statusWrapper) statusWrapper.classList.add("pulse--down");
     };
+
+    const scheduleReconnect = () => {
+      if (stopped || reconnectTimer) return;
+      const exponentialDelay = Math.min(10000, 500 * (2 ** Math.min(reconnectAttempt, 4)));
+      const jitter = Math.floor(Math.random() * 250);
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connectSocket();
+      }, exponentialDelay + jitter);
+    };
+
+    const connectSocket = () => {
+      if (stopped) return;
+      if (statusText) {
+        statusText.textContent = "连接中";
+        statusText.className = "pill";
+      }
+      const socketUrl = new URL({{ websocket_url | tojson }}, window.location.href);
+      socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
+      socketUrl.searchParams.set("after_cursor", liveCursor);
+      const candidate = new WebSocket(socketUrl);
+      socket = candidate;
+
+      candidate.onopen = () => {
+        if (socket !== candidate || stopped) {
+          candidate.close(1000, "stale connection");
+          return;
+        }
+        if (stableConnectionTimer) window.clearTimeout(stableConnectionTimer);
+        stableConnectionTimer = window.setTimeout(() => {
+          stableConnectionTimer = null;
+          if (socket === candidate && candidate.readyState === WebSocket.OPEN) {
+            reconnectAttempt = 0;
+          }
+        }, 5000);
+        if (statusText) {
+          statusText.textContent = "已连接";
+          statusText.className = "pill pill--success";
+        }
+        if (statusWrapper) statusWrapper.classList.remove("pulse--down");
+      };
+
+      candidate.onmessage = (event) => {
+        if (socket !== candidate || stopped) return;
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload?.cursor) liveCursor = String(payload.cursor);
+          if (payload?.type === "cursor") return;
+          appendEvent(payload);
+        } catch (error) {
+          appendEvent({ type: "error", raw: event.data });
+        }
+      };
+
+      candidate.onerror = () => candidate.close();
+      candidate.onclose = (event) => {
+        if (socket !== candidate) return;
+        if (stableConnectionTimer) {
+          window.clearTimeout(stableConnectionTimer);
+          stableConnectionTimer = null;
+        }
+        if (socket === candidate) socket = null;
+        if (stopped) return;
+        if (event.code === 1008) {
+          stopped = true;
+          setDisconnected("会话已失效，请重新登录");
+          return;
+        }
+        setDisconnected();
+        scheduleReconnect();
+      };
+    };
+
+    connectSocket();
+    const stopSocket = () => {
+      if (stopped) return;
+      suspendedForPage = true;
+      stopped = true;
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (stableConnectionTimer) {
+        window.clearTimeout(stableConnectionTimer);
+        stableConnectionTimer = null;
+      }
+      socket?.close(1000, "page unload");
+    };
+    window.addEventListener("pagehide", stopSocket);
+    window.addEventListener("beforeunload", stopSocket);
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted || !suspendedForPage) return;
+      suspendedForPage = false;
+      stopped = false;
+      reconnectAttempt = 0;
+      connectSocket();
+    });
   })();
 </script>
 {% endblock %}

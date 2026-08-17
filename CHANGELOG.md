@@ -22,6 +22,21 @@ This project records notable changes in the spirit of [Keep a Changelog](https:/
 
 ### Changed
 
+- Migrated the administration SMTP live UI and primary interface to the authenticated, server-only
+  WebSocket at `/api/v1/admin/live/smtp/ws`. JSON messages carry resumable cursors; reconnects use
+  `after_cursor`, and ring overruns or generation changes observed on an open stream emit `gap` before
+  continuing from the oldest available event. A stale generation supplied at handshake falls back to
+  the current ring or committed history. Cookie sessions require exactly one same-origin `Origin`;
+  header API Keys require `live.read`, while query credentials are rejected. Normal page unload uses
+  close code 1000, authentication/policy failures and client application frames delivered to the
+  route use 1008, and connection-capacity rejection uses 1013. The former
+  `/api/v1/admin/live/smtp/stream` SSE endpoint remains only as a deprecated compatibility route.
+  Supported launchers reject larger inbound messages at 16 KiB before application processing and
+  keep a one-message queue.
+- Limited cross-process administration events to committed delivery facts: C++ and separate ingress
+  `mailbox_delivery` outbox events map to `delivery_committed` with `source: committed_outbox`.
+  Parse-only delivery updates advance the resume cursor without being rendered, and no cross-process
+  connection/command telemetry is implied.
 - Docker Compose is now the recommended deployment path, native systemd is the secondary path, and
   `quickstart.sh` is documented as a local evaluation/development foreground launcher.
 - Made project-facing Markdown bilingual: standard filenames now contain English, complete

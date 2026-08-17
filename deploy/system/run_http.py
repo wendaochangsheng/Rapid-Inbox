@@ -7,6 +7,10 @@ import sys
 from pathlib import Path
 
 
+WEBSOCKET_MAX_MESSAGE_BYTES = 16 * 1024
+WEBSOCKET_MAX_QUEUE_MESSAGES = 1
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Rapid Inbox HTTP control plane")
     parser.add_argument("--base-dir", type=Path, required=True)
@@ -34,6 +38,8 @@ def main() -> int:
         port=settings.port,
         reload=False,
         limit_concurrency=settings.http_concurrency_limit,
+        ws_max_size=WEBSOCKET_MAX_MESSAGE_BYTES,
+        ws_max_queue=WEBSOCKET_MAX_QUEUE_MESSAGES,
     )
     return 0
 

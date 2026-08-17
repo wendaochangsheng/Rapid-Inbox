@@ -12,6 +12,7 @@ import pytest
 
 from app.config import Settings
 from app.db.connection import initialize_database
+from app.http.live import smtp_live_snapshot
 from app.runtime import RapidInboxRuntime
 from app.services.attachments import AttachmentService
 
@@ -111,6 +112,21 @@ async def test_cpp_ingestd_accepts_mail_and_python_reads_it(tmp_path: Path) -> N
                 assert detail["verification_code"] == "123456"
                 assert live_events[-1]["delivery_id"] == mailbox["items"][0]["delivery_id"]
                 assert live_events[-1]["parse_status"] == "parsed"
+                admin_events = smtp_live_snapshot(runtime, events=live_events)
+                assert admin_events == [
+                    {
+                        "type": "delivery_committed",
+                        "session_id": live_events[-1]["session_id"],
+                        "delivery_id": mailbox["items"][0]["delivery_id"],
+                        "message_id": mailbox["items"][0]["message_id"],
+                        "rcpt_to": "code@adb.com",
+                        "mail_from": "sender@example.com",
+                        "parse_status": "parsed",
+                        "ts": live_events[-1]["ts"],
+                        "source": "committed_outbox",
+                    }
+                ]
+                assert str(admin_events[0]["session_id"]).startswith("smtp_")
                 break
             if asyncio.get_running_loop().time() >= deadline:
                 raise AssertionError(

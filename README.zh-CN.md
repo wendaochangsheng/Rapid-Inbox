@@ -68,7 +68,9 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 > 演示使用隔离环境中的脱敏测试数据，不包含真实邮箱、邮件或凭据。录制时使用 Python 内嵌 SMTP。
 > 当前部署会把已提交的公共邮箱投递变化写入 SQLite live-event outbox，并由 Python HTTP 进程持续
 > 读取；因此默认 C++ ingestd 与独立 Python SMTP 模式也能通过 WebSocket 更新已打开的公开收件箱，
-> 无需手动刷新。管理端 SMTP 连接/命令 SSE 仍属于进程内能力；重连可回退到已提交历史。
+> 无需手动刷新。管理后台也使用经过鉴权的 WebSocket：Python SMTP 可推送进程内连接/命令遥测，
+> C++ 与独立收件进程则通过 SQLite outbox 推送 `delivery_committed` 已提交投递；重连携带 cursor，
+> 无法续传时可回退到已提交历史。
 
 ## 当前已实现
 
@@ -77,7 +79,7 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 | **邮件接收** | C++ `rapid-inbox-ingestd` 提供 durable ACK、字节级背压、group commit、多 worker MIME 解析和毒任务隔离；Python SMTP 保留为开发模式 |
 | **域名模式** | 支持仅接收已配置域名，或对到达本服务的 SMTP 投递启用 `managed_plus_catchall` 任意域模式；最长后缀规则优先，域规则可热刷新 |
 | **收件箱** | 域名默认私有；邮箱公开位默认启用，但只在域级公共开关开启后生效，且可按邮箱单独关闭；支持列表、详情、原始 EML、沙箱 HTML 预览和附件下载 |
-| **实时更新** | Python/C++ 收件入口会把已提交的公共邮箱投递变化持久化到 SQLite live-event outbox；每个 HTTP runtime 持续读取并通过 WebSocket 推送匹配邮箱，因此已打开的公开收件箱无需手动刷新。cursor 缺口会触发页面重新同步。管理端 SMTP 连接/命令 SSE 仍是进程内能力；独立收件进程只提供已提交历史，不持续推送逐会话遥测 |
+| **实时更新** | Python/C++ 收件入口会把已提交的公共邮箱投递变化持久化到 SQLite live-event outbox；每个 HTTP runtime 持续读取并通过 WebSocket 推送匹配邮箱，因此已打开的公开收件箱无需手动刷新。经过鉴权的管理端 WebSocket 支持 cursor 续传与 gap 报告；C++ 已提交投递显示为 `delivery_committed`，连接/命令级遥测仍属于进程内能力 |
 | **验证码识别** | 打分制提取算法，支持中英日韩西多语言上下文与字母数字/分隔符组合 |
 | **权限管理** | `viewer` / `operator` / `superadmin` RBAC；API Key 按 kind、scope、域授权模式、邮箱 glob、IP、限速和有效期约束 |
 | **HTTP API** | 推荐 `/api/v2`：Bearer-only、严格模型、Problem Details、稳定 cursor；保留 `/api/v1` 公开和管理接口 |
@@ -88,7 +90,7 @@ Rapid Inbox 面向需要自托管邮件测试环境的开源项目维护者、�
 
 ## 技术栈
 
-`Docker Compose` · `C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket` · `SSE`
+`Docker Compose` · `C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket`
 
 ## 快速开始
 
@@ -103,8 +105,8 @@ Docker Compose 是推荐部署方式。在已经审核的源码检出中安装�
 这一条命令会构建镜像、生成权限为 `0600` 的私密配置和随机 bootstrap/cursor/metrics 密钥，先启动
 Python 控制面并等待 schema 迁移与 `/health/ready`，再启动 C++ SMTP 入口。镜像使用非 root 用户；
 两个进程由同一个容器监督并共享 PID namespace，因为跨进程维护协议会记录并校验操作系统 PID。
-SQLite live-event outbox 负责跨越该进程边界传递已提交的公共邮箱投递通知。公共 WebSocket
-cursor generation 仍属于单个 HTTP 进程，因此每个实例应保持一个 HTTP worker（随附 runner
+SQLite live-event outbox 负责跨越该进程边界传递已提交的公共邮箱投递通知。公共与管理端 WebSocket
+的 cursor generation 仍属于单个 HTTP 进程，因此每个实例应保持一个 HTTP worker（随附 runner
 即为此配置）；在 cursor generation 共享前，多 worker 或多副本 HTTP 层需使用粘性路由。
 
 宿主机默认绑定：
@@ -294,7 +296,7 @@ Python HTTP、兼容 SMTP 与共享配置：
 | `HTTP_REQUEST_BODY_TIMEOUT_SECONDS` | `15` | 完整接收单个 HTTP 请求体的总时限，抵御慢速分块上传 |
 | `HTTP_BODY_MEMORY_BUDGET_BYTES` | `268435456` | 每进程所有已缓冲 HTTP 请求体的共享字节预算，必须不小于单请求上限 |
 | `HTTP_CONCURRENCY_LIMIT` | `1000` | 每进程 HTTP/WebSocket 总准入上限；受支持启动器同时传给 Uvicorn `--limit-concurrency`，应用中间件也执行 |
-| `HTTP_LIVE_CONNECTION_LIMIT` | `256` | 每个 HTTP 进程共享的管理 SSE 与公共邮箱 WebSocket 长连接上限，超限返回 503/1013 |
+| `HTTP_LIVE_CONNECTION_LIMIT` | `256` | 每个 HTTP 进程共享的管理端与公共邮箱 WebSocket 长连接上限；WebSocket 超限以 1013 关闭。已弃用的 v1 SSE 兼容流也共享该上限，满额时返回 503 |
 | `DATABASE_WRITE_QUEUE_CAPACITY` / `DATABASE_WRITE_MAX_WAITERS` | `256` / `1024` | SQLite 单写 actor 已接管请求与等待请求的双重上限，超限快速返回 503 |
 | `DATABASE_READ_POOL_SIZE` / `DATABASE_READ_QUEUE_CAPACITY` / `DATABASE_READ_MAX_WAITERS` / `DATABASE_READ_TIMEOUT_SECONDS` | `1` / `256` / `1024` / `5` | API v2 专用只读 actor、已接管请求与等待请求上限和端到端读时限。默认单 actor 是保守的设计选择；增加连接数前应按实际 workload 压测。维护会先排空请求并由 owner 线程关闭连接；这些数值均按 HTTP 进程分别计算 |
 | `SMTP_HOST` / `SMTP_PORT` | `0.0.0.0` / `25` | SMTP 监听地址与端口 |
@@ -334,6 +336,10 @@ Python HTTP、兼容 SMTP 与共享配置：
 | `API_CURSOR_SECRET` | 空（部署脚本与 quickstart 随机填充） | API v2 cursor HMAC 密钥；手工外网部署必须配置至少 32 个字符 |
 | `READINESS_MIN_FREE_DISK_BYTES` | `67108864` | readiness 所需最小可用磁盘空间 |
 | `ADMIN_TOKEN` / `PUBLIC_API_KEY` | 未启用 | v1 兼容令牌；仅显式配置非默认随机值时启用 |
+
+两个实时 WebSocket 都是只允许服务端下发的通知流，因此受支持的 Docker、systemd、quickstart
+与 Python 启动入口会把客户端到服务端的单条消息限制为 16 KiB，并且最多只排队一条未处理消息。
+反向代理应设置相同或更严格的限制。
 
 预览预算是单请求上限（CID 图片转成 data URL 后还会有约 4/3 的 Base64 膨胀）；正文与内联预算同时调大时，最坏并发内存约随 `HTTP_CONCURRENCY_LIMIT` 成比例增长。生产环境应按可用内存联合设置这些值，完整内容继续通过流式原始邮件与附件下载获取。
 
@@ -438,7 +444,7 @@ curl \
 
 当前 v2 覆盖 principal、公开邮箱的列表/验证码/详情/raw/附件、域名与 DNS 检查、邮箱、
 邮件详情/raw/附件/重解析/删除、SMTP 会话与事件、审计、仪表盘、手动清理/清空、系统设置、
-API Key 和管理员完整生命周期。管理实时流与跨邮件批量删除仍由 `/api/v1/*` 提供。新代码
+API Key 和管理员完整生命周期。管理端实时 WebSocket（以及已弃用的 SSE 兼容路由）与跨邮件批量删除仍由 `/api/v1/*` 提供。新代码
 应优先使用 v2 已覆盖的资源，并以 OpenAPI 中实际存在的 operation 为准。
 
 所有 v2 cursor 都有 2048 字节输入上限、HMAC 签名并绑定资源与筛选条件；保留的 v1 公开邮箱

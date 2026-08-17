@@ -503,7 +503,8 @@ fi
 
 if [ "$USE_CPP_INGESTD" -eq 1 ]; then
     "$VENV_DIR/bin/uvicorn" app.main:app --host "$HTTP_HOST" --port "$HTTP_PORT" \
-        --limit-concurrency "$HTTP_CONCURRENCY_LIMIT" > "$RUN_DIR/http.log" 2>&1 &
+        --limit-concurrency "$HTTP_CONCURRENCY_LIMIT" \
+        --ws-max-size 16384 --ws-max-queue 1 > "$RUN_DIR/http.log" 2>&1 &
     HTTP_PID=$!
     "$INGESTD_BIN" --base-dir "$ROOT_DIR" > "$RUN_DIR/ingestd.log" 2>&1 &
     INGESTD_PID=$!

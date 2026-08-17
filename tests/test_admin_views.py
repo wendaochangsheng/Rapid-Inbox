@@ -304,14 +304,18 @@ async def test_admin_live_placeholder_route_is_not_exposed(app_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_live_page_uses_cursor_based_stream_url(app_client, runtime) -> None:
+async def test_admin_live_page_uses_cursor_based_websocket_url(app_client, runtime) -> None:
     await _login_and_change_initial_password(app_client, runtime)
 
     response = await app_client.get("/admin/live")
 
     assert response.status_code == 200
     assert "实时监控中枢" in response.text
+    assert "Live WebSocket 流" in response.text
     assert "after_cursor=" in response.text
+    assert "/api/v1/admin/live/smtp/ws" in response.text
+    assert "new WebSocket" in response.text
+    assert "EventSource" not in response.text
     assert "msg.innerHTML = msgHtml" not in response.text
     assert "appendTextSpan" in response.text
 

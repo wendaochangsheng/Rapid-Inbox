@@ -18,7 +18,7 @@ Build a high-speed, receive-only email system that supports:
    - `https://adb.com/mail/xxx@adb.com`
 5. Letting the public frontend browse all messages in a mailbox, view message bodies, download attachments, and view raw messages.
 6. Letting the admin console inspect SMTP activity and historical sessions, as well as domains, mailboxes, messages, API keys, audit logs, and system settings;
-   the current two-process design persists public-mailbox delivery notifications in SQLite and tails them in HTTP for WebSocket updates, while connection-level administration SMTP telemetry remains process-local.
+   the current two-process design persists public-mailbox delivery notifications in SQLite and tails them in HTTP for WebSocket updates. The authenticated administration WebSocket exposes process-local connection/command telemetry, while separate C++ ingress contributes only committed outbox deliveries mapped to `delivery_committed`.
 7. Providing a complete HTTP API:
    - Admin API
    - General-access API
@@ -46,7 +46,7 @@ Build a high-speed, receive-only email system that supports:
 - **Database**: SQLite
 - **Template engine**: Jinja2 (server-side rendering)
 - **Reverse proxy**: Nginx / Caddy
-- **Admin real-time stream**: SSE (Server-Sent Events)
+- **Admin real-time stream**: authenticated WebSocket; the former SSE route is deprecated compatibility only
 - **Public-mailbox real-time stream**: WebSocket backed by a SQLite live-event outbox
 - **Raw message storage**: local filesystem (`.eml`)
 - **Attachment storage**: local filesystem
@@ -104,7 +104,7 @@ Responsibilities:
 - API key management
 - Audit logs
 - System settings
-- Real-time SMTP session monitoring for in-process ingress; committed session history for separate ingress
+- Real-time SMTP session monitoring over an authenticated WebSocket for in-process ingress; committed session history and delivery notifications for separate ingress
 
 #### E. DB Writer
 
@@ -118,7 +118,8 @@ Responsibilities:
 - Persist cross-process public-mailbox delivery events in SQLite
 - Tail committed delivery events into bounded per-HTTP live state
 - Push matching mailbox updates over WebSocket
-- Keep connection-level SMTP telemetry in memory for administration SSE
+- Keep connection-level SMTP telemetry in memory for the administration WebSocket
+- Map committed `mailbox_delivery` outbox events, including those produced by separate/C++ ingress, to administration `delivery_committed` events; parse-update events advance the cursor without claiming cross-process command telemetry
 
 ## 5. Domain and Subdomain Support Rules
 
@@ -590,9 +591,25 @@ Example `POST /api/v1/admin/domains` request:
 
 - `GET /api/v1/admin/smtp/sessions`
 - `GET /api/v1/admin/smtp/sessions/{session_id}`
-- `GET /api/v1/admin/live/smtp/stream`
+- `WebSocket /api/v1/admin/live/smtp/ws?after_cursor={cursor}` (primary administration live interface)
+- `GET /api/v1/admin/live/smtp/stream` (deprecated SSE compatibility route)
 
-`/live/smtp/stream` uses SSE.
+The administration UI uses the server-only `/live/smtp/ws` WebSocket. Every data or control JSON
+message carries a `generation:sequence` cursor, and reconnects pass the newest cursor through
+`after_cursor`. A ring overrun or generation change detected on an established stream emits a `gap`
+message and then continues from the oldest available event. A reconnect whose supplied generation is
+already stale falls back to the current ring or committed history. An internal event that is not
+exposed to administrators emits a cursor-only control message so reconnects do not replay it.
+
+Cookie-authenticated handshakes require exactly one `Origin` whose HTTP(S) scheme, host, and port
+match the effective WebSocket URL (`ws` maps to `http`, and `wss` maps to `https`). Header
+`X-API-Key` authentication requires `live.read` and a global grant;
+credentials in the query string are rejected. Authentication/policy failures and client application
+frames delivered to the route close with code `1008`; supported launchers reject larger inbound
+messages at 16 KiB before application processing. The shared live-connection limit closes excess
+WebSockets with `1013`, and the administration page uses `1000` for normal unload. Internet-facing
+deployments must use WSS and preserve WebSocket upgrade headers at the trusted reverse proxy. The old
+`/live/smtp/stream` SSE endpoint remains only as a deprecated compatibility route.
 
 ### API Key Management
 
@@ -637,7 +654,7 @@ Displays:
 
 ### 13.3 Live Connection Panel
 
-Fields pushed over SSE:
+Example JSON message pushed over the administration WebSocket:
 
 ```json
 {
@@ -649,20 +666,26 @@ Fields pushed over SSE:
   "mail_from": "bounce@mandrillapp.com",
   "rcpt_to": "xxx@adb.com",
   "tls_used": true,
-  "state": "rcpt"
+  "state": "rcpt",
+  "cursor": "generation:42"
 }
 ```
 
-Event types:
-- `connected`
-- `ehlo`
-- `mail_from`
+Process-local data event types:
+- `connect`
 - `rcpt_accepted`
 - `rcpt_rejected`
-- `data_begin`
 - `queued`
-- `disconnected`
+- `disconnect`
 - `error`
+
+Cross-process and control event types:
+- `delivery_committed`: maps only a committed `mailbox_delivery` from the SQLite outbox and uses
+  `source: committed_outbox`; C++/separate ingress does not provide live connection or command events
+- `gap`: reports `ring_overrun` or `generation_changed` before replay continues from the oldest
+  available event
+- `cursor`: advances resume state when an internal event, such as a parse-only delivery update, is not
+  rendered in the administration feed
 
 ## 14. Public Frontend Behavior
 
@@ -783,7 +806,8 @@ app/
     admin_views.py
     public_api.py
     admin_api.py
-    sse.py
+    live.py
+    sse.py  # deprecated compatibility wrapper
   auth/
     passwords.py
     sessions.py
@@ -822,7 +846,7 @@ app/
 
 ### Phase 3: Real-Time and Operations
 
-11. SMTP live-connection SSE and durable public-mailbox WebSocket delivery events
+11. Authenticated SMTP live-connection WebSocket and durable public-mailbox WebSocket delivery events
 12. Historical SMTP session queries
 13. DNS check page
 14. Audit logs
@@ -841,7 +865,7 @@ app/
 2. After enabling `accept_subdomains`, the system can receive `foo@x.adb.com` and `foo@y.x.adb.com`.
 3. After explicitly enabling domain-level public Web access, visiting `https://adb.com/mail/foo@adb.com` shows that mailbox's messages.
 4. A publicly enabled mailbox can be browsed without a frontend login.
-5. Committed mailbox deliveries from embedded Python SMTP, standalone Python SMTP, and C++ ingestd appear in an already-open public mailbox over WebSocket without a manual refresh. Cursor gaps trigger a full-page resynchronization. Connection-level administration SMTP SSE remains in-process; separate ingress guarantees committed history, not per-command live telemetry.
+5. Committed mailbox deliveries from embedded Python SMTP, standalone Python SMTP, and C++ ingestd appear in an already-open public mailbox over WebSocket without a manual refresh. Cursor gaps trigger a full-page resynchronization. The administration UI uses `/api/v1/admin/live/smtp/ws`, resumes with `after_cursor`, and reports gaps without pretending that history is command telemetry. Connection/command events remain process-local; separate C++ ingress contributes only committed `delivery_committed` events and historical session data.
 6. An administrator API key can restrict permissions by scope and by domain/mailbox.
 7. The Public API can retrieve messages from a public mailbox using a read-only key.
 8. In durable ACK mode, the raw message file is persisted successfully before `250` is returned.

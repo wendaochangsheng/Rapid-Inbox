@@ -153,6 +153,15 @@ def test_init_db_helper_uses_explicit_base_directory(tmp_path: Path) -> None:
     assert integrity == "ok"
 
 
+def test_system_http_runner_bounds_inbound_websocket_messages() -> None:
+    content = (SYSTEM_DIR / "run_http.py").read_text(encoding="utf-8")
+
+    assert "WEBSOCKET_MAX_MESSAGE_BYTES = 16 * 1024" in content
+    assert "WEBSOCKET_MAX_QUEUE_MESSAGES = 1" in content
+    assert "ws_max_size=WEBSOCKET_MAX_MESSAGE_BYTES" in content
+    assert "ws_max_queue=WEBSOCKET_MAX_QUEUE_MESSAGES" in content
+
+
 def test_installer_shell_syntax_and_help() -> None:
     subprocess.run(["bash", "-n", str(SYSTEM_DIR / "install.sh")], check=True)
     result = subprocess.run(

@@ -692,8 +692,11 @@ class RapidInboxRuntime:
                     event.delivery_id,
                     event.created_at,
                     delivery.delivered_at,
+                    delivery.rcpt_to,
                     delivery.status AS delivery_status,
                     message.id AS message_id,
+                    message.smtp_session_id,
+                    message.envelope_from,
                     message.parse_status,
                     mailbox.address_canonical AS mailbox
                 FROM event_state
@@ -752,6 +755,17 @@ class RapidInboxRuntime:
                             "type": str(row["event_type"]),
                             "delivery_id": str(row["delivery_id"]),
                             "message_id": str(row["message_id"]),
+                            "session_id": (
+                                str(row["smtp_session_id"])
+                                if row["smtp_session_id"] is not None
+                                else None
+                            ),
+                            "rcpt_to": str(row["rcpt_to"]),
+                            "mail_from": (
+                                str(row["envelope_from"])
+                                if row["envelope_from"] is not None
+                                else None
+                            ),
                             "mailbox": str(row["mailbox"]),
                             "parse_status": str(row["parse_status"]),
                             "ts": str(row["delivered_at"] or row["created_at"]),

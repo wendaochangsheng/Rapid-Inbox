@@ -102,6 +102,8 @@ def test_compose_keeps_http_and_ingestd_in_one_container() -> None:
         "/usr/local/bin/rapid-inbox-ingestd --base-dir /app &"
     )
     assert readiness_gate < managed_ingestd_start
+    assert entrypoint.count("--ws-max-size 16384") == 2
+    assert entrypoint.count("--ws-max-queue 1") == 2
 
 
 def test_docker_launcher_builds_before_stop_and_preserves_the_volume() -> None:

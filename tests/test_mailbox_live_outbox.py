@@ -477,8 +477,11 @@ async def test_database_identity_change_resets_cursor_and_replays_replacement_ou
                 "delivery_id": "dlv-replacement",
                 "created_at": NOW,
                 "delivered_at": NOW,
+                "rcpt_to": "box@live.example",
                 "delivery_status": "active",
                 "message_id": "msg-replacement",
+                "smtp_session_id": "smtp-replacement",
+                "envelope_from": "sender@example.test",
                 "parse_status": "parsed",
                 "mailbox": "box@live.example",
             }

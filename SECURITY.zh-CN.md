@@ -108,8 +108,11 @@ wendao@ofoco.cn
   请求；同时设置 `HTTP_REQUEST_BODY_TIMEOUT_SECONDS`、`HTTP_BODY_MEMORY_BUDGET_BYTES` 和
   `HTTP_CONCURRENCY_LIMIT`；受支持启动器会把并发值同步传给 Uvicorn。它们仍不能替代反向代理的
   连接数、header、速率和超时限制。
-- 用 `HTTP_LIVE_CONNECTION_LIMIT` 约束每个进程内的管理 SSE 与公共邮箱 WebSocket；多进程或
-  多实例部署仍应在反向代理设置全局长连接上限、握手速率和空闲超时。
+- 用 `HTTP_LIVE_CONNECTION_LIMIT` 约束每个进程内的管理端/公共邮箱 WebSocket 与已弃用的管理
+  SSE 兼容流。受支持启动器还会把禁止的 WebSocket 入站应用消息限制为 16 KiB，并只排队一条。
+  外网部署必须使用 WSS，并由可信反向代理透传 `Upgrade`/`Connection`，同时设置全局长连接上限、
+  握手速率、帧大小和空闲超时。Cookie 鉴权的管理 WebSocket 必须精确校验同源 `Origin`；API Key
+  只能放在握手 Header，不得放入 query。
 - SQLite 写 actor 使用 `DATABASE_WRITE_QUEUE_CAPACITY` 与 `DATABASE_WRITE_MAX_WAITERS` 双界限；
   503 表示控制面已过载，应退避重试，而不是无界排队或立即放大重试流量。
 

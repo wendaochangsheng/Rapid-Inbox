@@ -18,8 +18,9 @@
    - `https://adb.com/mail/xxx@adb.com`
 5. 前台可浏览某邮箱下的所有邮件、查看正文、下载附件、查看原始邮件。
 6. 管理后台可查看 SMTP 活动和历史会话，以及域名、邮箱、邮件、API Key、审计日志、系统设置；
-   当前双进程方案会把公共邮箱投递通知持久化到 SQLite，并由 HTTP 读取后通过 WebSocket 更新页面，
-   管理端逐连接 SMTP 遥测仍属于进程内能力。
+   当前双进程方案会把公共邮箱投递通知持久化到 SQLite，并由 HTTP 读取后通过 WebSocket 更新页面。
+   经过鉴权的管理端 WebSocket 提供进程内连接/命令遥测；独立 C++ 收件入口只贡献已提交的 outbox
+   投递，并映射为 `delivery_committed`。
 7. 提供完整 HTTP API：
    - 管理员 API
    - 普通访问 API
@@ -47,7 +48,7 @@
 - **数据库**：SQLite
 - **模板引擎**：Jinja2（服务端渲染）
 - **反向代理**：Nginx / Caddy
-- **后台实时流**：SSE（Server-Sent Events）
+- **后台实时流**：经过鉴权的 WebSocket；原 SSE 路由仅作为已弃用的兼容接口保留
 - **公共邮箱实时流**：基于 SQLite live-event outbox 的 WebSocket
 - **原始邮件存储**：本地文件系统（`.eml`）
 - **附件存储**：本地文件系统
@@ -105,7 +106,7 @@
 - API Key 管理
 - 审计日志
 - 系统设置
-- 同进程收件时实时监控 SMTP 会话；独立收件进程提供已提交会话历史
+- 同进程收件时通过经过鉴权的 WebSocket 实时监控 SMTP 会话；独立收件进程提供已提交会话历史与投递通知
 
 #### E. DB Writer
 
@@ -119,7 +120,9 @@
 - 在 SQLite 中持久化跨进程公共邮箱投递事件
 - 将已提交投递事件读取到每个 HTTP 进程的有界 live state
 - 通过 WebSocket 推送匹配邮箱的更新
-- 在内存中保留供管理 SSE 使用的逐连接 SMTP 遥测
+- 在内存中保留供管理端 WebSocket 使用的逐连接 SMTP 遥测
+- 将已提交的 `mailbox_delivery` outbox 事件（包括独立/C++ 收件入口产生的事件）映射为管理端
+  `delivery_committed`；解析更新只推进 cursor，不宣称提供跨进程命令遥测
 
 ## 5. 域名与子域支持规则
 
@@ -589,9 +592,22 @@ API Key 除 scope 外，还要支持资源绑定：
 
 - `GET /api/v1/admin/smtp/sessions`
 - `GET /api/v1/admin/smtp/sessions/{session_id}`
-- `GET /api/v1/admin/live/smtp/stream`
+- `WebSocket /api/v1/admin/live/smtp/ws?after_cursor={cursor}`（管理端实时主接口）
+- `GET /api/v1/admin/live/smtp/stream`（已弃用的 SSE 兼容路由）
 
-`/live/smtp/stream` 使用 SSE。
+管理 UI 使用只允许服务端下发的 `/live/smtp/ws` WebSocket。每条数据或控制 JSON 消息都携带
+`generation:sequence` cursor，断线重连通过 `after_cursor` 携带最新值。已建立流中发现 ring 越界
+或 generation 变化时先发送 `gap`，随后从当前最早可用事件继续；握手时已过期的 generation
+会回退到当前 ring 或已提交历史。不向管理端展示的内部事件会发送仅含 cursor 的控制消息，避免
+重连时重复处理。
+
+Cookie 鉴权握手必须且只能包含一个 `Origin`，其 HTTP(S) scheme、host、port 必须与有效
+WebSocket URL 精确匹配（`ws` 映射 `http`，`wss` 映射 `https`）。Header `X-API-Key` 鉴权要求
+`live.read` 与全局授权；拒绝 query string 中的凭据。鉴权/策略失败
+与已进入路由的客户端应用帧以 `1008` 关闭；受支持启动器会在应用处理前拒绝超过 16 KiB 的
+入站消息。共享长连接容量满时以 `1013` 关闭，管理页面正常卸载使用 `1000`。外网部署必须使用
+WSS，并由受信反向代理保留 WebSocket Upgrade header。旧 `/live/smtp/stream` SSE 端点仅作为
+已弃用的兼容路由保留。
 
 ### API Key 管理
 
@@ -636,7 +652,7 @@ API Key 除 scope 外，还要支持资源绑定：
 
 ### 13.3 实时连接面板
 
-SSE 推送字段：
+管理端 WebSocket 推送的 JSON 消息示例：
 
 ```json
 {
@@ -648,20 +664,24 @@ SSE 推送字段：
   "mail_from": "bounce@mandrillapp.com",
   "rcpt_to": "xxx@adb.com",
   "tls_used": true,
-  "state": "rcpt"
+  "state": "rcpt",
+  "cursor": "generation:42"
 }
 ```
 
-事件类型：
-- `connected`
-- `ehlo`
-- `mail_from`
+进程内数据事件类型：
+- `connect`
 - `rcpt_accepted`
 - `rcpt_rejected`
-- `data_begin`
 - `queued`
-- `disconnected`
+- `disconnect`
 - `error`
+
+跨进程与控制事件类型：
+- `delivery_committed`：仅映射 SQLite outbox 中已提交的 `mailbox_delivery`，并携带
+  `source: committed_outbox`；C++/独立收件入口不提供实时连接或命令事件
+- `gap`：报告 `ring_overrun` 或 `generation_changed`，随后从最早可用事件继续
+- `cursor`：解析类投递更新等内部事件不显示在管理 feed 时，仅推进断点续传位置
 
 ## 14. 前台页面行为
 
@@ -783,7 +803,8 @@ app/
     admin_views.py
     public_api.py
     admin_api.py
-    sse.py
+    live.py
+    sse.py  # 已弃用的兼容 wrapper
   auth/
     passwords.py
     sessions.py
@@ -822,7 +843,7 @@ app/
 
 ### Phase 3：实时与运维
 
-11. SMTP 实时连接 SSE 与持久公共邮箱 WebSocket 投递事件
+11. 经过鉴权的 SMTP 实时连接 WebSocket 与持久公共邮箱 WebSocket 投递事件
 12. 历史 SMTP 会话查询
 13. DNS 检查页面
 14. 审计日志
@@ -842,8 +863,10 @@ app/
 3. 显式开启域级公共 Web 后，访问 `https://adb.com/mail/foo@adb.com` 可查看该邮箱邮件。
 4. 无需前台登录即可浏览已显式公开的邮箱。
 5. Python 内嵌 SMTP、独立 Python SMTP 与 C++ ingestd 提交的邮箱投递，都能通过 WebSocket
-   出现在已打开的公开收件箱中，无需手动刷新；cursor 缺口会触发整页重新同步。管理端逐连接
-   SMTP SSE 仍属于进程内能力，独立收件进程保证已提交历史但不保证逐命令实时遥测。
+   出现在已打开的公开收件箱中，无需手动刷新；cursor 缺口会触发整页重新同步。管理 UI 使用
+   `/api/v1/admin/live/smtp/ws`，通过 `after_cursor` 续传并显式报告 gap，不把历史记录冒充命令
+   遥测。连接/命令事件仍属于进程内能力；独立 C++ 收件入口只贡献已提交的
+   `delivery_committed` 与历史会话数据。
 6. 管理员 API Key 可按 scope 与域/邮箱限制权限。
 7. Public API 可按 read-only key 获取公开邮箱消息。
 8. 在 durable ACK 模式下，邮件原始文件落盘成功后才返回 `250`。

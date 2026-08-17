@@ -83,6 +83,7 @@ def test_quickstart_applies_http_concurrency_limit_and_loopback_default() -> Non
     assert 'resolve_dotenv_value HTTP_HOST HOST "127.0.0.1"' in content
     assert 'resolve_dotenv_value HTTP_CONCURRENCY_LIMIT HTTP_CONCURRENCY_LIMIT "1000"' in content
     assert '--limit-concurrency "$HTTP_CONCURRENCY_LIMIT"' in content
+    assert "--ws-max-size 16384 --ws-max-queue 1" in content
     assert "SECURITY WARNING: HTTP is bound to non-loopback address" in content
     assert "trusted HTTPS reverse proxy" in content
 

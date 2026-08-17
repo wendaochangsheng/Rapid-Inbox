@@ -428,12 +428,22 @@ def test_http_runner_builds_embedded_smtp_app(monkeypatch, tmp_path) -> None:
         calls["embed_smtp"] = embed_smtp
         return DummyApp()
 
-    def fake_run(app, host, port, reload, limit_concurrency):
+    def fake_run(
+        app,
+        host,
+        port,
+        reload,
+        limit_concurrency,
+        ws_max_size,
+        ws_max_queue,
+    ):
         calls["app"] = app
         calls["host"] = host
         calls["port"] = port
         calls["reload"] = reload
         calls["limit_concurrency"] = limit_concurrency
+        calls["ws_max_size"] = ws_max_size
+        calls["ws_max_queue"] = ws_max_queue
 
     monkeypatch.setattr(http_runner, "default_settings", fake_default_settings)
     monkeypatch.setattr(http_runner, "create_app", fake_create_app)
@@ -449,6 +459,8 @@ def test_http_runner_builds_embedded_smtp_app(monkeypatch, tmp_path) -> None:
     assert calls["port"] == 8000
     assert calls["reload"] is False
     assert calls["limit_concurrency"] == 1000
+    assert calls["ws_max_size"] == 16 * 1024
+    assert calls["ws_max_queue"] == 1
 
 
 def test_smtp_server_uses_disconnect_aware_protocol(tmp_path) -> None:

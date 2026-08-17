@@ -19,6 +19,17 @@
 
 ### 变更
 
+- 管理后台 SMTP 实时 UI 与主接口迁移到经过鉴权、只允许服务端下发的 WebSocket
+  `/api/v1/admin/live/smtp/ws`。JSON 消息携带可续传 cursor，重连使用 `after_cursor`；已建立流中
+  发现 ring 越界或 generation 变化时会先发送 `gap`，再从最早可用事件继续；握手时已过期的
+  generation 会回退到当前 ring 或已提交历史。Cookie 会话必须且只能携带一个精确同源
+  `Origin`；Header API Key 要求 `live.read`，拒绝 query 凭据。页面正常卸载、鉴权/策略失败或
+  已进入路由的客户端应用帧、长连接容量满分别使用关闭码 1000、1008、1013。原
+  `/api/v1/admin/live/smtp/stream` SSE 端点仅作为已弃用的兼容路由保留。受支持启动器把禁止的
+  客户端入站应用消息限制为 16 KiB，超限消息会在进入应用前被拒绝，并只保留一条待处理消息。
+- 将跨进程管理事件限定为已提交的投递事实：C++ 与独立收件入口的 `mailbox_delivery` outbox
+  事件映射为携带 `source: committed_outbox` 的 `delivery_committed`。仅解析状态变化的投递更新
+  只推进续传 cursor、不显示在 feed 中，也不暗示存在跨进程连接/命令遥测。
 - Docker Compose 成为推荐部署方式，原生 systemd 作为次要方式；`quickstart.sh` 明确降为本地
   试用/开发用前台启动器。
 - 项目对外 Markdown 改为中英双语：标准文件名使用英文，完整简体中文版本使用 `.zh-CN.md`

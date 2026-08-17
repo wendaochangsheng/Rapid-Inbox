@@ -164,6 +164,12 @@ def test_live_connection_limit_classifies_routes_under_root_path() -> None:
     )
     assert LiveConnectionLimitMiddleware._is_live_connection(
         _websocket_scope(
+            "/prefix/api/v1/admin/live/smtp/ws",
+            root_path="/prefix",
+        )
+    )
+    assert LiveConnectionLimitMiddleware._is_live_connection(
+        _websocket_scope(
             "/prefix/mail/box@example.test/ws",
             root_path="/prefix",
         )
@@ -174,7 +180,7 @@ def test_live_connection_limit_classifies_routes_under_root_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_connection_limit_is_shared_by_sse_and_websocket() -> None:
+async def test_live_connection_limit_is_shared_by_admin_and_public_live_transports() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -223,6 +229,16 @@ async def test_live_connection_limit_is_shared_by_sse_and_websocket() -> None:
         receive,
         send_rejected_websocket,
     )
+    rejected_admin_websocket: list[dict] = []
+
+    async def send_rejected_admin_websocket(message: dict) -> None:
+        rejected_admin_websocket.append(message)
+
+    await middleware(
+        _websocket_scope("/api/v1/admin/live/smtp/ws"),
+        receive,
+        send_rejected_admin_websocket,
+    )
 
     assert rejected_http[0]["type"] == "http.response.start"
     assert rejected_http[0]["status"] == 503
@@ -233,6 +249,7 @@ async def test_live_connection_limit_is_shared_by_sse_and_websocket() -> None:
             "reason": "live connection capacity exceeded",
         }
     ]
+    assert rejected_admin_websocket == rejected_websocket
 
     release.set()
     await asyncio.wait_for(first, timeout=1)

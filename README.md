@@ -74,8 +74,10 @@ See [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)
 > messages, or credentials. It was recorded with Python's embedded SMTP server. Current deployments
 > persist committed public-mailbox delivery changes in a SQLite live-event outbox and tail them from
 > the Python HTTP process, so the default C++ ingestd and standalone Python SMTP modes can update an
-> open public inbox over WebSocket without a manual refresh. Connection-level administration SMTP
-> SSE remains process-local; reconnects can fall back to committed history.
+> open public inbox over WebSocket without a manual refresh. The administration console also uses
+> an authenticated WebSocket: Python SMTP can publish process-local connection/command telemetry,
+> while C++ and separate ingress surface committed deliveries as `delivery_committed` events through
+> the SQLite outbox. Cursor-based reconnects can fall back to committed history.
 
 ## Implemented Features
 
@@ -84,7 +86,7 @@ See [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)
 | **Email ingestion** | C++ `rapid-inbox-ingestd` provides durable ACKs, byte-level backpressure, group commit, multi-worker MIME parsing, and poison-task isolation; Python SMTP remains available as a development mode |
 | **Domain modes** | Receive only configured domains, or enable `managed_plus_catchall` for any-domain SMTP deliveries that reach this service; longest-suffix rules take precedence and domain rules are hot-reloaded |
 | **Inboxes** | Domains are private by default; the per-mailbox public flag defaults to enabled but takes effect only when the domain-level public switch is enabled, and it can still be disabled per mailbox; supports lists, details, raw EML, sandboxed HTML previews, and attachment downloads |
-| **Live updates** | Python and C++ ingress persist committed public-mailbox delivery changes in a SQLite live-event outbox; each HTTP runtime tails the outbox and pushes matching mailbox updates over WebSocket, so open public inboxes do not require manual refreshes. Cursor gaps trigger a page resync. Administration SMTP connection/command SSE remains process-local; separate ingress exposes committed history rather than continuous per-session telemetry |
+| **Live updates** | Python and C++ ingress persist committed public-mailbox delivery changes in a SQLite live-event outbox; each HTTP runtime tails the outbox and pushes matching mailbox updates over WebSocket, so open public inboxes do not require manual refreshes. The authenticated administration WebSocket uses cursor resume and gap reporting; committed C++ deliveries appear as `delivery_committed`, while connection/command telemetry remains process-local |
 | **Verification-code detection** | A scored extraction algorithm with Chinese, English, Japanese, Korean, and Spanish context plus alphanumeric and separated-code patterns |
 | **Access control** | `viewer` / `operator` / `superadmin` RBAC; API Keys are constrained by kind, scope, domain grant mode, mailbox glob, IP, rate limit, and expiry |
 | **HTTP API** | `/api/v2` is recommended: Bearer-only, strict models, Problem Details, and stable cursors; public and admin `/api/v1` endpoints remain available |
@@ -95,7 +97,7 @@ See [Roadmap Issue #5](https://github.com/wendaochangsheng/Rapid-Inbox/issues/5)
 
 ## Technology Stack
 
-`Docker Compose` · `C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket` · `SSE`
+`Docker Compose` · `C++20` · `Python 3.10+` · `FastAPI` · `aiosmtpd` · `Jinja2` · `SQLite` · `Uvicorn` · `WebSocket`
 
 ## Quick Start
 
@@ -113,9 +115,10 @@ cursor-signing, and metrics secrets, starts the Python control plane, waits for 
 `/health/ready`, then starts the C++ SMTP ingress. The image runs as a non-root user. Both processes
 are supervised in one container and one PID namespace because the cross-process maintenance protocol
 records and verifies operating-system PIDs. A SQLite live-event outbox carries committed public-mailbox
-delivery notifications across this process boundary. Public WebSocket cursor generations remain local
-to one HTTP process, so keep one HTTP worker per instance (as the supplied runners do); a multi-worker
-or multi-replica HTTP tier requires sticky routing until cursor generations are shared.
+delivery notifications across this process boundary. Public and administration WebSocket cursor
+generations remain local to one HTTP process, so keep one HTTP worker per instance (as the supplied
+runners do); a multi-worker or multi-replica HTTP tier requires sticky routing until cursor generations
+are shared.
 
 Default host bindings:
 
@@ -324,7 +327,7 @@ Python HTTP, compatibility SMTP, and shared configuration:
 | `HTTP_REQUEST_BODY_TIMEOUT_SECONDS` | `15` | Total time allowed to receive one complete HTTP request body, mitigating slow chunked uploads |
 | `HTTP_BODY_MEMORY_BUDGET_BYTES` | `268435456` | Shared per-process byte budget for all buffered HTTP request bodies; must be at least the per-request limit |
 | `HTTP_CONCURRENCY_LIMIT` | `1000` | Per-process admission limit across HTTP and WebSocket traffic; supported launchers also pass it to Uvicorn as `--limit-concurrency`, and application middleware enforces it |
-| `HTTP_LIVE_CONNECTION_LIMIT` | `256` | Shared per-HTTP-process limit for admin SSE and public-mailbox WebSocket long-lived connections; excess connections receive 503/1013 |
+| `HTTP_LIVE_CONNECTION_LIMIT` | `256` | Shared per-HTTP-process limit for administration and public-mailbox WebSockets; excess WebSockets close with 1013. The deprecated v1 SSE compatibility stream shares the same limit and receives 503 when full |
 | `DATABASE_WRITE_QUEUE_CAPACITY` / `DATABASE_WRITE_MAX_WAITERS` | `256` / `1024` | Dual limits for requests accepted by the single SQLite write actor and requests waiting for it; excess load fails fast with 503 |
 | `DATABASE_READ_POOL_SIZE` / `DATABASE_READ_QUEUE_CAPACITY` / `DATABASE_READ_MAX_WAITERS` / `DATABASE_READ_TIMEOUT_SECONDS` | `1` / `256` / `1024` / `5` | API v2 dedicated read-only actors, admitted-request and waiting-request limits, and end-to-end read timeout. A single actor is the conservative default; benchmark the actual workload before increasing connections. Maintenance first drains requests, then the owner thread closes connections. All values are calculated independently per HTTP process |
 | `SMTP_HOST` / `SMTP_PORT` | `0.0.0.0` / `25` | SMTP listen address and port |
@@ -364,6 +367,10 @@ Python HTTP, compatibility SMTP, and shared configuration:
 | `API_CURSOR_SECRET` | empty (randomized by deployment scripts and quickstart) | HMAC secret for API v2 cursors; manual Internet-facing deployments must configure at least 32 characters |
 | `READINESS_MIN_FREE_DISK_BYTES` | `67108864` | Minimum free disk space required for readiness |
 | `ADMIN_TOKEN` / `PUBLIC_API_KEY` | disabled | v1 compatibility tokens; enabled only when explicitly configured with non-default random values |
+
+Because both live WebSockets are server-only notification streams, the supported Docker, systemd,
+quickstart, and Python entrypoints cap client-to-server messages at 16 KiB and queue at most one
+unhandled message. Reverse proxies should apply compatible or tighter limits.
 
 Preview budgets are per-request limits. CID images grow by roughly 4/3 when converted to data URLs;
 if body and inline budgets are increased together, worst-case concurrent memory grows roughly in
@@ -467,7 +474,7 @@ curl \
 The current v2 surface covers principal, public mailbox list/verification-code/detail/raw/attachment resources,
 domain and DNS checks, mailbox operations, message detail/raw/attachment/reparse/delete, SMTP sessions
 and events, audit, dashboard, manual cleanup/clear, system settings, and the full API-Key and admin
-lifecycle. Admin live streams and cross-message bulk deletion remain under `/api/v1/*`. New code should
+lifecycle. The admin live WebSocket (plus its deprecated SSE compatibility route) and cross-message bulk deletion remain under `/api/v1/*`. New code should
 prefer resources covered by v2 and follow the operations actually present in OpenAPI.
 
 Every v2 cursor has a 2,048-byte input limit, an HMAC signature, and resource/filter binding. Retained

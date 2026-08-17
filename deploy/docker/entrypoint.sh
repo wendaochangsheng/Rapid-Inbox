@@ -7,7 +7,9 @@ run_http() {
     exec uvicorn app.main:app \
         --host "${HOST:-0.0.0.0}" \
         --port "${PORT:-8000}" \
-        --limit-concurrency "${HTTP_CONCURRENCY_LIMIT:-1000}"
+        --limit-concurrency "${HTTP_CONCURRENCY_LIMIT:-1000}" \
+        --ws-max-size 16384 \
+        --ws-max-queue 1
 }
 
 run_ingestd() {
@@ -40,7 +42,9 @@ run_all() {
     uvicorn app.main:app \
         --host "${HOST:-0.0.0.0}" \
         --port "${PORT:-8000}" \
-        --limit-concurrency "${HTTP_CONCURRENCY_LIMIT:-1000}" &
+        --limit-concurrency "${HTTP_CONCURRENCY_LIMIT:-1000}" \
+        --ws-max-size 16384 \
+        --ws-max-queue 1 &
     http_pid=$!
 
     # The HTTP lifespan applies the schema and migrations before Uvicorn begins

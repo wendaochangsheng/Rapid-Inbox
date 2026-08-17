@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import sqlite3
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 
 from app.auth.api_keys import ApiKeyAuthorizationError
@@ -19,10 +21,12 @@ from app.auth.permissions import (
 )
 from app.db.connection import connect_database
 from app.http.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, build_pagination_context
-from app.http.sse import (
-    LIVE_SSE_EVENT_TYPES,
+from app.http.live import (
+    iter_smtp_live_events,
     smtp_live_snapshot,
     smtp_sessions_page,
+)
+from app.http.sse import (
     stream_smtp_live_events,
 )
 from app.ingest.storage import utc_now
@@ -42,7 +46,7 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client is not None else None
 
 
-async def _current_admin_session(request: Request) -> dict[str, Any] | None:
+async def _current_admin_session(request: Request | WebSocket) -> dict[str, Any] | None:
     cookie_name = request.app.state.settings.session_cookie_name
     token = request.cookies.get(cookie_name)
     if not token:
@@ -447,7 +451,7 @@ def _smtp_session_detail(
     return result
 
 
-async def _record_admin_key_usage(request: Request, admin: PermissionContext) -> None:
+async def _record_admin_key_usage(request: Request | WebSocket, admin: PermissionContext) -> None:
     if admin.api_key_id is None:
         return
     request_ip = request.client.host if request.client is not None else None
@@ -501,6 +505,91 @@ async def require_admin_live_access(
     return _session_permission_context(admin_session)
 
 
+def _normalized_admin_websocket_origin(value: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, hostname.lower(), port
+
+
+def _admin_websocket_origin_is_allowed(websocket: WebSocket) -> bool:
+    origins = websocket.headers.getlist("origin")
+    if len(origins) != 1:
+        return False
+    scheme = "https" if websocket.url.scheme.lower() == "wss" else "http"
+    hostname = websocket.url.hostname
+    if not hostname:
+        return False
+    port = websocket.url.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return _normalized_admin_websocket_origin(origins[0]) == (
+        scheme,
+        hostname.lower(),
+        port,
+    )
+
+
+def _admin_websocket_is_remote(websocket: WebSocket) -> bool:
+    if websocket.client is None:
+        return True
+    try:
+        return not ipaddress.ip_address(websocket.client.host).is_loopback
+    except ValueError:
+        return True
+
+
+async def _authorize_admin_websocket(websocket: WebSocket) -> PermissionContext | None:
+    if "api_key" in websocket.query_params:
+        return None
+    settings = websocket.app.state.settings
+    if not settings.externally_bound() and _admin_websocket_is_remote(websocket):
+        findings = await asyncio.to_thread(
+            websocket.app.state.runtime.external_request_security_findings
+        )
+        if findings:
+            return None
+
+    x_api_keys = websocket.headers.getlist("x-api-key")
+    if len(x_api_keys) > 1:
+        return None
+    if x_api_keys:
+        x_api_key = x_api_keys[0]
+        try:
+            admin = await require_admin_key(websocket, x_api_key)  # type: ignore[arg-type]
+            require_admin_scope(admin, "live.read")
+            _require_global_grant(admin)
+            await _record_admin_key_usage(websocket, admin)
+        except (HTTPException, PermissionDenied):
+            return None
+        return admin
+
+    if not _admin_websocket_origin_is_allowed(websocket):
+        return None
+    admin_session = await _current_admin_session(websocket)
+    if admin_session is None or admin_session.get("must_change_password"):
+        return None
+    try:
+        admin = _session_permission_context(admin_session)
+        require_admin_scope(admin, "live.read")
+        _require_global_grant(admin)
+    except (HTTPException, PermissionDenied):
+        return None
+    return admin
+
+
 @router.get("/admin/live", response_class=HTMLResponse)
 async def live_page(
     request: Request,
@@ -515,13 +604,12 @@ async def live_page(
 
     runtime = request.app.state.runtime
     live_events, live_cursor = runtime.live_state.snapshot_state()
-    initial_events = live_events[-DEFAULT_PAGE_SIZE:]
-    if not initial_events:
-        initial_events = await asyncio.to_thread(
-            smtp_live_snapshot,
-            runtime,
-            history_limit=DEFAULT_PAGE_SIZE,
-        )
+    initial_events = await asyncio.to_thread(
+        smtp_live_snapshot,
+        runtime,
+        history_limit=DEFAULT_PAGE_SIZE,
+        events=live_events,
+    )
     sessions, total_count = await asyncio.to_thread(
         smtp_sessions_page,
         runtime,
@@ -537,8 +625,7 @@ async def live_page(
             "admin": admin,
             "events": initial_events,
             "sessions": sessions,
-            "stream_url": f"/api/v1/admin/live/smtp/stream?after_cursor={live_cursor}",
-            "live_event_types": LIVE_SSE_EVENT_TYPES,
+            "websocket_url": f"/api/v1/admin/live/smtp/ws?after_cursor={live_cursor}",
             "stream_item_limit": DEFAULT_PAGE_SIZE,
             "sessions_pagination": build_pagination_context(
                 path="/admin/live",
@@ -576,8 +663,68 @@ async def smtp_stream(
             last_event_id=last_event_id,
         ),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Deprecation": "true",
+            "Link": '</api/v1/admin/live/smtp/ws>; rel="alternate"',
+        },
     )
+
+
+@router.websocket("/api/v1/admin/live/smtp/ws")
+async def smtp_websocket(websocket: WebSocket) -> None:
+    _admin = await _authorize_admin_websocket(websocket)
+    if _admin is None:
+        await websocket.accept()
+        await websocket.close(code=1008, reason="admin WebSocket access denied")
+        return
+
+    await websocket.accept()
+    event_stream = iter_smtp_live_events(
+        websocket.app.state.runtime,
+        after_cursor=websocket.query_params.get("after_cursor"),
+    )
+    receive_task: asyncio.Task[dict[str, Any]] | None = asyncio.create_task(
+        websocket.receive()
+    )
+    event_task: asyncio.Task[dict[str, Any]] | None = asyncio.create_task(
+        anext(event_stream)
+    )
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {receive_task, event_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if receive_task in done:
+                message = receive_task.result()
+                if message.get("type") == "websocket.disconnect":
+                    return
+                await websocket.close(
+                    code=1008,
+                    reason="admin live WebSocket is server-only",
+                )
+                return
+
+            try:
+                payload = event_task.result()
+            except StopAsyncIteration:
+                return
+            await websocket.send_json(payload)
+            event_task = asyncio.create_task(anext(event_stream))
+    except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+        return
+    finally:
+        tasks = tuple(
+            task for task in (receive_task, event_task) if task is not None
+        )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await event_stream.aclose()
 
 
 @router.post("/api/v1/admin/domains/{domain_id}/dns-check")

@@ -71,7 +71,7 @@ class HttpConcurrencyLimitMiddleware:
 
 
 class LiveConnectionLimitMiddleware:
-    """Bound long-lived SSE and public mailbox WebSocket connections."""
+    """Bound administrator/public WebSockets and the deprecated SSE stream."""
 
     def __init__(self, app, *, max_connections: int) -> None:
         self.app = app
@@ -88,10 +88,10 @@ class LiveConnectionLimitMiddleware:
                 str(scope.get("method") or "").upper() == "GET"
                 and path == "/api/v1/admin/live/smtp/stream"
             )
-        return (
-            scope_type == "websocket"
-            and path.startswith("/mail/")
-            and path.endswith("/ws")
+        if scope_type != "websocket":
+            return False
+        return path == "/api/v1/admin/live/smtp/ws" or (
+            path.startswith("/mail/") and path.endswith("/ws")
         )
 
     async def __call__(self, scope, receive, send) -> None:
